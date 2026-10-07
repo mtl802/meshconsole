@@ -486,3 +486,198 @@ func TestHeartbeatAfterNodeDeleted(t *testing.T) {
 		t.Fatalf("heartbeat after delete = %d, want 401", rec.Code)
 	}
 }
+
+// ---- M1b-a：services/agents 上报扩展（SPEC §2/§3/§4）----
+
+// heartbeatServicesBody 构造带 services/agents 的心跳体。
+func heartbeatServicesBody(node string, services []map[string]any, agents []map[string]any) map[string]any {
+	body := heartbeatBody(node, false)
+	if services != nil {
+		body["services"] = services
+	}
+	if agents != nil {
+		body["agents"] = agents
+	}
+	return body
+}
+
+func svcMap(name, typ, target, status string) map[string]any {
+	return map[string]any{"name": name, "type": typ, "target": target, "status": status, "detail": ""}
+}
+
+func agentMap(name, typ, version, path, status string) map[string]any {
+	return map[string]any{"name": name, "type": typ, "version": version, "path": path, "status": status}
+}
+
+func TestHeartbeatServicesAndAgents(t *testing.T) {
+	h, st := newTestHandler(t)
+	tok, nodeID := mustRegister(t, h, "n1")
+
+	// 带 services+agents 的心跳 → 200 且落库。
+	body := heartbeatServicesBody("n1",
+		[]map[string]any{svcMap("rustdesk", "process", "rustdesk", "active"), svcMap("derp", "docker", "derp", "inactive")},
+		[]map[string]any{agentMap("zcode", "cli", "1.2.3", "/usr/local/bin/zcode", "active")})
+	if rec := doReq(t, h, "/api/agent/heartbeat", tok, body); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat(svc+agents) = %d body=%s", rec.Code, rec.Body.String())
+	}
+	svcs, _ := st.ListServices(t.Context(), nodeID)
+	if len(svcs) != 2 || svcs[0].Name != "derp" || svcs[1].Name != "rustdesk" {
+		t.Fatalf("services rows wrong: %+v", svcs)
+	}
+	if svcs[1].Type != "process" || svcs[1].Target != "rustdesk" || svcs[1].Status != "active" {
+		t.Fatalf("rustdesk row wrong: %+v", svcs[1])
+	}
+	agents, _ := st.ListAgents(t.Context(), nodeID)
+	if len(agents) != 1 || agents[0].Name != "zcode" || agents[0].Version != "1.2.3" ||
+		agents[0].Path != "/usr/local/bin/zcode" || agents[0].Status != "active" {
+		t.Fatalf("agents rows wrong: %+v", agents)
+	}
+	if agents[0].Invokable {
+		t.Fatal("invokable must be false")
+	}
+
+	// 字段缺席 → 无变化不覆盖（上轮数据保持）。
+	if rec := doReq(t, h, "/api/agent/heartbeat", tok, heartbeatBody("n1", false)); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat(no svc) = %d", rec.Code)
+	}
+	svcs, _ = st.ListServices(t.Context(), nodeID)
+	if len(svcs) != 2 || svcs[1].Status != "active" {
+		t.Fatalf("absent services must not overwrite, got %+v", svcs)
+	}
+	agents, _ = st.ListAgents(t.Context(), nodeID)
+	if len(agents) != 1 || agents[0].Status != "active" {
+		t.Fatalf("absent agents must not overwrite, got %+v", agents)
+	}
+
+	// 显式 [] → 全量替换为空：既有行转 stale。
+	if rec := doReq(t, h, "/api/agent/heartbeat", tok, heartbeatServicesBody("n1", []map[string]any{}, []map[string]any{})); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat(empty arrays) = %d", rec.Code)
+	}
+	svcs, _ = st.ListServices(t.Context(), nodeID)
+	for _, s := range svcs {
+		if s.Status != "stale" {
+			t.Fatalf("service %s should be stale after empty report: %+v", s.Name, s)
+		}
+	}
+	agents, _ = st.ListAgents(t.Context(), nodeID)
+	if len(agents) != 1 || agents[0].Status != "stale" {
+		t.Fatalf("agent should be stale after empty report: %+v", agents)
+	}
+
+	// 同名覆盖（声明优先语义在服务端即 UPSERT）。
+	body = heartbeatServicesBody("n1", []map[string]any{svcMap("rustdesk", "process", "rustdesk", "failed")}, nil)
+	if rec := doReq(t, h, "/api/agent/heartbeat", tok, body); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat(upsert) = %d", rec.Code)
+	}
+	svcs, _ = st.ListServices(t.Context(), nodeID)
+	if len(svcs) != 2 {
+		t.Fatalf("upsert must not create duplicate rows, rows=%d", len(svcs))
+	}
+	for _, s := range svcs {
+		if s.Name == "rustdesk" && s.Status != "failed" {
+			t.Fatalf("rustdesk should be failed after upsert: %+v", s)
+		}
+	}
+}
+
+// TestHeartbeatServicesValidation services/agents 值域与结构校验，全部 400 且不落库。
+func TestHeartbeatServicesValidation(t *testing.T) {
+	h, st := newTestHandler(t)
+	tok, nodeID := mustRegister(t, h, "n1")
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"bad type", heartbeatServicesBody("n1", []map[string]any{svcMap("s", "k8s", "s", "active")}, nil)},
+		{"bad status", heartbeatServicesBody("n1", []map[string]any{svcMap("s", "process", "s", "running")}, nil)},
+		{"empty name", heartbeatServicesBody("n1", []map[string]any{svcMap("", "process", "s", "active")}, nil)},
+		{"dup name", heartbeatServicesBody("n1", []map[string]any{svcMap("s", "process", "a", "active"), svcMap("s", "process", "b", "active")}, nil)},
+		{"bad target charset", heartbeatServicesBody("n1", []map[string]any{svcMap("s", "systemd", "a;b", "active")}, nil)},
+		{"target leading dash", heartbeatServicesBody("n1", []map[string]any{svcMap("s", "docker", "-c", "active")}, nil)},
+		{"agent bad type", heartbeatServicesBody("n1", nil, []map[string]any{agentMap("a", "daemon", "1", "/x", "active")})},
+		{"agent bad status", heartbeatServicesBody("n1", nil, []map[string]any{agentMap("a", "cli", "1", "/x", "ok")})},
+		{"agent empty name", heartbeatServicesBody("n1", nil, []map[string]any{agentMap("", "cli", "1", "", "active")})},
+	}
+	for _, c := range cases {
+		if rec := doReq(t, h, "/api/agent/heartbeat", tok, c.body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code = %d body=%s, want 400", c.name, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 条目超限 → 400。
+	many := []map[string]any{}
+	for i := range 65 {
+		many = append(many, svcMap(fmt.Sprintf("s%02d", i), "process", "x", "active"))
+	}
+	if rec := doReq(t, h, "/api/agent/heartbeat", tok, heartbeatServicesBody("n1", many, nil)); rec.Code != http.StatusBadRequest {
+		t.Fatalf("too many services = %d, want 400", rec.Code)
+	}
+
+	// 全部被拒的请求不应留下任何行。
+	if n, err := st.CountMetrics(t.Context(), nodeID); err != nil || n != 0 {
+		t.Fatalf("rejected heartbeats must not store metrics, got %d err=%v", n, err)
+	}
+	rows, _ := st.ListServices(t.Context(), nodeID)
+	if len(rows) != 0 {
+		t.Fatalf("rejected services must not store rows, got %+v", rows)
+	}
+}
+
+// TestHeartbeatAgentsDetailSanitized detail/version/path 净化：控制字符去除、超长截断。
+func TestHeartbeatAgentsDetailSanitized(t *testing.T) {
+	h, st := newTestHandler(t)
+	tok, nodeID := mustRegister(t, h, "n1")
+
+	long := strings.Repeat("v", 500) + "\x00\x1b[31m"
+	body := heartbeatServicesBody("n1", nil, []map[string]any{
+		{"name": "zcode", "type": "cli", "version": long, "path": long, "status": "unavailable", "detail": long},
+	})
+	if rec := doReq(t, h, "/api/agent/heartbeat", tok, body); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat = %d body=%s", rec.Code, rec.Body.String())
+	}
+	agents, _ := st.ListAgents(t.Context(), nodeID)
+	a := agents[0]
+	for field, val := range map[string]string{"version": a.Version, "path": a.Path, "detail": a.Detail} {
+		if strings.ContainsAny(val, "\x00\x1b") {
+			t.Fatalf("%s contains control chars: %q", field, val)
+		}
+		if len(val) > 512 {
+			t.Fatalf("%s not truncated: %d bytes", field, len(val))
+		}
+	}
+}
+
+// TestHeartbeatNullFieldsRejected 可选数组字段三态回归（R11-A）：显式 null 是
+// 协议违规（400，不落库），与「字段缺席 = 无变化」严格区分。
+func TestHeartbeatNullFieldsRejected(t *testing.T) {
+	h, st := newTestHandler(t)
+	tok, nodeID := mustRegister(t, h, "n1")
+
+	base := `{"node":"n1","metrics":{"cpu_pct":1.5},"agent_version":"v1"`
+	cases := []struct {
+		name, body string
+	}{
+		{"services null", base + `,"services":null}`},
+		{"agents null", base + `,"agents":null}`},
+		{"both null", base + `,"services":null,"agents":null}`},
+		{"null with whitespace", base + `,"services": null }`},
+	}
+	for _, c := range cases {
+		if rec := doRawReq(t, h, "/api/agent/heartbeat", tok, c.body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code = %d body=%s, want 400", c.name, rec.Code, rec.Body.String())
+		}
+	}
+	// 被拒的心跳不落任何行。
+	if n, err := st.CountMetrics(t.Context(), nodeID); err != nil || n != 0 {
+		t.Fatalf("null-rejected heartbeats must not store metrics, got %d err=%v", n, err)
+	}
+
+	// 对照：字段缺席 → 200 且正常落库（缺席语义保持）。
+	if rec := doRawReq(t, h, "/api/agent/heartbeat", tok, base+`}`); rec.Code != http.StatusOK {
+		t.Fatalf("absent fields must stay 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if n, err := st.CountMetrics(t.Context(), nodeID); err != nil || n != 1 {
+		t.Fatalf("absent-field heartbeat must store metrics, got %d err=%v", n, err)
+	}
+}

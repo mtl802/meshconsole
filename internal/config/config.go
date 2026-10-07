@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -74,7 +75,9 @@ func (t *RegistrationToken) UnmarshalYAML(unmarshal func(interface{}) error) err
 	}
 	var s string
 	if err := unmarshal(&s); err == nil {
-		return fmt.Errorf("注册 token 不再接受纯字符串写法（无到期、不绑定节点，等于永久凭据）: %q\n请改为映射写法，例如:\n%s", s, tokenExampleYAML)
+		// 不回显原值（R15-#1，与 R11-C/R13-#3 同口径）：纯字符串写法本身就是
+		// 凭据材料，不得进错误信息/日志；只说明拒绝原因与映射写法。
+		return fmt.Errorf("注册 token 不再接受纯字符串写法（无到期、不绑定节点，等于永久凭据）\n请改为映射写法，例如:\n%s", tokenExampleYAML)
 	}
 	return fmt.Errorf("注册 token 须为映射写法（token + expires_at + expected_node），例如:\n%s", tokenExampleYAML)
 }
@@ -91,13 +94,96 @@ type Console struct {
 	// OfflineAfterS 为无心跳判定离线的秒数（DESIGN §4.1：默认 60s）。
 	OfflineAfterS int `yaml:"offline_after_s"`
 	// MetricsRetentionDays 为 metrics 保留天数（默认 7）。
-	MetricsRetentionDays int    `yaml:"metrics_retention_days"`
-	LogLevel             string `yaml:"log_level"`
+	MetricsRetentionDays int `yaml:"metrics_retention_days"`
+	// PKIDir 为 CA 与服务端证书目录（DESIGN §7-3；默认 ./pki，生产 /opt/meshconsole/pki）。
+	// 支持默认值覆盖，路径支持 ~ 展开。console 启动只加载其中证书，不重新生成。
+	PKIDir string `yaml:"pki_dir"`
+	// TLSCert / TLSKey 显式指定服务端证书与私钥路径；留空取 <pki_dir>/server.crt|key。
+	TLSCert string `yaml:"tls_cert"`
+	TLSKey  string `yaml:"tls_key"`
+	// TailnetIP 为本机 Tailnet IP：仅 `meshconsole pki` 生成证书时写入 SAN 用；
+	// 留空则 SAN 只含 localhost/主机名/回环地址。
+	TailnetIP string `yaml:"tailnet_ip"`
+	// MaxConnections 为连接总数上限（DESIGN §7-4/§7-9，LimitListener，默认 256）。
+	// 第 max_connections+1 条并发连接在内核 accept 队列排队而非被拒。
+	MaxConnections int    `yaml:"max_connections"`
+	LogLevel       string `yaml:"log_level"`
+}
+
+// CertKeyPaths 返回服务端证书与私钥路径（显式配置优先，缺省落 pki_dir）。
+func (c *Console) CertKeyPaths() (cert, key string) {
+	cert, key = c.TLSCert, c.TLSKey
+	if cert == "" {
+		cert = filepath.Join(c.PKIDir, "server.crt")
+	}
+	if key == "" {
+		key = filepath.Join(c.PKIDir, "server.key")
+	}
+	return cert, key
+}
+
+// ServiceDecl 为 agent 配置里声明的受管服务（DESIGN §4.3、SPEC-M1b-a §2）。
+// 状态每 15s 随心跳上报；type 决定查询途径，target 为查询对象（白名单字符集）。
+type ServiceDecl struct {
+	// Name 为服务显示名（console services 表按 (node_id, name) 唯一）。
+	Name string `yaml:"name"`
+	// Type ∈ systemd | docker | process；非法值拒绝启动。
+	Type string `yaml:"type"`
+	// Target 为查询对象：systemd unit 名 / docker 容器名 / pgrep -f 模式。
+	Target string `yaml:"target"`
+}
+
+// CustomAgent 为显式声明的 CLI 型 AI agent（DESIGN §4.2-A；声明优先于 PATH 探测）。
+type CustomAgent struct {
+	Name string `yaml:"name"`
+	// Type 目前仅支持 cli（服务型走 AgentScanCfg.Services 端口探测）。
+	Type string `yaml:"type"`
+	// Command 必须为绝对路径（相对路径拒绝启动，SPEC §4 配置校验）。
+	Command string `yaml:"command"`
+	// VersionFlag 为版本探测参数，缺省 "--version"。
+	VersionFlag string `yaml:"version_flag"`
+}
+
+// CustomAgentService 为显式声明的服务型 AI agent：仅本地端口探测存活性登记，
+// 不可 invoke（DESIGN §1 v1 边界：服务型 agent 只发现登记）。
+type CustomAgentService struct {
+	Name string `yaml:"name"`
+	Port int    `yaml:"port"`
+}
+
+// AgentScanCfg 为 AI agent 扫描配置（DESIGN §4.2-A 双轨机制）。
+type AgentScanCfg struct {
+	// Known 覆盖内置已知 CLI 清单（默认 zcode/codex/claude/gemini/aider）。
+	// nil（配置里未出现 known 键）→ 用默认清单；显式给出（含空列表）→ 整体替换，
+	// 增删都通过改列表完成。扫描方式：PATH 存在性 + --version（5s 超时）。
+	Known *[]string `yaml:"known"`
+	// Custom 为自定义 CLI 声明，与 PATH 探测结果合并、同名时声明优先。
+	Custom []CustomAgent `yaml:"custom"`
+	// Services 为服务型 agent（端口探测登记，不参与 invoke）。
+	Services []CustomAgentService `yaml:"services"`
+}
+
+// DefaultKnownAgents 为内置已知 AI CLI 清单（SPEC-M1b-a §3）。
+func DefaultKnownAgents() []string {
+	return []string{"zcode", "codex", "claude", "gemini", "aider"}
+}
+
+// maxAgentScanTotal 为 agent_scan 合并去重后的 agent 总数上限（R10-#7），
+// 与 console 心跳 agents 数组上限一致（internal/registry maxAgents=64）。
+const maxAgentScanTotal = 64
+
+// KnownList 返回生效的已知清单（未配置取默认）。
+func (a AgentScanCfg) KnownList() []string {
+	if a.Known == nil {
+		return DefaultKnownAgents()
+	}
+	return *a.Known
 }
 
 // Agent 为 meshagent（节点代理）配置。
 type Agent struct {
 	// ConsoleURL 留空时使用本地 state 文件里注册时记录的地址。
+	// https:// 时必须配置 CACert 或 Fingerprint 之一（不提供跳过验证的选项）。
 	ConsoleURL string `yaml:"console_url"`
 	// StateFile 为节点 token 持久化路径（0600）。空值取平台默认。支持 ~ 展开。
 	StateFile string `yaml:"state_file"`
@@ -106,7 +192,29 @@ type Agent struct {
 	CollectIntervalS int `yaml:"collect_interval_s"`
 	// DiskMount 为磁盘指标采集挂载点；空值按平台取 "/"（Windows 取 "C:\\"）。
 	DiskMount string `yaml:"disk_mount"`
-	LogLevel  string `yaml:"log_level"`
+	// CACert 为控制台 CA 证书 PEM 路径（DESIGN §7-3 带外分发）；与 Fingerprint
+	// 任一配置即启用 TLS 验证。仅对 https:// 上报生效。
+	CACert string `yaml:"ca_cert"`
+	// Fingerprint 为控制台服务端证书 SHA-256 指纹（`meshconsole pki` 输出）；
+	// hex，冒号分隔与大小写均可，加载时归一化。
+	Fingerprint string `yaml:"fingerprint"`
+	// DockerBin 为 docker CLI 可执行路径（R10-#4，默认 "docker"）。生产部署中
+	// docker 访问必须以只读 helper 或 socket-proxy 提供（DESIGN §7-5，M1b-b 部署
+	// 落地），本项用于指向受限包装脚本。
+	DockerBin string `yaml:"docker_bin"`
+	// Services 为受管服务声明（每 15s 查询状态随心跳上报）。
+	Services []ServiceDecl `yaml:"services"`
+	// AgentScan 为 AI agent 发现配置；nil（未配置）等价零值（默认清单、无自定义）。
+	AgentScan *AgentScanCfg `yaml:"agent_scan"`
+	LogLevel  string        `yaml:"log_level"`
+}
+
+// ScanCfg 返回 agent 扫描配置（未配置时返回零值结构）。
+func (a *Agent) ScanCfg() AgentScanCfg {
+	if a.AgentScan == nil {
+		return AgentScanCfg{}
+	}
+	return *a.AgentScan
 }
 
 func readFile(path string) ([]byte, error) {
@@ -136,31 +244,60 @@ func ExpandHome(p string) string {
 	return filepath.Join(home, p[1:])
 }
 
-// LoadConsole 载入控制台配置。path 为空或文件不存在时返回纯缺省配置。
-func LoadConsole(path string) (*Console, error) {
+// parseConsole 解析 console 配置文件并做与注册 token 无关的公共校验。
+// 返回 loaded=false 表示空路径或文件不存在（调用方拿到纯缺省配置、不做强制校验，
+// 与 M1a 行为一致）。
+func parseConsole(path string) (*Console, bool, error) {
 	cfg := &Console{
 		Listen:               "127.0.0.1:7700",
 		DBPath:               "./data/meshconsole.db",
 		OfflineAfterS:        60,
 		MetricsRetentionDays: 7,
+		PKIDir:               "./pki",
+		MaxConnections:       256,
 		LogLevel:             "info",
 	}
 	if path == "" {
-		return cfg, nil
+		return cfg, false, nil
 	}
 	data, err := readFile(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if data == nil {
-		return cfg, nil
+		return cfg, false, nil
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, false, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	cfg.DBPath = ExpandHome(cfg.DBPath)
+	cfg.PKIDir = ExpandHome(cfg.PKIDir)
+	cfg.TLSCert = ExpandHome(cfg.TLSCert)
+	cfg.TLSKey = ExpandHome(cfg.TLSKey)
 	if cfg.Listen == "" || cfg.DBPath == "" {
-		return nil, fmt.Errorf("console.listen / console.db_path 不得为空")
+		return nil, false, fmt.Errorf("console.listen / console.db_path 不得为空")
+	}
+	if cfg.MaxConnections <= 0 {
+		return nil, false, fmt.Errorf("console.max_connections 必须为正数（LimitListener 连接总数上限）")
+	}
+	if cfg.OfflineAfterS <= 0 || cfg.MetricsRetentionDays <= 0 {
+		return nil, false, fmt.Errorf("console.offline_after_s / metrics_retention_days 必须为正数")
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	return cfg, true, nil
+}
+
+// LoadConsole 载入控制台配置（服务模式，含注册 token 强制校验）。
+// path 为空或文件不存在时返回纯缺省配置（不做 token 校验，与 M1a 行为一致）。
+func LoadConsole(path string) (*Console, error) {
+	cfg, loaded, err := parseConsole(path)
+	if err != nil {
+		return nil, err
+	}
+	if !loaded {
+		return cfg, nil
 	}
 	if len(cfg.RegistrationTokens) == 0 {
 		return nil, fmt.Errorf("console.registration_tokens: 至少需要一个一次性注册 token")
@@ -184,13 +321,202 @@ func LoadConsole(path string) (*Console, error) {
 		}
 		cfg.RegistrationTokens[i] = t
 	}
-	if cfg.OfflineAfterS <= 0 || cfg.MetricsRetentionDays <= 0 {
-		return nil, fmt.Errorf("console.offline_after_s / metrics_retention_days 必须为正数")
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
 	return cfg, nil
+}
+
+// LoadConsoleForPKI 载入控制台配置但不强制注册 token（`meshconsole pki` 生成证书
+// 时使用：pki 子命令只关心 pki_dir/tailnet_ip 等字段，不应因 token 未配置而拒绝）。
+// 共享字段的校验（listen/db_path/连接上限）与完整加载保持一致。
+func LoadConsoleForPKI(path string) (*Console, error) {
+	cfg, _, err := parseConsole(path)
+	return cfg, err
+}
+
+// NormalizeFingerprint 归一化证书指纹：去冒号/空白、转小写；非 64 位 hex 报错。
+func NormalizeFingerprint(fp string) (string, error) {
+	var b strings.Builder
+	for _, r := range fp {
+		if r == ':' || r == ' ' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	s := strings.ToLower(b.String())
+	if len(s) != 64 {
+		return "", fmt.Errorf("fingerprint 须为服务端证书 SHA-256 指纹的 64 位 hex（meshconsole pki 会输出）")
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			// 不回显原值：错误信息不留任何证书材料片段（R11-C）。
+			return "", fmt.Errorf("fingerprint 含非 hex 字符（须为 64 位 hex，`meshconsole pki` 输出）")
+		}
+	}
+	return s, nil
+}
+
+// ValidServiceTarget 报告 systemd/docker 型 target 是否在白名单字符集内
+// （[a-zA-Z0-9_@.-]，SPEC-M1b-a §2：exec 固定 argv + 字符集白名单双保险）。
+// 以 - 开头一律拒绝：exec 无 shell 仍可能被 systemctl/docker 当作选项解析。
+func ValidServiceTarget(target string) bool {
+	if target == "" || target[0] == '-' {
+		return false
+	}
+	for _, r := range target {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '@' || r == '.' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validProcessTarget 校验 process 型 target（pgrep -f 模式）：可含空格但禁止
+// 控制字符与开头的 -（防被解析为 pgrep 参数），长度有界。
+func validProcessTarget(target string) bool {
+	if target == "" || len(target) > 256 || target[0] == '-' {
+		return false
+	}
+	for _, r := range target {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validLabelCfg(s string, max int) bool {
+	if s == "" || len(s) > max {
+		return false
+	}
+	for _, r := range s {
+		if r <= ' ' || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// validateAgentServices 校验受管服务声明：type 合法、target 白名单、名称唯一、数量有界。
+func validateAgentServices(services []ServiceDecl) error {
+	if len(services) > 32 {
+		return fmt.Errorf("agent.services: 条目数不得超过 32")
+	}
+	seen := map[string]bool{}
+	for i, s := range services {
+		if !validLabelCfg(s.Name, 128) {
+			return fmt.Errorf("agent.services[%d]: name 非空、无空白且 ≤128 字节", i)
+		}
+		if seen[s.Name] {
+			return fmt.Errorf("agent.services[%d]: name %q 重复", i, s.Name)
+		}
+		seen[s.Name] = true
+		switch s.Type {
+		case "systemd", "docker":
+			if !ValidServiceTarget(s.Target) {
+				return fmt.Errorf("agent.services[%d] (%s): target 须匹配 [a-zA-Z0-9_@.-] 且非空，got %q", i, s.Type, s.Target)
+			}
+		case "process":
+			if !validProcessTarget(s.Target) {
+				return fmt.Errorf("agent.services[%d] (process): target 须非空、无控制字符、不以 - 开头", i)
+			}
+		default:
+			return fmt.Errorf("agent.services[%d]: type 须为 systemd|docker|process，got %q", i, s.Type)
+		}
+	}
+	return nil
+}
+
+// validateAgentScan 校验 AI agent 扫描声明：custom 命令绝对路径、类型合法、
+// 名称唯一（custom 与 services 之间亦不得重名），端口在值域内。
+func validateAgentScan(scan *AgentScanCfg) error {
+	if scan == nil {
+		return nil
+	}
+	if scan.Known != nil {
+		seen := map[string]bool{}
+		for _, n := range *scan.Known {
+			if !validLabelCfg(n, 64) {
+				return fmt.Errorf("agent_scan.known: %q 须为非空无空白 ≤64 字节的 CLI 名", n)
+			}
+			if seen[n] {
+				return fmt.Errorf("agent_scan.known: %q 重复", n)
+			}
+			seen[n] = true
+		}
+	}
+	if len(scan.Custom) > 32 {
+		return fmt.Errorf("agent_scan.custom: 条目数不得超过 32")
+	}
+	if len(scan.Services) > 32 {
+		return fmt.Errorf("agent_scan.services: 条目数不得超过 32")
+	}
+	names := map[string]bool{}
+	for i, c := range scan.Custom {
+		if !validLabelCfg(c.Name, 128) {
+			return fmt.Errorf("agent_scan.custom[%d]: name 非空、无空白且 ≤128 字节", i)
+		}
+		if names[c.Name] {
+			return fmt.Errorf("agent_scan.custom[%d]: name %q 重复（custom 与 services 不得重名）", i, c.Name)
+		}
+		names[c.Name] = true
+		typ := c.Type
+		if typ == "" {
+			typ = "cli"
+		}
+		if typ != "cli" {
+			return fmt.Errorf("agent_scan.custom[%d]: type 须为 cli（服务型 agent 走 agent_scan.services），got %q", i, c.Type)
+		}
+		cmd := ExpandHome(strings.TrimSpace(c.Command))
+		if !filepath.IsAbs(cmd) {
+			return fmt.Errorf("agent_scan.custom[%d] (%s): command 必须为绝对路径，got %q", i, c.Name, c.Command)
+		}
+		vf := strings.TrimSpace(c.VersionFlag)
+		if vf == "" {
+			vf = "--version"
+		}
+		if len(vf) > 64 {
+			return fmt.Errorf("agent_scan.custom[%d]: version_flag 过长（≤64）", i)
+		}
+		for _, r := range vf {
+			if r < 0x20 || r == 0x7f {
+				return fmt.Errorf("agent_scan.custom[%d]: version_flag 含控制字符", i)
+			}
+		}
+		scan.Custom[i].Command = cmd
+		scan.Custom[i].VersionFlag = vf
+		scan.Custom[i].Type = typ
+	}
+	for i, s := range scan.Services {
+		if !validLabelCfg(s.Name, 128) {
+			return fmt.Errorf("agent_scan.services[%d]: name 非空、无空白且 ≤128 字节", i)
+		}
+		if names[s.Name] {
+			return fmt.Errorf("agent_scan.services[%d]: name %q 与 custom 重名", i, s.Name)
+		}
+		names[s.Name] = true
+		if s.Port < 1 || s.Port > 65535 {
+			return fmt.Errorf("agent_scan.services[%d] (%s): port 须在 1-65535，got %d", i, s.Name, s.Port)
+		}
+	}
+	// R10-#7：合并去重后的 agent 总数不得超过 64——与 console 心跳 agents 数组
+	// 上限（registry maxAgents=64）一致，超限的扫描结果上报时会被 400 拒绝，
+	// 必须在启动时即拒绝而非等心跳失败。同名时声明覆盖 PATH 探测，合并按名去重。
+	merged := map[string]bool{}
+	for _, n := range scan.KnownList() {
+		merged[n] = true
+	}
+	for _, c := range scan.Custom {
+		merged[c.Name] = true
+	}
+	for _, s := range scan.Services {
+		merged[s.Name] = true
+	}
+	if len(merged) > maxAgentScanTotal {
+		return fmt.Errorf("agent_scan: 合并去重后 agent 总数为 %d，不得超过 %d（与心跳 agents 数组上限一致）；请精简 known/custom/services", len(merged), maxAgentScanTotal)
+	}
+	return nil
 }
 
 // LoadAgent 载入代理配置。path 为空或文件不存在时返回纯缺省配置。
@@ -200,6 +526,7 @@ func LoadAgent(path string) (*Agent, error) {
 		CollectIntervalS: 15,
 		DiskMount:        DefaultDiskMount(),
 		StateFile:        DefaultStatePath(),
+		DockerBin:        "docker",
 		LogLevel:         "info",
 	}
 	if path == "" {
@@ -227,6 +554,35 @@ func LoadAgent(path string) (*Agent, error) {
 	cfg.StateFile = ExpandHome(strings.TrimSpace(cfg.StateFile))
 	if cfg.StateFile == "" {
 		cfg.StateFile = DefaultStatePath()
+	}
+	// TLS 固定验证（DESIGN §7-3）：console_url 强制 https（R10-#1，明文 http
+	// 一律拒绝），且 https 必须带 ca_cert 或 fingerprint 之一；不提供跳过验证
+	// 的选项，配置缺失直接拒绝启动。
+	cfg.CACert = ExpandHome(strings.TrimSpace(cfg.CACert))
+	if cfg.Fingerprint != "" {
+		fp, err := NormalizeFingerprint(cfg.Fingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("agent.fingerprint: %w", err)
+		}
+		cfg.Fingerprint = fp
+	}
+	if cfg.ConsoleURL != "" {
+		if u, err := url.Parse(strings.TrimSpace(cfg.ConsoleURL)); err != nil || u.Scheme != "https" || u.Host == "" {
+			return nil, fmt.Errorf("agent.console_url 必须为 https:// 地址（明文 http 已不再支持，DESIGN §7-3），got %q", cfg.ConsoleURL)
+		}
+		if cfg.CACert == "" && cfg.Fingerprint == "" {
+			return nil, fmt.Errorf("agent.console_url 为 https 时必须配置 ca_cert 或 fingerprint 之一（不提供跳过验证的选项；指纹由控制台 `meshconsole pki` 输出）")
+		}
+	}
+	// docker CLI 路径（R10-#4）：缺省 "docker"，支持 ~ 展开；空串归缺省。
+	if cfg.DockerBin = ExpandHome(strings.TrimSpace(cfg.DockerBin)); cfg.DockerBin == "" {
+		cfg.DockerBin = "docker"
+	}
+	if err := validateAgentServices(cfg.Services); err != nil {
+		return nil, err
+	}
+	if err := validateAgentScan(cfg.AgentScan); err != nil {
+		return nil, err
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"

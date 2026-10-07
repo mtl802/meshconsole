@@ -5,7 +5,10 @@ CROSS_TARGETS := linux/amd64 darwin/arm64 windows/amd64
 
 GO ?= go
 
-.PHONY: build cross test vet fmt clean
+# console 配置文件路径（pki 目标读取其中的 pki_dir/tailnet_ip）。
+CONFIG ?= console.yaml
+
+.PHONY: build cross test vet fmt clean pki
 
 build: $(BINS)
 
@@ -14,6 +17,12 @@ bin/meshconsole: $(shell find cmd internal -name '*.go')
 
 bin/meshagent: $(shell find cmd internal -name '*.go')
 	$(GO) build -ldflags '$(LDFLAGS)' -o $@ ./cmd/agent
+
+# pki：幂等生成 CA + 服务端证书到 pki_dir（缺省 ./pki，私钥 0600）。
+# 已存在则不重新生成、不覆盖私钥；打印服务端证书 SHA-256 指纹供 agent 配置。
+# 注意勿并行运行（无跨进程锁，R11-E）：并发执行可能产生配对不一致产物。
+pki: bin/meshconsole
+	./bin/meshconsole pki -config $(CONFIG)
 
 # 三平台交叉编译（SPEC 验收 1）：linux/amd64、darwin/arm64、windows/amd64
 cross:

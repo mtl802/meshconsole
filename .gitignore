@@ -6,3 +6,4 @@
 meshagent-state.json
 console.yaml
 agent.yaml
+.pipeline/

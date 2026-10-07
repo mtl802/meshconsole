@@ -2,6 +2,8 @@
 //
 //	meshagent register -console <url> -token <注册token> -name <名称>
 //	meshagent run [-config <path>]
+//
+// console 地址强制 https（R10-#1），不存在明文 http 路径。
 package main
 
 import (
@@ -17,6 +19,7 @@ import (
 
 	"github.com/mtl802/meshconsole/internal/agent"
 	"github.com/mtl802/meshconsole/internal/agent/collect"
+	"github.com/mtl802/meshconsole/internal/agentdisc"
 	"github.com/mtl802/meshconsole/internal/config"
 )
 
@@ -41,20 +44,25 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `meshagent (%s)
 用法:
   meshagent register -console <url> -token <注册token> -name <名称> [-role <角色>] [-state <path>]
+                     [-ca-cert <CA证书路径>] [-fingerprint <SHA-256指纹>]
+                     （https 地址必须带 -ca-cert 或 -fingerprint 之一）
   meshagent run [-config <path>] [-state <path>]
 `, version)
 	os.Exit(2)
 }
 
 // cmdRegister 执行一次性注册并持久化节点 token（0600 JSON）。
+// https 上报必须带 -ca-cert 或 -fingerprint 之一（或配置文件已配）。
 func cmdRegister(args []string) int {
 	fs := flag.NewFlagSet("register", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "配置文件路径（可选，用于读取 role/state_file 等缺省值）")
-	console := fs.String("console", "", "控制台地址，如 http://127.0.0.1:7700")
+	cfgPath := fs.String("config", "", "配置文件路径（可选，用于读取 role/state_file/ca_cert/fingerprint 等缺省值）")
+	console := fs.String("console", "", "控制台地址，如 https://127.0.0.1:7700")
 	token := fs.String("token", "", "一次性注册 token")
 	name := fs.String("name", "", "节点名称")
 	role := fs.String("role", "", "节点角色（默认 node 或配置文件值）")
 	statePath := fs.String("state", "", "state 文件路径（默认 ~/.meshagent/state.json）")
+	caCert := fs.String("ca-cert", "", "控制台 CA 证书 PEM 路径（https 验证；缺省取配置值）")
+	fingerprint := fs.String("fingerprint", "", "控制台服务端证书 SHA-256 指纹（https 固定验证；缺省取配置值）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -76,11 +84,22 @@ func cmdRegister(args []string) int {
 	if path == "" {
 		path = cfg.StateFile
 	}
+	if *caCert == "" {
+		*caCert = cfg.CACert
+	}
+	if *fingerprint == "" {
+		*fingerprint = cfg.Fingerprint
+	}
+	client, err := agent.NewHTTPClient(*console, *caCert, *fingerprint)
+	if err != nil {
+		log.Error("build http client", "err", err)
+		return 1
+	}
 
 	// 注册请求绑定 ctx + 超时（审查 R1-#10：所有出站请求可取消）。
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	st, err := agent.Register(ctx, *console, *token, *name, *role, runtime.GOOS, runtime.GOARCH)
+	st, err := agent.Register(ctx, client, *console, *token, *name, *role, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		log.Error("register failed", "err", err)
 		return 1
@@ -132,9 +151,18 @@ func cmdRun(args []string) int {
 	log.Info("meshagent starting", "version", version, "console", consoleURL,
 		"node_id", st.NodeID, "name", st.Name, "interval_s", cfg.CollectIntervalS)
 
+	// 上报客户端：https 时强制 TLS 固定验证（ca_cert 链和/或 fingerprint），
+	// 两者皆空在此处直接启动失败（不提供跳过验证的选项）。
+	client, err := agent.NewHTTPClient(consoleURL, cfg.CACert, cfg.Fingerprint)
+	if err != nil {
+		log.Error("build http client", "err", err)
+		return 1
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	scanCfg := cfg.ScanCfg()
 	runner := &agent.Runner{
 		Cfg:     cfg,
 		State:   st,
@@ -142,6 +170,12 @@ func cmdRun(args []string) int {
 		Log:     log,
 		Collector: collect.NewCollector(cfg.DiskMount,
 			time.Duration(cfg.CollectIntervalS)*time.Second),
+		// 服务状态查询（配置未声明时 CheckAll 不执行、心跳不带 services 字段）；
+		// docker 型走配置的 docker_bin（默认 "docker"，生产建议只读 helper）。
+		Services: collect.NewServiceChecker(cfg.Services, cfg.DockerBin),
+		// AI agent 发现（默认已知清单 + 自定义声明，低频 5 分钟）。
+		Discover: agentdisc.New(scanCfg.KnownList(), scanCfg.Custom, scanCfg.Services),
+		Client:   client,
 	}
 	if err := runner.Run(ctx); err != nil {
 		log.Error("agent run failed", "err", err)

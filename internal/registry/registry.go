@@ -11,6 +11,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -37,6 +38,11 @@ const (
 	maxInFlight      = 64      // DESIGN §7-4/§7-9：并发上限，超限拒绝
 	maxCollectErrors = 16      // collect_errors 条目数上限
 	maxCollectErrKv  = 256     // collect_errors 单条 key/value 长度上限
+	maxServices      = 64      // 心跳 services 数组条目上限（M1 规模富余）
+	maxAgents        = 64      // 心跳 agents 数组条目上限
+	maxSvcDetail     = 512     // 服务/agent detail 长度上限
+	maxAgentVersion  = 128     // agent 版本串长度上限
+	maxAgentPath     = 512     // agent 路径长度上限
 )
 
 // Handler 为 agent API 的 HTTP 处理器集合。
@@ -336,6 +342,52 @@ type heartbeatReq struct {
 	Metrics      metricsIn `json:"metrics"`
 	// CollectErrors 字段名 -> 采集失败原因；非空时 last_success 不刷新。
 	CollectErrors map[string]string `json:"collect_errors"`
+	// Services / Agents 为 M1b-a 扩展（可选数组字段）。R11-A：以 json.RawMessage
+	// 承载，解码后区分三态——字段缺席 → 无变化不覆盖；显式 `[]` → 全量替换
+	// （既有行转 stale）；**显式 `null` → 协议违规 400**（null 不是合法上报，
+	// 不得与缺席混同）。以本次上报为准 UPSERT（SPEC-M1b-a §4）。
+	Services json.RawMessage `json:"services"`
+	Agents   json.RawMessage `json:"agents"`
+}
+
+// errNullField 为可选数组字段收到显式 null 的协议违规。
+var errNullField = errors.New("explicit null not allowed for optional array field")
+
+// optionalArray 解释可选数组字段的三态（R11-A）：返回 present=false 表示字段
+// 缺席（无变化）；raw 为显式 null → errNullField；显式数组（含空数组）→ 解码
+// 并返回 present=true。
+func optionalArray[T any](raw json.RawMessage) (present bool, val []T, err error) {
+	if len(raw) == 0 {
+		return false, nil, nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return false, nil, errNullField
+	}
+	if err := json.Unmarshal(trimmed, &val); err != nil {
+		return false, nil, err
+	}
+	return true, val, nil
+}
+
+// serviceIn 为心跳上报的单条受管服务状态。
+type serviceIn struct {
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Target string `json:"target"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// agentIn 为心跳上报的单条 AI agent 发现结果。
+type agentIn struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Version string `json:"version"`
+	Path    string `json:"path"`
+	Status  string `json:"status"`
+	Detail  string `json:"detail"`
+	// Invokable 不在协议内：服务端强制 false（发现 ≠ 可调用，DESIGN §4.2-B）。
 }
 
 // metricsIn 与 agent 上报结构对应；指针承载 null 语义——采集失败的字段为 nil，禁止填 0。
@@ -405,6 +457,107 @@ func sanitizeErrStr(s string, max int) string {
 	return b.String()
 }
 
+// validateServices 校验心跳 services 数组（值域 + 上限 + 重名），返回入库行。
+// 服务端不信任 agent 配置：type/status 枚举、名称/target 有界、detail 净化。
+func validateServices(in []serviceIn) ([]store.ServiceRow, error) {
+	if len(in) > maxServices {
+		return nil, fmt.Errorf("too many services (%d > %d)", len(in), maxServices)
+	}
+	seen := map[string]bool{}
+	out := make([]store.ServiceRow, 0, len(in))
+	for i, s := range in {
+		name := sanitizeErrStr(s.Name, 128)
+		typ := sanitizeErrStr(s.Type, 32)
+		target := sanitizeErrStr(s.Target, 256)
+		status := sanitizeErrStr(s.Status, 32)
+		if name == "" {
+			return nil, fmt.Errorf("services[%d]: empty name", i)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("services[%d]: duplicate name %q", i, name)
+		}
+		seen[name] = true
+		switch typ {
+		case "systemd", "docker":
+			// 与 agent 配置校验同一白名单：入库的 target 必须安全。
+			if target == "" || target[0] == '-' {
+				return nil, fmt.Errorf("services[%d]: bad target", i)
+			}
+			for _, r := range target {
+				if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+					r == '_' || r == '@' || r == '.' || r == '-') {
+					return nil, fmt.Errorf("services[%d]: bad target charset", i)
+				}
+			}
+		case "process":
+			if target == "" || target[0] == '-' {
+				return nil, fmt.Errorf("services[%d]: bad target", i)
+			}
+		default:
+			return nil, fmt.Errorf("services[%d]: bad type %q", i, typ)
+		}
+		switch status {
+		case "active", "inactive", "failed", "unavailable", "unknown":
+		default:
+			return nil, fmt.Errorf("services[%d]: bad status %q", i, status)
+		}
+		out = append(out, store.ServiceRow{
+			Name:   name,
+			Type:   typ,
+			Target: target,
+			Status: status,
+			Detail: sanitizeErrStr(s.Detail, maxSvcDetail),
+		})
+	}
+	return out, nil
+}
+
+// validateAgents 校验心跳 agents 数组（值域 + 上限 + 重名），返回入库行。
+func validateAgents(in []agentIn) ([]store.AgentRow, error) {
+	if len(in) > maxAgents {
+		return nil, fmt.Errorf("too many agents (%d > %d)", len(in), maxAgents)
+	}
+	seen := map[string]bool{}
+	out := make([]store.AgentRow, 0, len(in))
+	for i, a := range in {
+		name := sanitizeErrStr(a.Name, 128)
+		typ := sanitizeErrStr(a.Type, 32)
+		status := sanitizeErrStr(a.Status, 32)
+		if name == "" {
+			return nil, fmt.Errorf("agents[%d]: empty name", i)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("agents[%d]: duplicate name %q", i, name)
+		}
+		seen[name] = true
+		switch typ {
+		case "cli", "service":
+		default:
+			return nil, fmt.Errorf("agents[%d]: bad type %q", i, typ)
+		}
+		switch status {
+		case "active", "inactive", "unavailable", "unknown":
+		default:
+			return nil, fmt.Errorf("agents[%d]: bad status %q", i, status)
+		}
+		// path 禁控制字符（入库存档，后续面板会渲染，防注入同 §7-8）。
+		path := sanitizeErrStr(a.Path, maxAgentPath)
+		if strings.ContainsAny(path, "\x00") {
+			return nil, fmt.Errorf("agents[%d]: bad path", i)
+		}
+		out = append(out, store.AgentRow{
+			Name:    name,
+			Type:    typ,
+			Version: sanitizeErrStr(a.Version, maxAgentVersion),
+			Path:    path,
+			Status:  status,
+			// Invokable 由 store 层强制 false，这里不透传任何客户端输入。
+			Detail: sanitizeErrStr(a.Detail, maxSvcDetail),
+		})
+	}
+	return out, nil
+}
+
 // sanitizeCollectErrors 净化客户端可控的 collect_errors：限制条目数与单条长度、
 // 去控制字符；结构非法（条目超限/空 key/空 value）返回 ok=false 由调用方拒绝。
 func sanitizeCollectErrors(in map[string]string) (map[string]string, bool) {
@@ -424,6 +577,22 @@ func sanitizeCollectErrors(in map[string]string) (map[string]string, bool) {
 		out[k] = v
 	}
 	return out, true
+}
+
+// svcRowsOrNil / agentRowsOrNil 把三态映射为 store 层指针语义：
+// 缺席 → nil（不替换）；显式数组（含空数组）→ 非 nil 指针（全量替换）。
+func svcRowsOrNil(present bool, rows []store.ServiceRow) *[]store.ServiceRow {
+	if !present {
+		return nil
+	}
+	return &rows
+}
+
+func agentRowsOrNil(present bool, rows []store.AgentRow) *[]store.AgentRow {
+	if !present {
+		return nil
+	}
+	return &rows
 }
 
 func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -482,7 +651,46 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		Load1:         req.Metrics.Load1,
 		CollectErrors: errJSON,
 	}
-	stOK, err := h.st.Heartbeat(r.Context(), row, sanitizeErrStr(req.AgentVersion, 64))
+	// M1b-a 扩展：services/agents 数组三态（R11-A）——缺席不覆盖；显式 null
+	// 协议违规 400；显式数组（含 []）全量替换（含把消失条目转 stale）。校验先于
+	// 任何写库：值域违规与 metrics 校验同语义，整条拒绝、不落任何行。
+	svcPresent, svcIn, err := optionalArray[serviceIn](req.Services)
+	if err != nil {
+		h.log.Warn("heartbeat services field malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	var svcRows []store.ServiceRow
+	if svcPresent {
+		rows, verr := validateServices(svcIn)
+		if verr != nil {
+			h.log.Warn("heartbeat services invalid", "node", node.Name, "reason", verr.Error())
+			httpError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		svcRows = rows
+	}
+	agPresent, agIn, err := optionalArray[agentIn](req.Agents)
+	if err != nil {
+		h.log.Warn("heartbeat agents field malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	var agentRows []store.AgentRow
+	if agPresent {
+		rows, verr := validateAgents(agIn)
+		if verr != nil {
+			h.log.Warn("heartbeat agents invalid", "node", node.Name, "reason", verr.Error())
+			httpError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		agentRows = rows
+	}
+
+	// 单事务完成本次心跳全部写入（R11-F）：metrics 与 services/agents 全量替换
+	// 同一事务，任一失败整体回滚，不落半轮数据。
+	stOK, err := h.st.HeartbeatFull(r.Context(), row, sanitizeErrStr(req.AgentVersion, 64),
+		svcRowsOrNil(svcPresent, svcRows), agentRowsOrNil(agPresent, agentRows))
 	if err != nil {
 		h.log.Error("store heartbeat", "node", node.Name, "err", err)
 		httpError(w, http.StatusInternalServerError, "internal")

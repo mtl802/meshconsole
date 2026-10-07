@@ -1,12 +1,24 @@
 # meshagent 节点代理配置样例。
 # 拷贝为 agent.yaml 后修改；生产环境文件权限建议 600。
-# 首次使用先注册（注册 token 向控制台管理员带外索取）：
-#   meshagent register -console http://127.0.0.1:7700 -token <一次性注册token> -name mac-mini
+# 首次使用先注册（注册 token 向控制台管理员带外索取；控制台 M1b-a 起为 HTTPS）：
+#   meshagent register -console https://127.0.0.1:7700 -token <一次性注册token> \
+#     -name mac-mini -ca-cert ./pki/ca.crt -fingerprint <make pki 输出的指纹>
 # 之后运行：
 #   meshagent run -config agent.yaml
 
 # 控制台地址。留空则使用 state 文件中注册时记录的地址。
-console_url: "http://127.0.0.1:7700"
+# **只接受 https://**（R10-#1：明文 http 已在客户端与配置加载两处强制拒绝，
+# 本机调试用 pki 证书的 localhost SAN 即可，见下方 ca_cert/fingerprint）。
+# https 时必须配置 ca_cert 或 fingerprint 之一（TLS 固定验证，
+# 不提供跳过验证的选项）。
+console_url: "https://127.0.0.1:7700"
+
+# 控制台 CA 证书 PEM 路径（`make pki` 产物，经 SSH/手动等带外方式拷贝到本机）。
+# 与 fingerprint 任一配置即启用 TLS 验证；两者都配时链与指纹须同时通过。
+ca_cert: "~/.meshagent/pki/ca.crt"
+
+# 控制台服务端证书 SHA-256 指纹（`meshconsole pki` 输出，hex；冒号/大小写均可）。
+# fingerprint: "ab:cd:..."
 
 # 本地 state 文件（节点 token 持久化，0600）。断线恢复凭此续接，不重复注册。
 # 路径支持 ~ 展开；与默认路径 $HOME/.meshagent/state.json 一致。
@@ -20,6 +32,45 @@ collect_interval_s: 15
 
 # 磁盘指标采集挂载点；Windows 填 "C:\\"。
 disk_mount: "/"
+
+# ---- 受管服务清单（DESIGN §4.3，每 15s 查询随心跳上报）----
+# **三态语义（R11-B）**：本段整个缺席 = 无变化（console 保留既有清单）；
+# 要移除全部受管服务，必须显式写 `services: []`（console 把既有条目全转 stale）。
+# type: systemd（systemctl is-active，按退出码+文本双口径判状态）|
+#       docker（<docker_bin> ps 只读 CLI）| process（pgrep -f 计数，macOS/Windows 兜底）。
+# systemd/docker 的 target 限字符集 [a-zA-Z0-9_@.-] 且不以 - 开头。
+#
+# docker CLI 路径（R10-#4，默认 "docker"）。**生产部署注意（DESIGN §7-5）**：
+# 普通 docker CLI 等价于宿主 root（挂载 docker.sock 可逃逸），生产环境必须以
+# 只读 helper 或 socket-proxy 提供受限的 docker 访问，并把本项指向该包装入口；
+# 完整接线在 M1b-b 部署批次落地。
+# docker_bin: "/usr/local/bin/docker-readonly"
+#
+# macOS 本机示例：
+# services:
+#   - name: meshagent
+#     type: process
+#     target: meshagent
+#   - name: nextcloud
+#     type: docker
+#     target: nextcloud
+
+# ---- AI agent 发现（DESIGN §4.2-A，低频 5 分钟扫描随心跳上报）----
+# known:       覆盖内置已知 CLI 清单（默认 zcode/codex/claude/gemini/aider）；
+#              未配置该键 → 用默认；显式给出（含空列表）→ 整体替换。
+# custom:      显式声明 CLI 型 agent（command 必须绝对路径），同名覆盖 PATH 探测。
+# services:    服务型 agent：仅本地端口探测存活性登记（v1 不可 invoke）。
+# 上限：known+custom+services 合并去重后总数不得超过 64（R10-#7，
+# 与 console 心跳 agents 数组上限一致），超限拒绝启动。
+# agent_scan:
+#   custom:
+#     - name: my-agent
+#       type: cli
+#       command: /opt/tools/my-agent
+#       version_flag: "--version"
+#   services:
+#     - name: hana-agent
+#       port: 5800
 
 # 日志级别：debug | info | warn | error（JSON 结构化输出）。
 log_level: "info"

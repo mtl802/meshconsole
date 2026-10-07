@@ -123,3 +123,139 @@
 |----|------|
 | 两路由独立 semaphore 合计 128 → 共享单个 64 | `internal/registry/registry.go:212-217`：`RegisterRoutes` 入口创建**单个** `sem := make(chan struct{}, maxInFlight)`（`:213`），register 与 heartbeat 两路由均传入同一 `sem`（`:215`/`:217`）——注册+心跳在处理请求合计不超 64 配额；`limitConcurrent` 签名由 `(n int, …)` 改为 `(sem chan struct{}, …)` 并删除函数内各自 `make`（`:171-183`），超限 503 语义不变 |
 | DESIGN.md §7-9 裁剪未同步 → 补范围注记 | `DESIGN.md:464-465` §7-9 资源限额补注：M1a 实现范围仅请求体 ≤1MB 与 handler 并发 ≤64（注册+心跳共享配额），连接总数限额随 TLS 于 M1b 实现；`DESIGN.md:447-448` §7-4「请求体/连接数限额」处同步同口径注记——两处与 R5 裁剪（连接总数上限移除）不再矛盾 |
+
+## R10 · codex 审查 M1b-a（2026-10-08 00:20）
+
+**结论：修改后通过。** 5 阻塞 + 2 建议。正向：netutil.LimitListener 用了官方实现（R5 教训吸收）、target 白名单/绝对路径/固定 argv 落实、M1a 语义无回退、无越界。
+
+### 裁决（Hana）
+
+| # | 意见 | 级别 | 裁决 |
+|---|------|------|------|
+| 1 | TLS 可绕过：HTTP 地址放行 + fingerprint-only 跳过链验证 | 阻塞 | **采纳**：agent 强制 HTTPS（HTTP 地址启动报错）、CheckRedirect 拒绝降级、指纹验证叠加证书链+有效期+主机名校验 |
+| 2 | CA 幂等覆盖路径：ca.crt 缺失但 ca.key 在时重生成覆盖 | 阻塞 | **采纳**：任一文件单独存在视为不完整拒绝生成；复用文件校验 0600 |
+| 3 | systemd 状态误报：非零退出全归 unavailable | 阻塞 | **采纳**：区分 is-active 状态退出码（0=active/3=inactive 等）与执行环境错误 |
+| 4 | Docker 权限边界：直接用普通 docker CLI | 阻塞 | **采纳+范围裁决**：本批改为可配置 docker bin 路径 + deploy 文档明确生产部署必须接 socket-proxy/受限 helper（M1b-b 部署落地）；理由：当前三节点无 docker daemon，该路径实际未激活，完整接线随部署做，配置化先行不留裸接口 |
+| 5 | 探测输出无内存上限（无限 Builder） | 阻塞 | **采纳**：写入阶段限额（capped buffer）+ 截断标记，符合 §7-9 |
+| 6 | 端口探测不响应 ctx 取消 | 建议 | **采纳**：DialTimeout → DialContext |
+| 7 | 发现配置容量与心跳 64 项限制不一致 | 建议 | **采纳**：合并去重后总数 >64 拒绝启动 |
+
+## R11 · codex 复审 M1b-a（2026-10-08 凌晨，值班员执行）
+
+**背景**：R10 裁决后上一会话中断，STATE.md 未更新；值班员按流程重跑 codex 审查（read-only 沙盒），14 条意见（7 阻塞 + 7 建议），tokens 95,972。与 R10 交叉比对：7 条与 R10 重合（不重复裁决，按 R10 口径执行），7 条为新增，逐条抽验源码后裁决如下。
+
+### 新增意见裁决（值班员，按伦哥既有授权自主裁决流程性问题）
+
+| # | 意见 | 级别 | 裁决 |
+|---|------|------|------|
+| A | registry.go:347 `*[]serviceIn` 指针字段：JSON `null` 与字段缺席在服务端合并为「无变化」，违反任务书审查重点「服务端不得把 null 当作字段缺席」；DELIVERY 自述「null=无变化」与任务书冲突 | 阻塞 | **采纳，以任务书为准**：JSON 层区分缺席/null/数组三态——缺席=无变化、显式 `[]`=全量替换、显式 `null`=400 拒绝（协议违规）；补 services/agents 三态回归测试 |
+| B | runner.go:151 services 配置段整个缺席时不发清单，「删光配置后历史服务永不转 stale」 | 建议 | **不采纳代码改动**（字段缺席=无变化是协议语义，显式 `[]` 全转 stale 已实现并 E2E 钉住）；**采纳文档补充**：deploy/agent.example.yaml 注明「移除全部受管服务时须显式写 `services: []`」 |
+| C | config.go:339 指纹错误 `%q` 回显原值，与 DELIVERY「错误信息不含指纹值」自述矛盾 | 建议 | **采纳**：错误信息不回显原值（含 NormalizeFingerprint 全路径） |
+| D | pki.go:208 复用既有 CA 时未校验证书/私钥配对与有效期，可能报告成功却产出不可验证证书 | 建议 | **采纳，与 R10 #2 合并执行**：复用前校验 ca_cert/ca_key、server_cert/server_key 配对（公钥比对）+ 私钥权限 0600，不匹配拒绝 |
+| E | pki.go:406 并发 Ensure 无跨进程锁，可覆盖私钥或 CA 配对不一致 | 建议 | **不采纳代码改动**（单管理员 make pki 串行执行，为极低概率场景加锁是设计债）；**采纳文档注明**「勿并行运行 make pki」 |
+| F | registry.go:640+ heartbeat/services/agents 三次独立事务，中途失败留半轮数据 | 建议 | **采纳**：同一心跳全部写入合并为单一事务（或等效原子路径），任一失败整体回滚 |
+| G | collect/services.go:74 服务查询串行，最多阻塞心跳 160s，超过 offline_after 60s | 建议 | **采纳轻量版**：整轮查询设总预算（10s ctx），超预算未完成的服务报 unknown+说明（如实），不引入并发复杂度 |
+
+**修复轮范围**：R10 全部 7 条 + 本表 A/C/D/F/G 代码项 + B/E 文档项 → 派 m1b-a-fix。验证口径不变：go vet / gofmt / go test -count=1 全绿 + make cross 三平台 + M1a 验收不回退。
+
+## 修复轮记录 · zcode m1b-a-fix（2026-10-08 完成）
+
+**R10 全部 7 条 + R11 新增裁决 A/C/D/F/G（代码）与 B/E（文档）共 14 条全部按口径修完。** 修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **90 用例全绿**（修复前基线 75 + 本轮新增 15）、`make cross` 三平台通过。未执行任何 git commit。
+
+### R10 七条修复（文件:行号 · 怎么修）
+
+| # | 修复说明 |
+|---|---|
+| 1 | 阻塞：TLS 可绕过。`internal/agent/client.go:34-66` `NewHTTPClient` 重写——`url.Parse` 后 scheme 非 https（含 http/其他 scheme/无 scheme）一律报错（`:42-44`，明文路径彻底移除；register/run/state 旧地址共用此入口全被拦）；`:52-63` `CheckRedirect` 拒绝向非 https 降级（报错含 `downgrade`），上限 3 跳防重定向环。指纹验证重做（`:73-122`）：ca_cert 模式不变（RootCAs 链+有效期+主机名，配指纹叠加复核 `:139-150`）；**仅指纹模式 `:95-105`——`InsecureSkipVerify` 仅为绕过系统信任库（自签 CA 不在其中），`verifyServedChain`（`:124-161`）以服务端握手下发的证书链重建完整 x509 验证（自签锚+签名链+有效期+ExtKeyUsage+主机名全执行），再叠加叶子 SHA-256 常量时间指纹比对**——不再是叶子字节单比对。两处关键防御：① `ServerName` 显式取自 console_url 主机名（`:74`），主机名校验不被跳过；② `:137-139` 下发链末端必须自签——Go x509 对「叶子自身在信任池」有直通捷径（`opts.Roots.contains(leaf)→{leaf}` 即过，签名链验证被架空；已用独立探针程序实测钉住），非自签锚直接拒绝。服务端配套：`internal/pki/pki.go:178-198` `ServerTLSConfig(cert,key,caPath)` 新增第三参，ca 确为签发方（CheckSignatureFrom）时把 CA 追加进下发链，仅指纹的 agent 才有信任锚；`cmd/console/main.go:220` 传 `pki_dir/ca.crt`（CA 缺失/不匹配保持原样不阻塞启动）。配置层：`internal/config/config.go:566-570` console_url 非 https 拒绝加载。测试 `internal/agent/client_test.go`：`:35` http/ftp/无 scheme 全拒；`:188` CA 签发四态——完整链过、leaf-only 拒（指纹匹配也不行，证明非字节比对）、过期拒、主机名不匹配拒；`:251` http 重定向拒；原自签 httptest 场景（自签锚=平凡链）全保留通过 |
+| 2 | 阻塞：CA 幂等覆盖路径。`internal/pki/pki.go:224-249` `loadCA` 按两文件存在性三分：均缺失→`errNoCA`（可安全新生成）；**任一单独存在→报「CA 不完整」拒绝生成并提示人工处置**（`:233-238`；修复前缺 ca.crt 而 ca.key 在会走 errNoCA 重新生成并覆盖 ca.key——审查指出的缺陷本体）；均在→解析校验复用。`Ensure`（`:70-133`）复用路径校验私钥权限：ca.key（`:103`）/server.key（`:126`）非 0600 报错（`requireKeyPerms :213-225`，含 chmod 提示；Windows 的 `Mode().Perm()` 不反映真实 ACL，平台豁免并注释）。测试 `internal/pki/pki_test.go:134`（cert-only/key-only 两场景：报错含「不完整/人工」、存量文件字节不变、不产生缺失侧新文件）、`:175`（ca.key/server.key 分别放宽 0644 拒绝，恢复 0600 幂等通过） |
+| 3 | 阻塞：systemd 状态误报。`internal/agent/collect/services.go:155-197` `checkSystemd` 按退出码分类（裁决口径）：0=active（`:195` 文本核对防编造）、**3=inactive（`:174-184`，"failed" 文本精化为 failed——现代 systemd failed 单元也退出 3，纯按码归 inactive 会丢 failed；""/"inactive"→inactive；其他文本 unknown+原文）**、其他非零按文本映射（`:186-188`）、**非 ExitError（命令不存在等执行器错误）才 unavailable（`:160-165`）**、超时 unknown（`:156-159`）。`:199-214` `systemdTextStatus` 文本映射抽出共用（active/inactive/failed 直映，空/中间态 unknown+原文）。修测试 mock：`internal/agent/collect/services_test.go:71-78` inactive 改注入 `exitErr(3)+inactive` 文本（原 mock 以 err=nil 返回，掩盖「非零退出全归 unavailable」缺陷本体）；`:73-75` failed=`exitErr(3)+"failed"`；`:82-84` unit 不存在=`exitErr(4)+inactive`→inactive；`:59-130` 全表 8 态断言 |
+| 4 | 阻塞（采纳+范围裁决）：Docker 边界。`internal/config/config.go:199-202` 新增 `Agent.DockerBin`（yaml `docker_bin`），`:581-583` 加载时 ExpandHome+TrimSpace、空串归缺省 `"docker"`（缺省结构体 `:532` 同）；`internal/agent/collect/services.go:105-115` `NewServiceChecker(decls, dockerBin)` 收路径、`:231` `checkDocker` 以 `c.dockerBin` 执行（原硬编码 `"docker"`）；`cmd/agent/main.go:174` 接线 `cfg.DockerBin`。文档（生产必须以只读 helper/socket-proxy 提供，M1b-b 落地）：`deploy/agent.example.yaml` services 段 + `deploy/console.example.yaml` 生产部署安全注意段 + DELIVERY §一/§四.9/§六。测试：`internal/config/config_test.go:462`（缺省/覆盖/空白归缺省）、`services_test.go:127-149`（断言 exec 的正是配置的 bin 路径且 argv 不变） |
+| 5 | 阻塞：探测输出无内存上限。`internal/agent/collect/services.go:37-39` `maxExecOutput=64KB`；`:60-84` `cappedBuffer` 写入阶段封顶（触顶丢弃+置位 truncated+报告全量写入不中断 io.Copy 语义）；`:88-98` `execRunner.Run` stdout/stderr 各挂 cappedBuffer、`cmdResult.truncated` 汇总；`:217-225` `markTruncated` 三型查询全部路径 detail 统一标注 `output truncated at 64KB`。`internal/agentdisc/agentdisc.go:37/186-206` 同口径 64KB cappedBuffer；`runVersion`（`:209-249`）：失败路径 detail 追加截断说明；**成功路径换行在封顶之内→首行版本可信照报；封顶吞掉换行→首行不完整不冒充版本，报 unavailable+truncated 说明**。测试：`services_test.go:255`（cappedBuffer 边界：未触顶/恰满/触顶丢弃+标记）、`:275`（execRunner 真实执行 640KB 输出→截断 64KB+标记、小输出不受影响）、`:302`（三型 detail 标注+inactive 空 detail 也标注）；`agentdisc_test.go:213`（版本行先出+200KB 噪声→版本正常；128KB 无换行→unavailable+truncated 且 Version 为空） |
+| 6 | 建议：端口探测响应取消。`internal/agentdisc/agentdisc.go:165-183` `portProbe(ctx, svc)` 签名加入 ctx，`net.DialTimeout`→`net.Dialer{Timeout}.DialContext(ctx,"tcp",addr)`；ctx 取消的探测错误单独分流——**报 unavailable+cancelled 说明，不编造 inactive**（`:171-175`），普通不可达仍 inactive+err 说明。`Scan`（`:92`）传 ctx。测试 `internal/agentdisc/agentdisc_test.go:191`（预取消 ctx→unavailable+detail）；`:169-186` `TestScanRespectsCtx` 断言收紧为不得编造 active/inactive |
+| 7 | 建议：发现配置容量对齐心跳 64 项。`internal/config/config.go:177` `maxAgentScanTotal=64`；`validateAgentScan`（`:436`）末尾 `:506-521` 计算 known+custom+services **合并去重**后总数（custom 同名覆盖 PATH 探测不重复计数，`KnownList()` 承载「未配置取默认 5 项」语义）>64 拒绝启动，报错注明与 console 心跳 agents 数组上限（registry `maxAgents=64`）一致。测试 `internal/config/config_test.go:497`（60 known+5 services=65 拒；60 known+1 同名 service 去重后 60 通过） |
+
+### R11 新增七条修复（文件:行号 · 怎么修）
+
+| # | 修复说明 |
+|---|---|
+| A | 阻塞：null 与缺席混同。`internal/registry/registry.go:347-349` `heartbeatReq.Services/Agents` 改 `json.RawMessage` 承载原始字节；`:356-372` `optionalArray[T]` 泛型三态解释——字段缺席（len==0）→ present=false 无变化；**显式 `null`（TrimSpace 后精确比对）→ `errNullField` 协议违规 400**；显式数组（含空数组）→ 解码 present=true。`handleHeartbeat`（`:649-682`）：null 先于值域校验拒绝（400 不落任何行）；`:584-592` `svcRowsOrNil`/`agentRowsOrNil` 把三态映射为 store 层 nil 指针语义（nil=不替换）。测试 `internal/registry/registry_test.go:653`：services/agents/双字段/带空白 null 四态 400 + 不落 metrics + 缺席对照 200 落库；原「缺席无变化」「`[]` 全转 stale」「值域 400」用例保持通过（`TestHeartbeatServicesAndAgents`/`TestHeartbeatServicesValidation`） |
+| B | 建议（文档）：`deploy/agent.example.yaml` services 段注明三态语义——本段整个缺席=无变化（console 保留既有清单），**移除全部受管服务必须显式写 `services: []`**（既有条目全转 stale） |
+| C | 建议：指纹错误不回显原值。`internal/config/config.go:349` `NormalizeFingerprint` 非 hex 报错删除 `%q` 回显，只提示格式要求（长度错误路径本就不回显；agent 侧 `client.go` normalizeFingerprint 亦不回显）——错误信息不留任何证书材料片段 |
+| D | 建议（与 R10 #2 合并执行）：CA 复用前配对校验。`internal/pki/pki.go:99-101` Ensure 复用分支先 `requireCAPair`（`:212-221`：ca.crt 的公钥必须就是 ca.key 的公钥，错配即报「不配对」拒绝——否则重签产物无法被 ca.crt 验证却报成功）再 `requireKeyPerms`（0600，R10 #2 已做）；server 侧 cert/key 错配由既有 `needsRenewal` 公钥比对触发重签自然修复（私钥不动）。测试 `internal/pki/pki_test.go:305`（CA A 的证书 + CA B 的私钥 → 报错含「不配对」） |
+| E | 建议（文档）：`deploy/console.example.yaml` pki 段与 `Makefile` pki 目标注明**勿并行运行 make pki**（无跨进程锁，并发执行可能产生配对不一致产物；工具会校验配对并拒绝，仍应避免） |
+| F | 建议：心跳三事务半轮数据。`internal/store/store.go:365-398` 心跳核心写入抽 `heartbeatTx`；`:564-607` 服务/agent 全量替换抽 `replaceServicesTx`/`replaceAgentsTx`（原 `ReplaceNodeServices`/`ReplaceNodeAgents` 公开方法保留、单表事务语义不变）；**新增 `:400-425` `HeartbeatFull`——单事务完成 metrics+节点时间戳+services 替换+agents 替换，任一步失败 defer Rollback 整体回滚**；`internal/registry/registry.go:692-694` handleHeartbeat 改调 HeartbeatFull 一次（原 Heartbeat→Replace×2 三次独立 store 调用删除）。测试 `internal/store/store_test.go:434`：一次调用三表齐写；nil 缺席不动既有清单、metrics 照写；**中途失败注入（4 万行服务批次超 SQLite 变量数上限 32766 令 markStale 的 NOT IN 报错，此刻 metrics 已在事务内写入）→ 断言 metrics 与既有服务行全部原样保留（无半轮数据）** |
+| G | 建议（轻量版）：服务查询整轮总预算。`internal/agent/collect/services.go:34-37` `scanBudget=10s`（32 条×5s 病态最坏会阻塞心跳超过 offline_after 60s）；`CheckAll`（`:120-145`）整轮 `context.WithTimeout` 包裹，预算耗尽后剩余条目不再执行、如实报 unknown+`budget exhausted` 说明（不编造状态），单条 5s 超时语义不变；`budget` 字段测试可注入（`:107`）。测试 `services_test.go:337`（1ns 注入预算→全部条目 unknown+budget 说明；默认预算对照全部 active） |
+
+**验证记录**：`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` 全绿（**90 用例**：store 13、registry 17、agent 12、collect 15、agentdisc 8、config 16、pki 7、cmd/console 2）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过。期间实测记录：① Go x509「叶子在信任池即直通」行为以独立探针程序复现并据此加固 `verifyServedChain`（R10 #1 ②）；② **真机冒烟抓到并修复一处缺陷**——CA 不完整报错文案的「缺失/存在」文件名写反（`loadCA` 的 swap 条件用了 certMissing，应为 keyMissing；单测只断言了关键词没断言文件名，已补强两场景断言），修复后冒烟确认：`meshconsole pki` 在 ca.crt 被删后报「CA 不完整：ca.crt 缺失但 ca.key 存在」且不覆盖 ca.key；③ 真机全链路冒烟：console HTTPS（curl --cacert → ok）、`meshagent register -fingerprint`（不带 ca_cert，走下发链+指纹）注册成功、篡改指纹 → `server certificate fingerprint mismatch`、`meshagent register -console http://…` → 启动即拒（明文路径已移除）。deploy 两样例、Makefile、DELIVERY.md（§一/§二.7/§三/§四/§六）同步更新。越界项（MCP/Headscale/Web）未触碰。
+
+## R12 · codex 复审 M1b-a（2026-10-08 01:0x，值班员执行）——**作废**
+
+审查启动时工作区仍在被首轮 zcode（m1b-a-fix，00:21 派工未中断）修改，审查对象为移动中的树，结论不具效力，意见不裁决。存档：.pipeline/m1b-a-review-codex2.log（1 阻塞 + 5 建议，均为 R11 已采纳项的未完成态，与 zcode 正在执行的修复范围一致，间接确认修复方向无误）。正式重审待真实 done 后执行（R13，codex3.log）。
+
+事故根因记录：同一任务名重复派工（00:21 + 00:31），第二轮被取消后 EXIT trap 写出假 done，值班员据假 done 推进验证与复审。防复发：处理 done 前先确认无 zcode-cli/pipeline-run.sh 进程存活（见 STATE.md 备忘）。
+
+## R13 · codex 复审 M1b-a（2026-10-08 01:30，Hana 主会话执行）
+
+**结论：修改后通过。** R10+R11 累计意见大部分关闭；HeartbeatFull 原子性深挖通过；optionalArray 三态正确。4 条残留全部裁决采纳修复：
+
+| # | 意见 | 级别 | 修复口径 |
+|---|------|------|----------|
+| 1 | self-issued 误当 self-signed（只比 RawIssuer==RawSubject 未验自身签名，同名单异密钥叶子可绕过） | 阻塞 | 锚入 Roots 前显式验证其自身签名（用锚公钥 verify 签名），补反例单测 |
+| 2 | CA 复用未查有效期（过期/未生效 CA 可重签出废证书） | 阻塞 | 复用分支加 NotBefore/NotAfter 校验，过期拒绝并提示重新 make pki |
+| 3 | 指纹错误 %q 回显非法字符（客户端 -fingerprint 路径） | 缺陷 | 去回显，仅提示格式要求 |
+| 4 | 截断版本误判有效（stderr 截断不查、空行+截断漏判） | 缺陷 | 针对实际选中的版本行判断完整性（截断标记的行不作版本） |
+
+## R14 · zcode 修复（2026-10-08 完成）
+
+**R13 四条残留全部按裁决修完。** 修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **94 用例全绿**（修复前基线 90 + 本轮新增 4：agent 2、pki 1、agentdisc 1）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过。未执行任何 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞：self-issued 误当 self-signed。`internal/agent/client.go:140-145` `verifyServedChain`：`RawIssuer==RawSubject` 名单判定之后、锚入信任池之前，**新增 `anchor.CheckSignature(anchor.SignatureAlgorithm, anchor.RawTBSCertificate, anchor.Signature)`——用锚自身公钥验证其 TBS 自签名**，签名不符报 `anchor that is not genuinely self-signed` 拒绝。堵的口子：同名单异密钥的伪造锚（名单复制真 CA、TBS 由攻击者私钥签署）此前可凭名字入池，叠加 Go「叶子即在信任池」的直通捷径令签名链验证整体放行；显式 CheckSignature 用的是纯签名验证（不走 `CheckSignatureFrom`，避免其对锚 IsCA 的附加约束误伤自签叶子单证书场景）。反例单测 `client_test.go` `TestVerifyServedChainRejectsImpostorAnchor`：伪造锚（Issuer==Subject 同名单、证书公钥=impostorKey、签名=signingKey 异密钥）+ 同名单异密钥叶子，两形态（单证书呈现 / 双证书链）均断言拒绝且错误含 `self-signed`；真自签路径（httptest 自签锚、CA 签发完整链）既有用例全部保持通过 |
+| 2 | 阻塞：CA 复用未查有效期。`internal/pki/pki.go:104-106` Ensure 复用分支（配对校验后、权限校验前）新增 `requireCAValidity`（`:226-239`）——用当前时间比对 NotBefore/NotAfter，**已过期报「CA 证书已过期（NotAfter …）…请人工整体移除 ca.crt/ca.key 后重新 make pki」、尚未生效同型报错，均拒绝复用**（过期 CA 重签出的服务端证书在客户端验证必然失败却会报成功）；注明作废后果（各 agent 的 ca_cert/指纹需同步更新）。单测 `pki_test.go` `TestEnsureRejectsExpiredCA`：过期（NotAfter=-1h）/未生效（NotBefore=+1h）两子场景断言报错含关键词与 `make pki` 提示、既有 CA 文件字节不变、不悄悄签发服务端证书；对照断言有效期内 CA 幂等复用不受影响（`TestEnsureIdempotent` 继续钉住零改动） |
+| 3 | 缺陷：指纹错误 %q 回显。`internal/agent/client.go:177-188` `normalizeFingerprint`：非 hex 分支删除 `fmt.Errorf("fingerprint contains non-hex char %q", …)` 回显，改与 config 侧 `NormalizeFingerprint`（R11-C 口径）逐字一致的无回显文案 `fingerprint 含非 hex 字符（须为 64 位 hex，`meshconsole pki` 输出）`；长度错误分支同步对齐中文文案（本就不回显）。单测 `client_test.go` `TestNormalizeFingerprintNoEcho`：非 hex（尾部 `zz` 标记）与长度错误（独特标记串）两路断言错误信息不含标记/原值、且含 hex 格式提示；冒号/大写归一化正路径回归 |
+| 4 | 缺陷：截断版本误判。`internal/agentdisc/agentdisc.go:233-260` `runVersion` 成功路径重写——版本值取自哪个缓冲（stdout 优先、空则 stderr 兜底）就按**该缓冲**的截断状态判断：新增 `firstLineComplete`（`:262-274`，行选取规则与 `firstLine` 完全一致）判定选中行在已捕获字节内是否有换行终止；**选中缓冲被封顶且选中行无换行终止 → 报 unavailable+`output truncated at 64KB before first line break`，半行不冒充版本**——修复前两处漏判：① stdout 空行的换行使 `Contains(captured,"\n")` 恒真、空行后被截断的半行照报；② 版本值兜底取自 stderr 时截断检查仍只看 stdout。另修复「退出 0 但全空输出」：任一缓冲被截断时「无输出」结论不可信，报 unavailable+truncated（不再静默 active+空版本）；选中行有换行终止（换行在封顶之内）仍可信照报（R10-#5 语义保持）。单测 `agentdisc_test.go` `TestVersionTruncatedSelectedLine` 四脚本：stdout 空行+半行截断、stdout 全空行+截断（两形态均 unavailable+truncated+版本空）、stderr 半行截断（unavailable）、对照 stderr 完整版本行+截断噪声（active 照报）；R10 既有 `TestVersionOutputCapped`（版本行先出+200KB 噪声照报 / 128KB 无换行拒绝）保持通过 |
+
+## R15 · codex 复审 M1b-a（2026-10-08 01:45-02:10，值班员执行）
+
+**结论：修改后通过。** m1b-a-fix2 真实 done 后的全量未提交改动复审（codex4.log，read-only 沙盒）。值班员先行独立验证：`go vet` 零输出、`gofmt -l` 无文件、`go test -count=1` **94 用例全绿**、`make cross` 三平台通过（已覆盖 #6 所述静态审查边界）。6 条意见逐条到源码核实：5 条属实裁决如下，#6 为审查方法自述无需动作。
+
+| # | 意见 | 级别 | 核实 | 裁决 |
+|---|------|------|------|------|
+| 1 | `internal/config/config.go:78` UnmarshalYAML 拒绝纯字符串 token 时 `%q` 回显原值，秘密凭据进启动错误日志 | 阻塞 | 属实（`fmt.Errorf("…: %q", s)`） | 采纳：删回显，仅留格式要求与示例（R11-C/R13-#3 同口径：凭据材料不进日志/错误信息）；补无回显单测 |
+| 2 | `internal/pki/pki.go:360` 附近 `needsRenewal` 只查 NotAfter，未生效（NotBefore 在未来）或无 ServerAuth EKU 的服务端证书被复用且报成功 | 阻塞 | 属实（现有检查：解析/NotAfter/CheckSignatureFrom/SAN） | 采纳：与 R13-#2 同类「报成功但客户端验证必然失败」；补 NotBefore 与 EKU（含 ExtKeyUsageAny 视为可用）检查触发既有重签路径；补两场景单测 |
+| 3 | `internal/pki/pki.go:189` 附近 `ServerTLSConfig` 加载私钥未查 0600，被放宽后仍可启动 | 建议 | 属实（Ensure 生成侧查，启动加载入口不查） | 采纳：加载阶段复用 `requireKeyPerms`（非 Windows，与 R10-#2 口径一致）；补放宽拒绝单测 |
+| 4 | 退出测试仅覆盖裸 `LimitListener.Close`（R5 回归），未覆盖 TLS 监听链 + drainHTTP Shutdown | 建议 | 属实（`cmd/console/main.go` drainHTTP 无端到端测试） | 采纳（轻量版，R11-G 先例）：补一例真实链路 Shutdown 回归（TLS 证书 + LimitListener 包裹 + 在途连接），不要求穷举全部故障组合 |
+| 5 | `DELIVERY.md` §四.4 仍记「最坏 160s 拖慢心跳」，与 R11-G 已实现的 10s 整轮预算冲突 | 可选（文档） | 属实（`services.go:34-37` scanBudget=10s） | 采纳：文档同步为 10s 预算语义 |
+| 6 | 静态审查边界自述（未重跑测试/未核定改动集） | 可选 | — | 无需动作：值班员已独立重跑全部验证 |
+
+**修复轮范围**：本表 #1/#2/#3/#4（代码）+ #5（文档）→ 派 m1b-a-fix3。验证口径不变：`go vet` / `gofmt` / `go test -count=1` 全绿 + `make cross` 三平台。返工计数：5 条均为首次出现，未触发「同一条修两次不过」上限。
+
+## R16 · zcode 修复（2026-10-08 完成）
+
+**R15 裁决 5 条全部按口径修完。** 修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **97 用例全绿**（修复前基线 94 + 本轮新增 3：pki 2、cmd/console 1）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过。未执行任何 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞：纯字符串 token 报错回显原值。`internal/config/config.go:76-81` `RegistrationToken.UnmarshalYAML` 纯字符串分支删除 `: %q` 原值回显（凭据材料不进错误信息/日志，R11-C/R13-#3 同口径），报错只保留「不再接受纯字符串写法（无到期、不绑定节点，等于永久凭据）」的说明与映射写法示例（`tokenExampleYAML`，`config.go:44-47`）。单测 `config_test.go:71` `TestConsolePlainStringTokenRejected` 加固：既有四关键词指引断言（纯字符串/映射/expires_at/expected_node）之外，新增断言错误信息**不含原 token 值**（`config_test.go:88`，独特标记串全文不出现） |
+| 2 | 阻塞：needsRenewal 未查 NotBefore/EKU。`internal/pki/pki.go:367` `needsRenewal` 在既有检查（解析/NotAfter `:383-386`/CheckSignatureFrom `:391-393`/SAN/公钥比对）之上新增两检查，均触发既有重签路径（复用既有 CA+私钥，CA 与两把私钥不动）：① 当前时间早于 NotBefore → 重签（`:387-390`，与 R13-#2 同类「客户端验证必然失败却报成功」）；② ExtKeyUsage 既不含 ServerAuth 也不含 ExtKeyUsageAny → 重签（`:394-405` `hasServerEKU` 扫描，Any 视为可用于服务端）。函数注释同步（`:362-366`）。单测 `pki_test.go:427` `TestEnsureRenewsUnusableServerCert`（助手 `rewriteServerCert` `:389`：用目录内既有 CA+私钥重签按 mutate 改写的 server.crt，SAN 与 `issueServerCert` 同源）——「尚未生效」（NotBefore=+1h）与「缺 ServerAuth EKU」（EKU=nil）两场景均断言 `ServerCertRenewed=true`、CA/两把私钥/ca.crt 字节不变、重签产物当期有效且带 ServerAuth（`:427-474`）；对照断言 EKU 仅含 ExtKeyUsageAny 时幂等保持不重签（`:476-480`）；既有 SAN 变更重签/幂等零改动/到期 CA 拒绝用例保持通过 |
+| 3 | 建议：ServerTLSConfig 加载入口不查私钥权限。`internal/pki/pki.go:192-196`：`ServerTLSConfig` 在 `tls.LoadX509KeyPair` 成功后对 keyPath 复用 `requireKeyPerms` 校验 0600（Windows 豁免口径与 R10-#2 一致：`Mode().Perm()` 不反映真实 ACL，`pki.go:246-258`），权限放宽时启动报错并给 chmod 提示（既有文案「权限为 %o（chmod 600 …后重试）」）。单测 `pki_test.go:483` `TestServerTLSConfigRequiresKeyPerms`（非 Windows）：放宽 0644 拒绝且报错含 0600 与 chmod 提示、恢复 0600 正常加载 |
+| 4 | 建议：退出链无端到端测试。`cmd/console/main.go:98-101` `drainHTTP` 抽出时长可注入的同款序列 `drainHTTPSeq`（`main.go:103-127`，三段式 Shutdown→超时强断→inFlight.Wait 归零逐行不变，仅宽限/等待上限成参；生产入口仍传 `shutdownGrace`/`handlerWaitCap` 真实常量，main 调用点零改动——注入口径对齐 R11-G budget 先例）。新增 `cmd/console/main_test.go:172` `TestDrainHTTPOverTLSLimitListener`：`newTestTLSListener`（`main_test.go:135`）以 `pki.Ensure` 临时生成真实证书 + `pki.ServerTLSConfig` 组装与 `listenTLS` 同构的 `TLS(LimitListener(TCP))` 监听链，`tlsClient`（`:159`）按自签叶子构造信任客户端，两子场景各持一条在途 TLS 连接——① graceful drain：在途 handler 在宽限期内放行，跑生产版 `drainHTTP`（真实 35s 常量），断言函数返回且在途请求被排空（客户端收到完整 200 响应）；② forced close：handler 持续阻塞，`drainHTTPSeq` 注入 300ms 宽限 → Shutdown 超时 `srv.Close()` 强断 → handler 随连接断开返回 → WaitGroup 归零函数返回，断言客户端连接被切断（无干净响应）。不穷举满配额/未完成握手等组合（R15-#4 轻量口径）；连跑 3 遍无 flake |
+| 5 | 可选（文档）：DELIVERY §四.4 与 R11-G 已实现语义冲突。`DELIVERY.md:109` §四.4 重写为 R11-G 实现语义——整轮查询有 **10s 总预算**（scanBudget）兜底：预算耗尽后剩余条目不再执行、如实报 unknown+`budget exhausted` 说明（不编造状态），单条 5s 超时语义不变；病态环境整轮最坏 ~10s（预算到期即在途条目一并截断），远低于 offline_after 60s（原「最坏 160s 会拖慢该轮心跳」口径删除）。关联处同步：§一 pki 行（`DELIVERY.md:11`：重签触发补「尚未生效/缺 ServerAuth EKU」，ServerTLSConfig 补启动 0600 校验）、§一 cmd/console 行（`:13`：退出链回归单测）、§二.7 用例数 94→97 及分包数（`:88`）、§六处置记录补 R15 轮引述与三条行为变化 bullet（`:140-153`） |
+
+## R17 · codex 复审 M1b-a（2026-10-08 02:30，值班员执行）——**通过，M1b-a 收口**
+
+审查日志 `.pipeline/m1b-a-review-codex5.log`（静态只读；codex 自述未跑测试/构建，构建与 97 用例由值班员独立验证全绿后才采信结论）。结论「**通过**」（无 [阻塞] 项）。
+
+值班员独立验证（02:35-02:40）：`go vet` 零输出、`gofmt -l` 无文件、`go test -count=1` **97 用例全绿**、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；抽验 R15 #1 token 无回显断言（`TestConsolePlainStringTokenRejected`）与 #2 两场景重签单测（`TestEnsureRenewsUnusableServerCert/not-yet-valid + missing-server-auth-eku`）及对应源码落点均通过。
+
+3 条非阻塞意见裁决：**全部记录、不派修复轮**（结论为通过，建议/可选级属加固项而非验收缺陷，与 R15-#6「可选无动作」口径一致；三条均转入 M1b-b 任务书候选清单）：
+
+| # | 级别 | 意见 | 裁决 |
+|---|---|---|---|
+| 1 | 建议 | `internal/pki/pki.go:443` 非法非空 tailnet_ip 被静默忽略，证书生成仍报成功但缺配置要求的 SAN | 采纳转后续：证书生成前校验 IP 合法性，非法即报错（M1b-b 候选） |
+| 2 | 建议 | `internal/config/config.go:417` systemd/docker target 无长度上限，服务端仅保留 256 字节，可能截断甚至心跳超限 | 采纳转后续：启动校验统一 256 字节上限（M1b-b 候选） |
+| 3 | 可选 | `internal/agent/runner.go:135` 注释仍称 null 被视为字段缺席，与显式 null 返回 400 的实现相反 | 采纳转后续：注释同步三态语义（M1b-b 候选，纯注释改动） |
+
+处置：R17 通过 → `.pipeline/` 过程日志本轮起加入 .gitignore 不入库（结论已沉淀于本文件与 DELIVERY.md，审查原始日志留本地）；`git add -A && git commit` 收口 M1b-a。全轮次轨迹：R10 审查（1 阻塞+5 建议）→ R11 复审 → R12 作废（工作区移动）→ R13 复审（4 条残留）→ R14 修复 → R15 复审（2 阻塞+2 建议+2 可选，5 条采纳）→ R16 修复 → R17 终审通过。
+

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func TestMigrations(t *testing.T) {
 	if version != len(migrations) {
 		t.Fatalf("migration version = %d, want %d", version, len(migrations))
 	}
-	for _, table := range []string{"nodes", "metrics", "consumed_registration_tokens"} {
+	for _, table := range []string{"nodes", "metrics", "consumed_registration_tokens", "services", "ai_agents"} {
 		var name string
 		err := st.write.QueryRow(
 			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
@@ -295,5 +296,190 @@ func TestCleanupMetrics(t *testing.T) {
 	}
 	if n, _ := st.CountMetrics(ctx, node.ID); n != 2 {
 		t.Fatalf("remaining = %d, want 2", n)
+	}
+}
+
+// TestReplaceNodeServices 全量替换 + stale 语义（SPEC-M1b-a §2/§4）。
+func TestReplaceNodeServices(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	node, err := st.RegisterNode(ctx, "n1", "", "darwin", "arm64", "h1", "r1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 首次上报 2 个服务。
+	ok, err := st.ReplaceNodeServices(ctx, node.ID, []ServiceRow{
+		{Name: "svc-a", Type: "process", Target: "a", Status: "active"},
+		{Name: "svc-b", Type: "systemd", Target: "b.service", Status: "inactive", Detail: "is-active: inactive"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("replace: ok=%v err=%v", ok, err)
+	}
+	rows, err := st.ListServices(ctx, node.ID)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("list: %v rows=%d", err, len(rows))
+	}
+
+	// 第二次上报只剩 svc-a：svc-b 变 stale（保留行不删除），svc-a 状态刷新。
+	ok, err = st.ReplaceNodeServices(ctx, node.ID, []ServiceRow{
+		{Name: "svc-a", Type: "process", Target: "a", Status: "failed", Detail: "is-active: failed"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("replace2: ok=%v err=%v", ok, err)
+	}
+	rows, _ = st.ListServices(ctx, node.ID)
+	if len(rows) != 2 {
+		t.Fatalf("stale row must be kept, rows=%d", len(rows))
+	}
+	byName := map[string]ServiceRecord{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	if byName["svc-a"].Status != "failed" || byName["svc-a"].Detail != "is-active: failed" {
+		t.Fatalf("svc-a not upserted: %+v", byName["svc-a"])
+	}
+	if byName["svc-b"].Status != "stale" || byName["svc-b"].Target != "b.service" {
+		t.Fatalf("svc-b should be stale with history kept: %+v", byName["svc-b"])
+	}
+
+	// 空列表上报：全部转 stale。
+	ok, err = st.ReplaceNodeServices(ctx, node.ID, nil)
+	if err != nil || !ok {
+		t.Fatalf("replace empty: ok=%v err=%v", ok, err)
+	}
+	rows, _ = st.ListServices(ctx, node.ID)
+	for _, r := range rows {
+		if r.Status != "stale" {
+			t.Fatalf("all rows should be stale after empty report: %+v", r)
+		}
+	}
+
+	// 复活：stale 行随上报恢复真实状态（UPSERT 覆盖）。
+	ok, _ = st.ReplaceNodeServices(ctx, node.ID, []ServiceRow{
+		{Name: "svc-b", Type: "systemd", Target: "b.service", Status: "active"},
+	})
+	rows, _ = st.ListServices(ctx, node.ID)
+	byName = map[string]ServiceRecord{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	if !ok || byName["svc-b"].Status != "active" || byName["svc-a"].Status != "stale" {
+		t.Fatalf("revive wrong: ok=%v a=%+v b=%+v", ok, byName["svc-a"], byName["svc-b"])
+	}
+
+	// 节点不存在：返回 false，不写行。
+	ok, err = st.ReplaceNodeServices(ctx, 99999, []ServiceRow{{Name: "x", Type: "process", Status: "active"}})
+	if ok || err != nil {
+		t.Fatalf("missing node: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestReplaceNodeAgents ai_agents 全量替换 + invokable 服务端强制 false。
+func TestReplaceNodeAgents(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	node, _ := st.RegisterNode(ctx, "n1", "", "darwin", "arm64", "h1", "r1", 0)
+
+	ok, err := st.ReplaceNodeAgents(ctx, node.ID, []AgentRow{
+		{Name: "zcode", Type: "cli", Version: "1.0", Path: "/usr/local/bin/zcode", Status: "active"},
+		{Name: "hana-agent", Type: "service", Status: "unavailable", Detail: "port 5800 closed"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("replace: ok=%v err=%v", ok, err)
+	}
+	rows, err := st.ListAgents(ctx, node.ID)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("list: %v rows=%d", err, len(rows))
+	}
+	for _, r := range rows {
+		if r.Invokable {
+			t.Fatalf("invokable must be forced false: %+v", r)
+		}
+	}
+
+	// 声明优先的覆盖：同名 zcode 新版本与路径。
+	ok, _ = st.ReplaceNodeAgents(ctx, node.ID, []AgentRow{
+		{Name: "zcode", Type: "cli", Version: "2.0", Path: "/opt/tools/zcode", Status: "active"},
+	})
+	rows, _ = st.ListAgents(ctx, node.ID)
+	if len(rows) != 2 {
+		t.Fatalf("stale agent row must be kept, rows=%d", len(rows))
+	}
+	byName := map[string]AgentRecord{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	if byName["zcode"].Version != "2.0" || byName["zcode"].Path != "/opt/tools/zcode" {
+		t.Fatalf("zcode not upserted: %+v", byName["zcode"])
+	}
+	if byName["hana-agent"].Status != "stale" {
+		t.Fatalf("hana-agent should be stale: %+v", byName["hana-agent"])
+	}
+
+	// 节点删除级联清理（foreign_keys=ON）。
+	if n, err := st.DeleteNode(ctx, node.ID); err != nil || n != 1 {
+		t.Fatalf("delete node: %v err=%v", n, err)
+	}
+	var count int
+	if err := st.read.QueryRow(`SELECT COUNT(*) FROM ai_agents`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("ai_agents not cascade-deleted: count=%d err=%v", count, err)
+	}
+}
+
+// TestHeartbeatFullAtomic HeartbeatFull 单事务（R11-F）：一次调用完成 metrics +
+// services + agents 全部写入；中途失败整体回滚——失败注入用超大批次服务名
+// （4 万个占位符超过 SQLite 默认变量数上限 32766，markStale 的 NOT IN 报错），
+// 此刻 metrics 已在事务内写入，断言其被回滚不落盘。
+func TestHeartbeatFullAtomic(t *testing.T) {
+	st := openTestStore(t)
+	ctx := context.Background()
+	node, err := st.RegisterNode(ctx, "n1", "", "os", "arch", "h1", "reg-1", 0)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	pct := 12.5
+	row := &MetricsRow{NodeID: node.ID, TS: time.Now().Unix(), CPUPct: &pct}
+	svcs := []ServiceRow{{Name: "a", Type: "process", Target: "a", Status: "active"}}
+	ags := []AgentRow{{Name: "zcode", Type: "cli", Version: "1.0", Status: "active"}}
+	if ok, err := st.HeartbeatFull(ctx, row, "v1", &svcs, &ags); err != nil || !ok {
+		t.Fatalf("heartbeat full: ok=%v err=%v", ok, err)
+	}
+	if n, _ := st.CountMetrics(ctx, node.ID); n != 1 {
+		t.Fatalf("metrics = %d, want 1", n)
+	}
+	if s, _ := st.ListServices(ctx, node.ID); len(s) != 1 || s[0].Name != "a" {
+		t.Fatalf("services = %+v, want single row a", s)
+	}
+	if a, _ := st.ListAgents(ctx, node.ID); len(a) != 1 || a[0].Name != "zcode" {
+		t.Fatalf("agents = %+v, want single row zcode", a)
+	}
+
+	// 缺席语义：nil = 字段缺席，既有清单不动、metrics 照写。
+	if ok, err := st.HeartbeatFull(ctx, row, "v1", nil, nil); err != nil || !ok {
+		t.Fatalf("heartbeat full (absent): ok=%v err=%v", ok, err)
+	}
+	if s, _ := st.ListServices(ctx, node.ID); len(s) != 1 || s[0].Status != "active" {
+		t.Fatalf("nil services must not touch existing rows: %+v", s)
+	}
+	if n, _ := st.CountMetrics(ctx, node.ID); n != 2 {
+		t.Fatalf("metrics = %d, want 2", n)
+	}
+
+	// 中途失败注入：4 万行服务批次令 markStale 的 NOT IN 占位符超限报错。
+	flood := make([]ServiceRow, 40000)
+	for i := range flood {
+		flood[i] = ServiceRow{Name: fmt.Sprintf("s%05d", i), Type: "process", Status: "active"}
+	}
+	if _, err := st.HeartbeatFull(ctx, row, "v1", &flood, nil); err == nil {
+		t.Fatal("oversized services batch must fail")
+	}
+	// metrics 与既有服务行必须原样保留（半轮数据不存在）。
+	if n, _ := st.CountMetrics(ctx, node.ID); n != 2 {
+		t.Fatalf("failed heartbeat must roll back metrics: got %d rows, want 2", n)
+	}
+	if s, _ := st.ListServices(ctx, node.ID); len(s) != 1 || s[0].Name != "a" {
+		t.Fatalf("failed heartbeat must roll back services: %+v", s)
 	}
 }

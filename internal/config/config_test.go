@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -65,10 +66,12 @@ func TestConsoleValidation(t *testing.T) {
 }
 
 // TestConsolePlainStringTokenRejected 纯字符串写法在解析层即拒绝并提示新写法
-// （R3-#4 强制化：无到期、不绑节点的 token 等于永久凭据后门）。
+// （R3-#4 强制化：无到期、不绑节点的 token 等于永久凭据后门）；报错不回显原值
+// （R15-#1：凭据材料不进错误信息/日志，R11-C/R13-#3 同口径）。
 func TestConsolePlainStringTokenRejected(t *testing.T) {
+	const secret = "plain-token-0123456789ab"
 	path := filepath.Join(t.TempDir(), "console.yaml")
-	yaml := "registration_tokens:\n  - \"plain-token-0123456789ab\"\n"
+	yaml := "registration_tokens:\n  - \"" + secret + "\"\n"
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +83,9 @@ func TestConsolePlainStringTokenRejected(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q should hint new form (missing %q)", err, want)
 		}
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error must not echo the plain token value, got %q", err)
 	}
 }
 
@@ -229,5 +235,329 @@ func TestAgentStateFileTilde(t *testing.T) {
 	}
 	if cfg.StateFile != DefaultStatePath() {
 		t.Fatalf("state_file = %q, want default %q", cfg.StateFile, DefaultStatePath())
+	}
+}
+
+// TestAgentServiceValidation 受管服务声明校验（SPEC-M1b-a §4：type 非法值拒绝启动）。
+func TestAgentServiceValidation(t *testing.T) {
+	cases := map[string]string{
+		"bad type": `services:
+  - name: s1
+    type: kubernetes
+    target: s1
+`,
+		"bad charset": `services:
+  - name: s1
+    type: systemd
+    target: "foo;rm -rf /"
+`,
+		"empty target": `services:
+  - name: s1
+    type: docker
+    target: ""
+`,
+		"duplicate name": `services:
+  - name: s1
+    type: process
+    target: a
+  - name: s1
+    type: process
+    target: b
+`,
+		"process leading dash": `services:
+  - name: s1
+    type: process
+    target: "-evil"
+`,
+		"empty name": `services:
+  - name: ""
+    type: process
+    target: a
+`,
+	}
+	for name, yaml := range cases {
+		path := filepath.Join(t.TempDir(), "agent.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadAgent(path); err == nil {
+			t.Fatalf("%s: must be rejected", name)
+		}
+	}
+	// 合法声明：systemd/docker/process 均接受，target 字符集校验通过。
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte(`services:
+  - name: rustdesk
+    type: systemd
+    target: rustdesk@user.service
+  - name: derp
+    type: docker
+    target: derp-1
+  - name: helper
+    type: process
+    target: Visual Studio Code
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAgent(path)
+	if err != nil {
+		t.Fatalf("valid services rejected: %v", err)
+	}
+	if len(cfg.Services) != 3 || cfg.Services[0].Target != "rustdesk@user.service" {
+		t.Fatalf("services parsed wrong: %+v", cfg.Services)
+	}
+}
+
+// TestValidServiceTarget systemd/docker target 白名单字符集逐字符验证。
+func TestValidServiceTarget(t *testing.T) {
+	valid := []string{"rustdesk", "nginx.service", "user@1000", "my-app_2", "a.b-c_d@e"}
+	invalid := []string{"", "a b", "a;b", "a/b", "a$b", "a\nb", "中文", "a|b", "-x", "`x`", "x'y"}
+	for _, s := range valid {
+		if !ValidServiceTarget(s) {
+			t.Fatalf("%q should be valid", s)
+		}
+	}
+	for _, s := range invalid {
+		if ValidServiceTarget(s) {
+			t.Fatalf("%q should be invalid", s)
+		}
+	}
+}
+
+// TestAgentScanValidation 自定义 agent 声明校验（SPEC-M1b-a §4：相对路径拒绝启动）。
+func TestAgentScanValidation(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home dir")
+	}
+	cases := map[string]string{
+		"relative command": `agent_scan:
+  custom:
+    - name: my-agent
+      type: cli
+      command: bin/my-agent
+`,
+		"bad custom type": `agent_scan:
+  custom:
+    - name: my-agent
+      type: service
+      command: /bin/true
+`,
+		"port out of range": `agent_scan:
+  services:
+    - name: hana-agent
+      port: 70000
+`,
+		"dup across custom/services": `agent_scan:
+  custom:
+    - name: x
+      command: /bin/true
+  services:
+    - name: x
+      port: 5800
+`,
+		"dup known": `agent_scan:
+  known: ["zcode", "zcode"]
+`,
+	}
+	for name, yaml := range cases {
+		path := filepath.Join(t.TempDir(), "agent.yaml")
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadAgent(path); err == nil {
+			t.Fatalf("%s: must be rejected", name)
+		}
+	}
+
+	// 合法声明 + 缺省值填充：version_flag 缺省 --version，~/command 展开，known 缺省取内置清单。
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte(`agent_scan:
+  custom:
+    - name: my-agent
+      command: ~/tools/my-agent
+  services:
+    - name: hana-agent
+      port: 5800
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAgent(path)
+	if err != nil {
+		t.Fatalf("valid scan config rejected: %v", err)
+	}
+	scan := cfg.ScanCfg()
+	if scan.Custom[0].VersionFlag != "--version" || scan.Custom[0].Type != "cli" {
+		t.Fatalf("custom defaults wrong: %+v", scan.Custom[0])
+	}
+	if scan.Custom[0].Command != filepath.Join(home, "tools", "my-agent") {
+		t.Fatalf("command not expanded: %q", scan.Custom[0].Command)
+	}
+	if scan.Known != nil {
+		t.Fatal("known should be nil when not configured")
+	}
+	if got := scan.KnownList(); len(got) != 5 {
+		t.Fatalf("default known list = %v, want 5 entries", got)
+	}
+
+	// known 显式给出（含空列表）→ 整体替换。
+	path2 := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path2, []byte("agent_scan:\n  known: [\"custom-cli\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, err := LoadAgent(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg2.ScanCfg().KnownList(); len(got) != 1 || got[0] != "custom-cli" {
+		t.Fatalf("known override = %v", got)
+	}
+}
+
+// TestAgentTLSPinningRequired https 上报必须配置 ca_cert 或 fingerprint 之一（SPEC-M1b-a §1）。
+func TestAgentTLSPinningRequired(t *testing.T) {
+	// https + 两者皆空 → 拒绝启动。
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte(`console_url: "https://127.0.0.1:7700"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAgent(path); err == nil || !strings.Contains(err.Error(), "fingerprint") {
+		t.Fatalf("https without pinning must be rejected, got %v", err)
+	}
+
+	// 带 fingerprint（冒号分隔大写也要接受并归一化）。
+	path2 := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path2, []byte(`console_url: "https://127.0.0.1:7700"
+fingerprint: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAgent(path2)
+	if err != nil {
+		t.Fatalf("https with fingerprint rejected: %v", err)
+	}
+	if cfg.Fingerprint != "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" {
+		t.Fatalf("fingerprint not normalized: %q", cfg.Fingerprint)
+	}
+
+	// 坏 fingerprint（长度不足/非 hex）拒绝。
+	for _, bad := range []string{"abcd", "zzzz", "AB:CD"} {
+		path3 := filepath.Join(t.TempDir(), "agent.yaml")
+		if err := os.WriteFile(path3, []byte("fingerprint: \""+bad+"\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadAgent(path3); err == nil {
+			t.Fatalf("bad fingerprint %q must be rejected", bad)
+		}
+	}
+
+	// http 上报不再有任何豁免（R10-#1）：明文 console_url 拒绝加载。
+	path4 := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path4, []byte("console_url: \"http://127.0.0.1:7700\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err4 := LoadAgent(path4)
+	if err4 == nil || !strings.Contains(err4.Error(), "https") {
+		t.Fatalf("plain http console_url must be rejected, got %v", err4)
+	}
+}
+
+// TestAgentDockerBin docker CLI 路径配置（R10-#4）：缺省 "docker"，可覆盖，空串归缺省。
+func TestAgentDockerBin(t *testing.T) {
+	cfg, err := LoadAgent("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DockerBin != "docker" {
+		t.Fatalf("default docker_bin = %q, want docker", cfg.DockerBin)
+	}
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path, []byte("docker_bin: \"/usr/local/bin/docker-wrapper\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadAgent(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DockerBin != "/usr/local/bin/docker-wrapper" {
+		t.Fatalf("docker_bin override = %q", cfg.DockerBin)
+	}
+	if err := os.WriteFile(path, []byte("docker_bin: \"   \"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = LoadAgent(path); err != nil || cfg.DockerBin != "docker" {
+		t.Fatalf("blank docker_bin should fall back to default, got %q err=%v", cfg.DockerBin, err)
+	}
+}
+
+// TestAgentScanTotalCap 合并去重后的 agent 总数上限 64（R10-#7）：65 个不同名
+// 条目拒绝启动；重名去重后 ≤64 则通过（同名声明覆盖 PATH 探测，不重复计数）。
+func TestAgentScanTotalCap(t *testing.T) {
+	names := func(n int) string {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = "cli-" + strings.Repeat("a", 1) + strconv.Itoa(i)
+		}
+		return `["` + strings.Join(parts, `","`) + `"]`
+	}
+	// 65 个不同名（known 60 + services 5）→ 拒绝。
+	path := filepath.Join(t.TempDir(), "agent.yaml")
+	yaml := "agent_scan:\n  known: " + names(60) + "\n  services:\n"
+	for i := 0; i < 5; i++ {
+		yaml += "    - name: svc-" + strconv.Itoa(i) + "\n      port: " + strconv.Itoa(5800+i) + "\n"
+	}
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadAgent(path)
+	if err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("65 merged agents must be rejected, got %v", err)
+	}
+	// 60 known + 1 个与 known 同名的 service → 合并去重 60，通过。
+	path2 := filepath.Join(t.TempDir(), "agent.yaml")
+	if err := os.WriteFile(path2, []byte("agent_scan:\n  known: "+names(60)+"\n  services:\n    - name: cli-0\n      port: 5800\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAgent(path2); err != nil {
+		t.Fatalf("merged-unique ≤64 must be accepted (dedupe by name), got %v", err)
+	}
+}
+
+// TestConsolePKIFields console 侧 TLS/限额字段缺省与覆盖（SPEC-M1b-a §1）。
+func TestConsolePKIFields(t *testing.T) {
+	cfg, err := LoadConsole("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PKIDir != "./pki" || cfg.MaxConnections != 256 {
+		t.Fatalf("pki defaults wrong: pki_dir=%q max_conn=%d", cfg.PKIDir, cfg.MaxConnections)
+	}
+	if cert, key := cfg.CertKeyPaths(); cert != "pki/server.crt" || key != "pki/server.key" {
+		t.Fatalf("CertKeyPaths defaults = %q/%q", cert, key)
+	}
+
+	path := filepath.Join(t.TempDir(), "console.yaml")
+	if err := os.WriteFile(path, []byte("pki_dir: /opt/meshconsole/pki\ntls_cert: /x/server.pem\ntailnet_ip: \"100.64.0.1\"\nmax_connections: 32\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConsoleForPKI(path) // 无 registration_tokens 也应可加载（pki 子命令路径）
+	if err != nil {
+		t.Fatalf("LoadConsoleForPKI without tokens must work: %v", err)
+	}
+	if cfg.PKIDir != "/opt/meshconsole/pki" || cfg.MaxConnections != 32 || cfg.TailnetIP != "100.64.0.1" {
+		t.Fatalf("pki override wrong: %+v", cfg)
+	}
+	if cert, key := cfg.CertKeyPaths(); cert != "/x/server.pem" || key != "/opt/meshconsole/pki/server.key" {
+		t.Fatalf("CertKeyPaths override = %q/%q", cert, key)
+	}
+
+	// max_connections 非正数拒绝。
+	path2 := filepath.Join(t.TempDir(), "console.yaml")
+	if err := os.WriteFile(path2, []byte("max_connections: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConsole(path2); err == nil {
+		t.Fatal("max_connections=0 must be rejected")
 	}
 }

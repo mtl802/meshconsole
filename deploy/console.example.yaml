@@ -1,7 +1,7 @@
 # meshconsole 控制台配置样例。
 # 拷贝为 console.yaml 后修改；生产环境文件权限建议 600。
-# M1 不做 TLS（TLS 与证书管理在 M1b 统一上），监听地址务必只暴露在
-# Tailnet IP 或 localhost（DESIGN §2/§7）。
+# M1b-a 起 console 全程 HTTPS（DESIGN §7-3）：先 `make pki` 生成证书再启动，
+# 无明文 http 入口；监听地址仍务必只暴露在 Tailnet IP 或 localhost（DESIGN §2/§7）。
 
 listen: "127.0.0.1:7700"
 
@@ -25,6 +25,35 @@ registration_tokens:
   - token: "change-me-openssl-rand-hex-16-0002"
     expires_at: "2027-03-31T23:59:59Z"
     expected_node: "node-02"
+
+# ---- TLS（DESIGN §7-3：CA 持久化生命周期，启动仅加载、不重新生成）----
+
+# CA 与服务端证书目录。生产建议 /opt/meshconsole/pki（600 私钥权限由工具保证）。
+# 先运行 `make pki`（或 `./bin/meshconsole pki -config console.yaml`）生成，
+# 幂等：已存在的 CA/私钥不会被覆盖；输出末尾的 fingerprint 供 agent 配置固定。
+# **勿并行运行 make pki**（R11-E）：无跨进程锁，并发执行可能产生 CA/私钥
+# 配对不一致的产物（工具会校验配对并拒绝，但仍应避免）。
+pki_dir: "./pki"
+
+# 服务端证书/私钥路径。留空取 <pki_dir>/server.crt 与 <pki_dir>/server.key。
+# tls_cert: ""
+# tls_key: ""
+
+# 本机 Tailnet IP（可选）：仅 `meshconsole pki` 生成证书时写入 SAN，
+# 使 agent 可经 https://<tailnet-ip>:7700 连接并验证通过。
+# tailnet_ip: "100.64.0.1"
+
+# ---- 生产部署安全注意（M1b-b 落地，DESIGN §7-5）----
+# agent 侧 docker 型服务查询走 docker CLI：普通 docker CLI 等价于宿主 root，
+# 生产部署中节点上的 docker 访问必须以只读 helper 或 socket-proxy 提供受限
+# 入口（agent 配置 docker_bin 指向该包装），不允许 agent 直接持有 docker.sock
+# 访问权。console 本身不接触 docker，此处留注以约束整体部署边界。
+
+# ---- 资源限额 ----
+
+# 连接总数上限（DESIGN §7-4/§7-9，LimitListener）：超出的并发连接在内核
+# accept 队列排队而非被拒。默认 256，M1 规模（3 节点 + 1 客户端）无需调整。
+max_connections: 256
 
 # 无心跳判定离线的秒数（DESIGN §4.1：默认 60）。
 offline_after_s: 60

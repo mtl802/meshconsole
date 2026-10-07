@@ -1,0 +1,8 @@
+/bin/
+/data/
+*.db
+*.db-wal
+*.db-shm
+meshagent-state.json
+console.yaml
+agent.yaml

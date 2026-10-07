@@ -1,0 +1,36 @@
+# meshconsole 控制台配置样例。
+# 拷贝为 console.yaml 后修改；生产环境文件权限建议 600。
+# M1 不做 TLS（TLS 与证书管理在 M1b 统一上），监听地址务必只暴露在
+# Tailnet IP 或 localhost（DESIGN §2/§7）。
+
+listen: "127.0.0.1:7700"
+
+# SQLite 数据库文件路径（目录不存在会自动创建；支持 ~ 展开）。
+db_path: "./data/meshconsole.db"
+
+# 一次性注册 token 列表：每个 token 仅可成功注册一个节点，用后即废
+# （DESIGN §4.1-A：短期、一次性、绑定预期节点）。
+# 每个条目必须为映射写法，token / expires_at / expected_node 三个字段全部必填，
+# 纯字符串写法已在配置加载时直接报错（无到期、不绑节点的 token 等于永久凭据）：
+#   token          注册 token 明文，部署时生成（如 `openssl rand -hex 16`），
+#                  经带外交给目标节点的 `meshagent register -token` 使用；
+#                  不入库、不出现在接口响应中。
+#   expires_at     到期时刻（RFC3339）：过期后该 token 注册一律 401，
+#                  启动时已过期的 token 直接拒绝加载。
+#   expected_node  绑定预期节点名：仅该节点名可用此 token 注册，其他名一律 401。
+registration_tokens:
+  - token: "change-me-openssl-rand-hex-16-0001"
+    expires_at: "2026-12-31T23:59:59Z"
+    expected_node: "mac-mini"
+  - token: "change-me-openssl-rand-hex-16-0002"
+    expires_at: "2027-03-31T23:59:59Z"
+    expected_node: "node-02"
+
+# 无心跳判定离线的秒数（DESIGN §4.1：默认 60）。
+offline_after_s: 60
+
+# metrics 保留天数（DESIGN §5：保留 7 天，后台每小时清理）。
+metrics_retention_days: 7
+
+# 日志级别：debug | info | warn | error（JSON 结构化输出）。
+log_level: "info"

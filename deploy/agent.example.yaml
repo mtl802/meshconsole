@@ -1,0 +1,25 @@
+# meshagent 节点代理配置样例。
+# 拷贝为 agent.yaml 后修改；生产环境文件权限建议 600。
+# 首次使用先注册（注册 token 向控制台管理员带外索取）：
+#   meshagent register -console http://127.0.0.1:7700 -token <一次性注册token> -name mac-mini
+# 之后运行：
+#   meshagent run -config agent.yaml
+
+# 控制台地址。留空则使用 state 文件中注册时记录的地址。
+console_url: "http://127.0.0.1:7700"
+
+# 本地 state 文件（节点 token 持久化，0600）。断线恢复凭此续接，不重复注册。
+# 路径支持 ~ 展开；与默认路径 $HOME/.meshagent/state.json 一致。
+state_file: "~/.meshagent/state.json"
+
+# 节点角色（注册时上报，自由文本）。
+role: "workstation"
+
+# 采集上报间隔秒数（DESIGN §4.1：15s）。
+collect_interval_s: 15
+
+# 磁盘指标采集挂载点；Windows 填 "C:\\"。
+disk_mount: "/"
+
+# 日志级别：debug | info | warn | error（JSON 结构化输出）。
+log_level: "info"

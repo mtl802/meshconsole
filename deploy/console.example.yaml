@@ -49,6 +49,23 @@ pki_dir: "./pki"
 # 入口（agent 配置 docker_bin 指向该包装），不允许 agent 直接持有 docker.sock
 # 访问权。console 本身不接触 docker，此处留注以约束整体部署边界。
 
+# ---- Headscale 集成（M1b-b，只读拉取；SPEC-M1b-b §3）----
+# 配置了本段即启用：console 定期拉取 headscale REST /api/v1/node，
+# tailnet 节点状态并入 mesh 视图（Web 面板 Tailnet 区 + MCP get_mesh_status）。
+# 拉取失败保留上次数据并节流告警（WARN ≤1/h），恢复后自动续替。
+# 不需要集成时：删除本段即可，启动日志 INFO 一条「disabled」，不报错。
+# headscale:
+#   url: "http://127.0.0.1:8080"     # headscale API 基地址（scheme 限 http/https，不带末尾斜杠）
+#   api_key: "headscale-preauth-api-key"  # `headscale apikeys create` 预生成；不入 git
+#   interval_s: 300                  # 拉取周期，缺省 300s，下限 30s（保持低频只读）
+
+# ---- Web 只读面板（M1b-b；SPEC-M1b-b §4）----
+# 与 agent API 同端口：GET / 面板页、GET /api/panel/overview 聚合 JSON（15s 轮询）。
+# 仅 Host 为 localhost/127.0.0.1/[::1]（带或不带端口）的请求可达，畸形形式
+# （非数字/空端口、[localhost] 等方括号非 IPv6、userinfo、携带 path）同样 403；
+# 无 Cookie 无登录——面板安全边界 = 监听地址（本机/隧道），请保持 listen 不放公网。
+# 静态资源 embed 进二进制，离线可用；浏览器直接打开 https://127.0.0.1:7700/。
+
 # ---- 资源限额 ----
 
 # 连接总数上限（DESIGN §7-4/§7-9，LimitListener）：超出的并发连接在内核

@@ -259,3 +259,139 @@
 
 处置：R17 通过 → `.pipeline/` 过程日志本轮起加入 .gitignore 不入库（结论已沉淀于本文件与 DELIVERY.md，审查原始日志留本地）；`git add -A && git commit` 收口 M1b-a。全轮次轨迹：R10 审查（1 阻塞+5 建议）→ R11 复审 → R12 作废（工作区移动）→ R13 复审（4 条残留）→ R14 修复 → R15 复审（2 阻塞+2 建议+2 可选，5 条采纳）→ R16 修复 → R17 终审通过。
 
+
+---
+
+# 自测报告 · zcode M1b-b（2026-10-08）
+
+> 交付内容：SPEC-M1b-b.md 三交付物（MCP Server / Headscale 集成 / Web 只读面板）+ 三个观察点修复 + R17 三条转来候选闭环。全部只读，无任何写操作路径；未执行 git commit。
+> 验证基线：`go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **124 用例全绿**（M1b-b 收口基线 97 + 新增 27：store 3、headscale 5、meshview 3、panel 5、mcpserver 5、collect 4、pki 1、config 1）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过。依赖新增唯一一项：`github.com/modelcontextprotocol/go-sdk v1.8.0`（官方 SDK，GOPROXY=goproxy.cn 可拉，锁定 go.mod/go.sum；间接依赖 jsonschema-go/segmentio encoding 等随 SDK 带入）。
+
+## SPEC §7 验收清单逐条
+
+| # | 验收项 | 结果 | 证据 |
+|---|--------|------|------|
+| 1 | vet/gofmt/test 全绿 + 新模块单测 | ✅ | 124 用例全绿；SPEC 点名四类覆盖：**MCP 三方法握手**（`mcpserver_test.go`：内存传输上 client.Connect=initialize + `TestHandshakeToolsList` tools/list 五工具齐备不许多不少 + tools/call ×4）、**tailnet 全量替换事务**（`store_m1bb_test.go` `TestReplaceTailnetNodesFullReplace`：两次写入后表内容恰为第二集合、空集合清空；`headscale_test.go` `TestSyncFullReplace` 同语义）、**Origin/Host 校验**（`panel_test.go` `TestGuardHostAllowlist`：localhost/127.0.0.1/[::1] 带或不带端口与大小写放行；evil.com / `attacker.com:127.0.0.1` rebinding 变体 / 后缀伪装 / 空 Host 一律 403；`TestGuardOrigin`：跨源与 null 拒绝、四形态同源放行）、**panel overview 聚合**（`TestOverviewEndpoint` + `meshview_test.go` `TestOverviewAggregation`：nodes/services/agents/tailnet/freshness 全字段） |
+| 2 | `make cross` 三平台 | ✅ | linux/amd64、darwin/arm64、windows/amd64 全部 built（CGO_ENABLED=0 纯静态） |
+| 3 | MCP stdio 握手 + list_nodes 真数据 | ✅ | 本机 E2E（/tmp/m1bb-e2e，含心跳数据）：stdin 逐帧喂 `initialize` → `serverInfo {meshconsole, 19f3a33-dirty}`、协议版本 2025-06-18；`tools/list` 五工具；`tools/call list_nodes` 返回 e2e-node 真行（status/agent_version/last_seen）；`get_node` 24h samples=17 + services 2 + agents 2；`get_mesh_status` 汇总+异常名单+tailnet.tracked=2 |
+| 4 | Headscale 拉取 + 断 key 优雅降级 | ✅（mock E2E）/ 真机待上 | 本地 mock E2E：配置 headscale 段启动即拉取 2 节点入库（id 字符串/数字两形态、未知字段忽略）；**mode=401 → WARN 一次（`consecutive_failures:1`）+ 旧数据原样保留**；恢复 → INFO `sync recovered after_failures=1` + 数据续替。未配置段 → INFO disabled 一次不报错；配段缺 api_key → 拒绝启动。**真 headscale（云机现成实例）连测列部署上机项**（本机无 headscale 实例） |
+| 5 | 面板 4.4 验收 + liquid glass 五要素 | ✅（五要素自证见下） | `curl -s https://127.0.0.1:7790/ \| grep -c glass` = **6**；`/api/panel/overview` 聚合 JSON 200；`-H 'Host: evil.com'` → **403**（attacker.com:127.0.0.1 同样 403）；安全头 nosniff+no-store 全路径；JS 渲染冒烟（Node + 最小 DOM 桩 + 真实 overview 数据）：节点卡/仪表/清单行/sparkline/页脚全构建且 15s 轮询钉住。**浏览器人眼过布局/动效留部署上机项**（本机 Edge headless 受窗口服务器限制无法截图，渲染管线已由 DOM 冒烟实证；还借此抓出并修复 lead 卡 head 未 append 的真实渲染缺陷） |
+| 6 | 观察点三条闭环 | ✅ | 见下节 |
+| 7 | REVIEW/DELIVERY 更新、禁止 commit | ✅ | 即本节与 DELIVERY.md 顶部新节；未执行任何 git commit |
+
+## 观察点闭环
+
+| # | 现象 | 核查结论 | 处置 |
+|---|------|----------|------|
+| ① | `--version` 缺失 | 确认缺失（M1a/M1b-a 均无） | `cmd/console/main.go:90` `cmdVersion` + `cmd/agent/main.go` 同款：`meshconsole --version` / `meshagent --version` 输出 `<bin> <version> (commit <commit>)`；`-h/--help/help` 统一 usage 出口（exit 2），`pki -h`、`mcp -h` 由 flag.Usage 输出统一风格用法+flag 默认值 |
+| ② | 部署显示 `31eafac-dirty` 旧号 | Makefile 注入链本身存在，部署用的是 M1a 期旧产物；且缺 commit 注入无从核对 | `Makefile` LDFLAGS 补 `-X main.commit=$(COMMIT)`（`git rev-parse --short=8`），版本+commit 双注入两二进制；`bin/meshconsole` 重建依赖补 `internal/panel/web/*`（改面板不重跑 build 会打出旧静态资源）；部署核验口径写入 DELIVERY（拉代码后必须重 make build/cross） |
+| ③ | process 型对 agent 自身判 inactive | **核查结论：不存在 exclude-self 设计**——`checkProcess` 是裸 `pgrep -f <target>`，pgrep 只排除 pgrep 自身、不排除其祖先（agent 进程）；本机实测（macOS）`bash -c 'pgrep -f <pat>'` 能命中含该 pat 的父进程。代码语义下「agent 自身含 target 即被计入」，部署观察到的 inactive 最可能是该节点 target 与实际进程 cmdline 不匹配（配置层），或平台边缘（僵尸态空 cmdline 等）致 pgrep 漏检 | 按 SPEC「等效方案」加固 `services.go`：pgrep **exit 1（无匹配）时先做自进程确定性核对再判 inactive**——`selfMatches`（`services.go:129`）以本进程命令行（os.Args，`/proc/self/cmdline` 的跨平台等效物）按 pgrep 同口径 ERE 匹配（非法正则退化子串），命中报 `active` + detail `count=1 (self process matched; pgrep reported no other)`（来源如实标注，不编造其余进程）；不命中维持 inactive（不放过一切）。单测 4 例：注入 selfArgs 命中/不命中、正则/非法正则、真机自探活（跳过 Windows/pgrep 缺失）+ 真机反例（幽灵目标不改判）。E2E 实测 process 型自探 target=meshagent → `active count=1` |
+
+## Liquid Glass 五要素自证（SPEC §4.3，技能 `docs/skills/liquid-glass-frontend`）
+
+1. **真实 frost**：`glass.css` `.glass-surface` = `color-mix(in srgb, var(--app-panel) 42%, transparent)` + `backdrop-filter: blur(34px) saturate(190%)` + specular 顶边（`inset 0 1px 0 rgb(255 255 255/.14)`）；`.glass-surface-soft`（仪表条）blur(44px)+saturate(200%)+投影。玻璃面板内部一律 `.glass-inset`（半透明提亮+顶缘反光，**无 backdrop-filter**——嵌套破坏 GPU 合成是技能第一坑）；JS 行构建用 `glass-inset glass-inset-hover`（hover 是提亮浮起而非换色）。
+2. **atmosphere**：body 后景三枚漂移 blob（blur(76px)+mix-blend screen，26s/31s/37s 错频永不同步）+ 出血细线弧 + 淡方格图纸网格 + 颗粒叠层（feTurbulence SVG data-URI）；主节点卡右上角自带一枚 aura 光斑——玻璃之下始终有可折射的颜色。
+3. **色彩单一源**：三个 RGB 三元组 `--primary`(mint 52 211 153)/`--accent`(amber 245 158 11)/`--alarm`(red 248 113 113)——控制室方向「状态色即品牌色」；派生 tint 走 `color-mix`/`rgb(var() / α)`，组件零硬编码 hex（语义层 `[data-app]` 中性冷墨色板；浅色主题按技能口径留 TODO 注释，M1b-b 仅深色）。与技能样例三元组结构（primary/primary-soft/accent）的差异：本面板需要红黄绿三态信号色，soft tint 改由 color-mix 派生，三元组纪律不变。
+4. **排版**：数据全部等宽（`--font-mono`，系统等宽栈，**离线取舍**：不引 webfont，本机装有 JetBrains Mono/IBM Plex Mono 自动命中否则落 SF Mono/Menlo/Consolas）；标题=超大 mono（clamp 2.6–4.6rem，-0.04em 紧排）+ 一处衬线斜体 accent（`Network <em>control</em>`，ui-serif）；kicker 宽字距大写 mono；大数字 tabular-nums；状态一律「色点+文字」双通道不依赖颜色单通道。
+5. **动效**：全站唯一 easing 签名 `--ease: cubic-bezier(0.22,1,0.36,1)`。载入一次性编排：标题 clip-path 揭示 → 仪表条/面板按 0.22s→0.85s stagger 浮起（非全元素 uniform fade-in-up）；数据刷新数字 tween（JS ease-out，与 CSS 同族）、freshness 闪色、offline/failed 呼吸红点（breathe 2.4s）；`prefers-reduced-motion` 全关。
+
+**Honesty check**（技能 creative-direction.md）：非对称 7/5 与 5/7 交替 bento（主节点大卡+次节点小卡+tailnet 面板为右列，次行镜像）；仪表条四联大数字非卡片；单一签名交互=「控制室仪表读数 + 离线呼吸点」；无图标卡行、无居中 hero、无 SaaS 模板脸。
+
+## 结构与落点（新增文件）
+
+- `internal/mcpserver/mcpserver.go`（140 行）：SDK 组装，五工具输出顶层一律对象（structuredContent 稳妥形态），get_node 未知节点走 IsError 工具错误并提示 list_nodes
+- `internal/headscale/headscale.go`（233 行）：Client（10s 超时、Bearer、≤4MB body、非 200 报错含状态码+前 200B 说明）+ Fetcher（Sync 单元可注入 / Run 循环失败计数+1h WARN 节流+恢复 INFO）
+- `internal/meshview/meshview.go`（507 行）：MCP 与面板同源只读服务层；异常口径 `serviceIssueGrace=300s`（`status != active` 且数据未过宽限；`stale` 为簿记态不计）——SPEC「未过宽限」按「数据仍在宽限窗口内才计现行异常」实现（陈旧行=离线节点遗留数据，不当现行故障），单测双向钉住
+- `internal/panel/panel.go`（142 行）+ `internal/panel/web/{index.html,glass.css,app.js}`（108/462/528 行）
+- `internal/store/store.go` 扩展：migration v3（tailnet_nodes）、`OpenReadOnly`（mode=ro+query_only 双保险、9 个写路径方法加 ErrReadOnly 守卫、Close 兼容只读句柄）、tailnet 全量替换、ListNodes/ListAllServices/ListAllAgents/MetricsStatsSince/MetricsSeriesSince/LatestMetricsTime
+- `internal/config/config.go`：`headscale:` 段（url 缺省 127.0.0.1:8080、api_key 必填、interval_s 缺省 300 下限 30）
+- `cmd/console/main.go`：`mcp` 子命令（LoadConsoleForPKI 读 db_path 不强制 token；OpenReadOnly；日志全走 stderr 防 JSON-RPC 污染）+ headscale goroutine 接线 + 面板路由挂载
+
+## 已知限制与上机项
+
+1. **真 headscale 连测**（云机现成实例）与**浏览器人眼过面板**（布局/动效/玻璃质感）列部署上机项；本机以 mock E2E + DOM 冒烟兜底。
+2. MCP stdio 传输对「stdin 全部缓冲后立即 EOF」会随 EOF 快速退出（管道喂帧需像真实 MCP 客户端一样保持会话或分帧写入）；真实客户端（Hana/zcode）均为常驻会话，不受影响。
+3. 面板 poll 间隔固定 15s、sparkline 取最近 48 点、异常宽限 300s 为固定常量（SPEC 口径），未入配置。
+4. tailnet_nodes.online 直接采信 headscale 报告值；旧版 API 无 online 字段时按 offline 存（不推导，不编造），last_seen 仍可见。
+
+## R19 · codex 审查 M1b-b（2026-10-08 11:10，Hana 主会话执行）
+
+**结论：修改后通过。** 正向：MCP 只读边界（stdio/ro 开库/固定 SELECT/无注入入口）、embed 固定映射无穿越、agent API 路由隔离无回退、Headscale 未知字段容忍/超时/401 保旧数据。
+
+### 裁决（Hana，全部采纳）
+
+| # | 级别 | 意见 | 修复口径 |
+|---|------|------|----------|
+| 1 | 阻塞 | headscale.go:110 非法成功响应（{}/null/缺 nodes）被当空列表清库 | 区分合法 nodes:[] 与非法响应，非法保留旧数据+记错误 |
+| 2 | 阻塞 | meshview.go:38 节点视图缺 id | 补 id 字段（SPEC §2） |
+| 3 | 阻塞 | meshview.go:164 overview 缺 metrics 摘要 | 复用已有 24h 摘要查询（均值/峰值/磁盘占比） |
+| 4 | 阻塞 | app.js:156 面板自算异常数未用 300s 宽限 | service 层统一输出异常名单口径，前端不做业务判断 |
+| 5 | 阻塞 | Makefile VERSION 非语义版本 | VERSION 语义化变量（m1b-b）+ git commit 后缀，-X 注入 |
+| 6 | 阻塞 | DELIVERY.md "§7 全部通过"夸大（真 headscale/人眼验收未做） | 改口径：明确"本机验证通过 + 部署上机项清单" |
+| 7-11 | 建议 | Host 端口/畸形变体严格解析；store NULLIF 分指标处理；headscale 节流归零策略；config URL scheme 校验；SVG stop-color 无效值/easing 统一/状态点过渡 | 全部采纳 |
+| 12 | 可选 | 全量替换回滚断言缺失 | 采纳：补中途失败保留旧数据断言 |
+
+## R20 · zcode 修复（2026-10-08 完成）
+
+**R19 审查意见 12 条全部裁决采纳、全部按口径修完。** 修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **130 用例全绿**（修复前基线 124 + 本轮新增 6：headscale 3、store 2、config 1；meshview/panel 为既有用例扩展断言不计新函数）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过。真机冒烟复核：`meshconsole --version` → `meshconsole m1b-b+git_19f3a339 (commit 19f3a339)`（meshagent 同）；`/api/panel/overview` 实测输出节点 `id`、每节点 24h `metrics` 摘要与 `service_issues` 名单（inactive 行在列、active 不在列）；Host 严格校验变体 `localhost:evil`/`localhost:`/`[localhost]`/`::1`/`127.0.0.1:99999` 全 403（`evil@localhost` 被 net/http 层 400 拒绝，双层防御）、合法四形态 200；headscale 不可达场景 WARN 恰一条 + 旧数据保留。未执行任何 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞：HTTP 200 非法 body 被当空列表清库。`internal/headscale/headscale.go`：`wireResp.Nodes` 改 `*[]wireNode` 指针承载「键存在性」——顶层 `null`/`{}`/缺 `nodes` 键/`nodes:null` 在 Decode 后均为 nil，`FetchNodes` 显式判 nil 报 `headscale response missing "nodes" array (malformed body)`；`dec.More()` 补充拒绝尾部多余数据（`{"nodes":[]} junk` 同样非法）。非法响应与解析失败同路径返回错误 → Sync/Run 走既有「保留旧数据 + WARN 计数」降级链，错误日志由失败计数机制天然携带；只有显式 `nodes` 数组（**含空数组**）才全量替换（空列表清库是合法语义，非法响应清库是数据丢失）。测试 `headscale_test.go` `TestFetchNodesIllegalBody`（六形态非法 + 空数组合法对照）、`TestSyncIllegalResponseKeepsOld`（走真 client HTTP 层：非法 200 → Sync 报错且旧行原样） |
+| 2 | 阻塞：节点视图缺 id。`internal/meshview/meshview.go` `Node` 首字段补 `ID int64 \`json:"id"\``（SPEC §2 list_nodes 契约字段），`nodeView` 从 `NodeRecord.ID` 填充——MCP list_nodes/get_node 与面板 overview 同源受益。测试 `meshview_test.go` `TestOverviewAggregation` 补断言：全部节点卡 `Node.ID != 0` 且 cloud-1 id=1、JSON 契约含 `"id"` 键 |
+| 3 | 阻塞：overview 缺每节点 metrics 摘要。`meshview.go` `NodeCard` 补 `Metrics *MetricsSummary \`json:"metrics,omitempty"\``；`Overview` 循环内复用 store 既有 `MetricsStatsSince`（24h 窗口，**未新写 SQL**），并抽出 `statsView` 助手与 `NodeDetail`（get_node）共用同一转换。测试同用例补断言：`lead.Metrics.Samples ≥ 1` 且 CPUAvg=33.5 与 get_node 口径一致、JSON 含 `"metrics"` |
+| 4 | 阻塞：前端自算异常数未用 300s 宽限。`meshview.go` `Overview` 补 `ServiceIssues []ServiceIssue \`json:"service_issues"\``（初始化空切片保证 JSON 为 `[]` 非 null）；异常判定抽唯一谓词 `serviceIsIssue`（status != active、非 stale、`updated_at ≥ now-300s`），`Status`（get_mesh_status）与 `Overview` 共用，`sortIssues` 同步抽出——口径只在 service 层。`app.js` `renderReadout` 删除本地 `status!=='active'&&!=='stale'` 过滤（该计算无宽限口径，陈旧行会被误计），改 `const issues = (ov.service_issues \|\| []).length` 纯消费。测试：`meshview_test.go` overview 断言两行新鲜 inactive 在名单 + 拨旧超宽限后 overview 与 status 同步收敛到 1 条；`panel_test.go` `TestOverviewEndpoint` 既有断言不回退 |
+| 5 | 阻塞：VERSION 非语义版本。`Makefile`：`VERSION` 由 `git describe --tags --always --dirty`（产出 `19f3a33-dirty` 类非语义串）改为 `M1B_B := m1b-b` + `VERSION ?= $(M1B_B)+git_$(COMMIT)`，ldflags 注入值形如 `m1b-b+git_19f3a339`；两二进制 `--version` 输出 `<bin> m1b-b+git_<short_hash> (commit <short_hash>)`（`meshconsole --version`/`meshagent --version` 实测核对；commit 注入链不动，agent 心跳 `agent_version` 字段同样携带该语义版本） |
+| 6 | 阻塞：DELIVERY「全部通过」夸大。DELIVERY.md M1b-b 批次头改口径——状态行改为「**本机可验证项全部自测通过**」并明示两项未做；§四已知限制重组为显式「**部署上机项清单**」（①真 headscale 连测（云机现成实例）②浏览器人眼过面板布局/动效/玻璃质感③Windows 真机）+ 逐项现状与兜底说明；「全部通过」「§7 验收清单全部自测通过」表述全文消除（REVIEW.md R19 前的自测报告为历史记录不回改，R19 已裁决其口径问题） |
+| 7 | 建议：Host/Origin 校验严格化。`internal/panel/panel.go` `hostAllowed` 重写：`url.Parse("http://"+raw)` 解析 authority 后对 hostname 严格比对白名单（localhost/127.0.0.1/[::1]）——拒绝 `url.Parse` 报错、userinfo（`evil@localhost`）、携带 path/query/fragment、非数字/越界端口（>65535/0）、空端口（`localhost:`/`[::1]:`，u.Host 后缀 `:` 判定）、方括号非 IPv6 字面量（`[localhost]`/`[127.0.0.1]`，方括号仅接受 ParseIP 通过且 To4()==nil 的 IPv6）、裸 IPv6（`::1` 解析不出合法 authority）、首尾空白/内嵌空白；`originAllowed` 加 scheme 限 http/https（ftp/chrome-extension 等拒绝）+ 拒绝 userinfo/Opaque/path/query/fragment。测试 `panel_test.go` `TestGuardHostAllowlist` 拒绝清单补 `localhost:evil`/`localhost:`/`[::1]:`/`:0`/`:99999`/`[localhost]`/`[127.0.0.1]`/`::1`/`evil@localhost`/`localhost/evil`/` localhost` 十一变体（允许清单补 `LocalHost`）；`TestGuardOrigin` 改表驱动补 ftp/chrome-extension/userinfo/path/query/无 scheme 六拒绝形态。真机冒烟复核全过（`evil@localhost` 由 net/http 层 400 先拒，handler 层 403 兜底为双层防御） |
+| 8 | 建议：mem/disk total=0 行整行剔除。`internal/store/store.go` `MetricsStatsSince`：删除 WHERE 中 `(mem_total IS NULL OR mem_total>0) AND (disk_total…) ` 整行过滤，占比分指标改 `AVG/MAX(mem_used*100.0/NULLIF(mem_total,0))`、`MAX(disk_used*100.0/NULLIF(disk_total,0))`——除零样本只让对应占比保持 NULL，**CPU 等可用指标照常参与**（COUNT 为窗口内全部样本数，与 `MetricsSeriesSince` 既有 NULLIF 口径一致）。测试 `store_m1bb_test.go` `TestMetricsStatsZeroTotals`：total=0 行（cpu=50）入窗口 → Samples=2、CPUAvg=31.25/CPUMax=50（旧实现为 1/12.5），mem/disk 占比仅由 seed 行贡献 25%/10% |
+| 9 | 建议：失败计数单次成功即归零致节流被反复突破。`internal/headscale/headscale.go`：Run 循环结果处理抽 `handleResult`（可单测直调），新增 `successResetStreak=3` 与 `streak` 计数——失败计数在**连续成功 3 次**后才归零并 INFO `recovered`，期间的成功记 Debug `recovery pending`；闪断（失败→单次成功→失败）不再归零计数、不再重置节流窗口（WARN 保持 1/h 上限），streak 在任一失败时清零。测试 `headscale_test.go` `TestFailureCounterStreakReset`（捕获式 slog handler：fail/ok/fail 序列计数累计到 2 不归零、全程 WARN 恰 1 条、连续 3 次成功后 INFO 恰 1 条且 fails/streak 归零；对照单次成功夹失败场景）；`TestRunRecoveryAndThrottle` 行为级回归保持通过 |
+| 10 | 建议：headscale url scheme 未限制。`internal/config/config.go` `validateHeadscale`：scheme 白名单收紧为 `http`/`https`——`ftp://`/`file://`/`ssh://`/`javascript:` 等其他 scheme 与无 scheme 形式（`127.0.0.1:8080`，解析为空 scheme 空 host）启动即报错，报错注明 scheme 限制（不回显 url 原值，防配置中可能的 userinfo 泄漏）。测试 `config_test.go` `TestHeadscaleURLScheme`：五非法形态全拒（报错含 HTTP(S)）+ http/https 两合法形态正常加载 |
+| 11 | 建议：SVG stop-color 无效值 / easing 不一致 / 状态点跳变。`internal/panel/web/app.js` 三处：① **SVG 完整色值**——表现属性（stop-color/stroke）不接受 `var()`（CSS 变量在 presentation attribute 非法，原写法渲染结果未定义）：启动时 `getComputedStyle` 读 `--primary` 的 RGB 三元组拼完整 `rgb(...)` 色值（格式校验，读取失败回退 glass.css 字面量 `52 211 153`，token 单一源不变），gradient 两处 stop 与折线 stroke 全部改完整色值；② **easing 统一**——`tweenNum` 的 `1-Math.pow(1-p,3)`（时间参数直代 y(p)，非 CSS 语义）替换为 `EASE`：与 glass.css `--ease` 同一条 `cubic-bezier(0.22,1,0.36,1)` 的贝塞尔求值（牛顿迭代解 x(t)=x 再取 y(t)，8 次迭代收敛）；③ **状态点原地更新**——minis/services/agents/tailnet 四类行与 lead 卡状态格重构为「build 建结构一次、update 原地改 className/textContent」：`.dot` 的 background/box-shadow transition（glass.css 既有 .4s var(--ease)）此前因每次轮询 `replaceChildren` 重建元素从不生效，现状态色变连续过渡，呼吸类切换不再重建节点。验证：`node --check` 语法过；EASE 与标准贝塞尔二分参照实现全曲线对比最大偏差 2.67e-5；SVG 属性 grep 确认无残留 `var()`（`TestStaticServed` glass-inset 契约保持） |
+| 12 | 可选：全量替换回滚断言缺失。`internal/store/store_m1bb_test.go` 新增 `TestReplaceTailnetNodesRollbackKeepsOld`：同批两行第二行主键冲突（确定性中途失败）→ `ReplaceTailnetNodes` 报错，断言旧两行（cloud-1/mac-mini）字节级原样保留——先清后插的 DELETE 不因中途失败单独生效，事务回滚语义钉死（与 R11-F `TestHeartbeatFullAtomic` 同型断言） |
+
+**验证记录**：`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` 全绿（**130 用例**：cmd/console 3、agent 14、collect 19、agentdisc 9、config 18、headscale 8、mcpserver 5、meshview 3、panel 5、pki 11、registry 17、store 18）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过。真机冒烟（/tmp 临时实例，已清理）：见本节首段。对用户可见的行为变化：非法 headscale 响应不再清库（保留旧数据+WARN）；`--version` 版本号改 `m1b-b+git_<hash>` 语义格式；面板异常服务数与 get_mesh_status 同口径（300s 宽限生效）；Host/Origin 更严格（裸 `::1`、空端口等畸形一律 403）；headscale url 配置非 http(s) scheme 拒绝启动；total=0 样本不再拖累 CPU 摘要。
+
+## R21 · codex 复审 M1b-b 修复轮（2026-10-08 11:55，值班员执行）
+
+**结论：修改后通过。** R19 十二条中十条核销关闭，两条残余；另新增两条建议。值班员先行独立验证（.pipeline/verify-m1b-b-fix.out，VERIFY_EXIT=0）：`go vet` 零输出、`gofmt -l` 无文件、`go test -count=1` 全绿（12 包全 ok）、`make cross` 三平台通过。codex 只读复审存档 .pipeline/review-m1b-b-fix.out，全程未修改仓库文件。SPEC 符合度：MCP stdio/只读开库/五工具/同源查询/静态 embed 与安全边界符合；真 Headscale 连测与浏览器人眼验收仍为部署上机项（commit 后由 Hana 主会话执行）。
+
+### 裁决（Hana）
+
+| # | 意见 | 级别 | 裁决 | 口径 |
+|---|------|------|------|------|
+| 1 | headscale.go:130 非法响应校验不严——`dec.More()` 非 EOF 校验，`{"nodes":[]}]` 等尾随垃圾仍被接受并清库；4MiB 截断可伪装正常结束 | 阻塞 | 采纳 | 二次 `Decode` 要求 `io.EOF` 的严格校验（M1a `decodeJSONStrict` 同口径）；读满 4MiB 仍未见结尾或 `io.ErrUnexpectedEOF` 一律 malformed 拒绝，走既有「保留旧数据+错误」降级链。**返工计数：R19 同条意见第 2 次修复，本轮复审仍不过即触发上限请示伦哥** |
+| 2 | headscale.go:223/237 WARN 节流未独立于失败计数——恢复归零后再失败立即 WARN，「失败→恢复→失败」循环可突破 1/h 上限 | 建议 | 采纳 | WARN 节流窗口独立维护（记上次 WARN 时刻，与 streak/失败计数解耦），任意时刻相邻两条 WARN 间隔 ≥1h；恢复 INFO 不受限 |
+| 3 | app.js:529 tailnet 空→有数据时 `.empty` 提示不删除，在线节点与 "disabled or not synced yet" 同显 | 建议 | 采纳 | syncList 拿到数据即移除空态提示节点 |
+| 4 | Makefile:24/27 重建依赖缺 Makefile/go.mod/go.sum，已有 bin/ 产物时跳过构建，携带旧版本/旧依赖 | 建议 | 采纳（轻量版） | bin 目标补依赖 Makefile go.mod go.sum；commit 哈希变化不进依赖（避免每次提交全量重建），版本新鲜度由交付流程显式 `make cross` 保证 |
+
+**返工计数**：#1 第 2 次修复（m1b-b-fix 首修未完全关闭）；#2/#3/#4 首次出现，均未触发「同条修两次不过」上限。
+
+**修复轮范围**：#1/#2/#3/#4 全部 → 派 m1b-b-fix2。验证口径不变：`go vet` / `gofmt` / `go test -count=1` 全绿 + `make cross` 三平台。
+
+## R22 · zcode 修复轮 2 / m1b-b-fix2（2026-10-08 完成）
+
+**R21 四条意见全部按裁决口径修完。** #1 为 R19-#1 同条意见第 2 次修复，本轮按 registry `decodeJSONStrict` 同口径彻底关闭（详见下表）；#2/#3/#4 首次修复。测试 headscale 包 8 → 10 个用例（新增 `TestFetchNodesTruncatedOversized`、`TestWarnThrottleIndependentOfReset`，`TestFetchNodesIllegalBody` 扩至 9 个非法形态）。无 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞（R19-#1 残余，第 2 次修复）：`dec.More()` 对 `]`/`}` 起始的尾随垃圾返回 false（`{"nodes":[]}]` 被静默放过并清库），且 `io.LimitReader` 截断点恰落在完整值之后时「读满上限」被伪装成正常 EOF。`internal/headscale/headscale.go` FetchNodes 重写校验链：① body 先 `io.ReadAll(io.LimitReader(resp.Body, maxRespBytes+1))` 整读（新常量 `maxRespBytes=4<<20`，:128）——`len > maxRespBytes` 即「读满上限仍未见结尾」，显式报 `headscale response exceeds 4194304 bytes (malformed body)`（:132-134），多读 1 字节保证截断探测不误伤恰满 4MiB 的合法 body；② 解码改在 `bytes.NewReader` 上进行，首次 `Decode` 遇 `io.ErrUnexpectedEOF`（中途截断）显式报 `truncated mid-value (malformed body)`（:138-141），不与语法错混同；③ 尾部校验弃 `dec.More()` 改二次 `Decode(&struct{}{})` 必须返回 `io.EOF`（:152-155，registry `decodeJSONStrict` 同口径）——`{"nodes":[]}]`/`{"nodes":[]}}`/拼接第二个 JSON 值一律 `trailing data after JSON value (malformed body)`。三条错误路径全走既有「返回错误 → Sync/Run 保留旧数据 + WARN 计数」降级链，只有严格合法的 `{"nodes":[...]}`（含空数组）才全量替换。测试：`TestFetchNodesIllegalBody` 补 trailing bracket/brace/two json values 三形态（共 9 非法 + 空数组合法对照）；新增 `TestFetchNodesTruncatedOversized`（完整值+4MiB 尾随空白、mid-value 截断、mid-string 截断三形态均拒绝且报 malformed/exceeds）；`TestSyncIllegalResponseKeepsOld` 降级链回归保持 |
+| 2 | 建议（R19-#9 残余）：`f.fails == 1 \|\| time.Since(...)` 的短路使恢复归零后的首个新失败绕过 1h 窗口立即 WARN，「失败→恢复→失败」循环可突破上限。`internal/headscale/headscale.go` `handleResult`（:245-256）：删除 `fails == 1` 特判，节流只看 `time.Since(f.lastWarn) >= warnThrottle`（窗口独立于计数/streak；lastWarn 零值 → 首个失败仍立即 WARN）；窗口内失败降级 `Debug "headscale sync failed (warn throttled)"` 不输出 WARN；恢复 INFO `recovered` 不受限。`Fetcher` 注释与包文档同步（节流窗口独立维护，R21-#2）。测试新增 `TestWarnThrottleIndependentOfReset`：fail → 3×ok（恢复归零）→ fail → fail，全程 WARN 恰 1 条、恢复 INFO 恰 1 条、节流 Debug 恰 2 条、失败计数跨恢复累计到 2；`TestFailureCounterStreakReset`/`TestRunRecoveryAndThrottle` 回归保持 |
+| 3 | 建议：tailnet 空→有数据时 `.empty` 空态提示残留，"disabled or not synced yet" 与节点行同显。`internal/panel/web/app.js` `syncList`（:183-185）：`items.length > 0` 时先 `container.querySelectorAll(':scope > .empty').forEach(remove)` 再做行 diff——空态提示不在行复用 map 内，由 syncList 统一负责移除（四类列表共用该路径，tailnet 空→有数据的下次轮询即收敛）。`node --check` 语法过；静态资源经 embed 依赖随 bin 重建（R21-#4 后 Makefile go 产物依赖链覆盖） |
+| 4 | 建议（轻量版）：bin 产物目标缺 Makefile/go.mod/go.sum 依赖，已有产物时 `make build` 跳过构建，携带旧依赖/旧 ldflags 配方。`Makefile`（:23-32）：新变量 `BUILD_DEPS := Makefile go.mod go.sum`，`bin/meshconsole`/`bin/meshagent` 两目标补挂（构建配方与依赖清单变更触发重建）；commit 哈希变化不进依赖（不因提交触发全量重建），版本新鲜度由交付流程显式 `make cross` 保证（R21 裁决口径）。实测：touch go.mod → `make build` 两产物立即重编（mtime 刷新） |
+
+**验证记录（m1b-b-fix2）**：`gofmt -l` 无文件；`go vet ./...` 零输出；`go test -count=1 ./...` 全绿（见 DELIVERY.md §五 更新后的用例数）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check internal/panel/web/app.js` 过；Makefile 依赖行为实测（touch go.mod → bin 重编）。对用户可见的行为变化：① headscale 对尾随垃圾（含 `]`/`}` 起始）、超 4MiB、中途截断的 200 响应一律按拉取失败处理（保留旧数据），其中部分形态此前会被误接受甚至清库；② 「失败→恢复→再失败」场景 WARN 严格 1/h（窗口内降级 Debug），不再因计数归零立即重复告警；③ 面板 tailnet 列表从空态转有数据时提示文案不再与节点行同显；④ bin 产物在 go.mod/go.sum/Makefile 变更后自动重建，不再复用旧依赖产物。
+
+## R23 · codex 复审 m1b-b-fix2 + 裁决放行（2026-10-08 12:30，值班员执行）
+
+**codex 结论：通过（代码审查）。** R21 四条全部核销关闭，未发现新增阻塞；全程未修改仓库文件。复审存档 .pipeline/review-m1b-b-fix2.out。核销明细：① headscale.go 非法响应校验（4MiB 超限探测 + 严格二次 Decode EOF）正确、非法响应保留旧数据——**R19-#1 同条意见第 2 次修复后彻底关闭**（未触发「同条修两次不过」升级：该条件指修两次仍不过）；② WARN 节流窗口独立于失败计数，恢复归零不再绕过 1h 上限；③ 面板空态提示随数据出现正确移除；④ Makefile bin 产物依赖 Makefile/go.mod/go.sum，符合轻量版裁决。SPEC 符合度确认：MCP stdio/只读库/五工具/同源查询/Headscale 事务替换/静态 embed 与 Host-Origin 边界符合。
+
+### 裁决（Hana，值班员自主）
+
+| # | 级别 | 意见 | 裁决 | 口径 |
+|---|------|------|------|------|
+| 1 | 可选 | headscale.go:41 注释仍称恢复会重置「节流窗口」，与 R22-#2 后实现（窗口独立维护）不符 | 采纳转候选 | 纯注释改动、不影响通过，转 M1b-c 候选清单（R17「可选无动作」同口径），不派修复轮 |
+
+**裁决结论：通过 → 放行 commit（COMMIT_OK）。** m1b-b 至此完成 R19→R21→R23 两轮修复收敛（fix/fix2 各一轮，未触 3 轮护栏），由 worker 执行 commit 后回 idle。真 Headscale 连测与浏览器人眼验收仍为部署上机项，commit 后由 Hana 主会话执行。
+
+**M1b-c 候选清单（累计）**：① headscale.go:41 注释文案与节流窗口实现同步（本轮新增）；② pki.go 证书生成前校验 tailnet_ip 合法性（R17-#1）；③ config.go systemd/docker target 256 字节启动校验（R17-#2）；④ agent/runner.go:135 注释三态语义同步（R17-#3）。

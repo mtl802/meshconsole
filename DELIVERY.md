@@ -1,3 +1,64 @@
+# DELIVERY — M1b-b 交付说明（MCP Server + Headscale 集成 + Web 只读面板）
+
+> 交付人：zcode · 2026-10-08
+> 依据：SPEC-M1b-b.md（唯一需求源，逐条执行）+ DESIGN.md v0.7 §6/§2/§3/§8
+> 基线：M1b-a（commit 19f3a33）。状态：**本机可验证项全部自测通过；真 headscale 连测与浏览器人眼验收未做，列入「部署上机项清单」待上机执行**（见 §四；逐条证据见 REVIEW.md「自测报告 · zcode M1b-b」节；R19 审查 12 条意见修复见 REVIEW.md R20 节）。未执行 git commit（提交权在流水线）。
+> 前端设计按伦哥要求采用 `docs/skills/liquid-glass-frontend` 技能：只取其设计系统与原则，技术基线仍为 SPEC 硬约束的纯静态 HTML/CSS/原生 JS + Go embed（无 Node/npm/CDN）。
+
+## 一、交付物清单
+
+| 项 | 说明 |
+|----|------|
+| **MCP Server**（`meshconsole mcp` 子命令） | 官方 `github.com/modelcontextprotocol/go-sdk v1.8.0`（版本锁定 go.mod；GOPROXY=goproxy.cn 实拉成功，未走手写 JSON-RPC 备选）。**stdio 传输**（MCP 2025-06-18 语义由 SDK 保证），零网络暴露；五个只读工具：`list_nodes`（nodes 全行）/`get_node`（详情 + 24h metrics 摘要 cpu/mem 均值峰值、磁盘占比 + 该节点 services/agents）/`list_services(node?)`/`list_agents(node?)`/`get_mesh_status`（节点/在线/离线名单、服务异常名单、tailnet 概况、数据新鲜度）。配置复用 `-config console.yaml`（`LoadConsoleForPKI` 读 db_path，不强制注册 token）；**库只读打开**（`store.OpenReadOnly`：`?mode=ro` + `query_only=1` 双保险，不执行 migration、库不存在报错不创建；store 9 个写路径方法加 ErrReadOnly 守卫）。结构化输出顶层一律对象（structuredContent 稳妥形态）；get_node 未知节点回 IsError 工具错误并提示 list_nodes。**日志全走 stderr**（stdout 是 JSON-RPC 通道，`cmd/console/main.go:100` cmdMCP） |
+| **Headscale 集成**（`internal/headscale/`，console 内嵌 goroutine） | 数据源 REST `GET /api/v1/node`（Bearer api_key）；配置 `console.yaml` 新增 `headscale:` 段（`url` 缺省 `http://127.0.0.1:8080`、**scheme 限 http/https 其他启动报错（R19-#10）**、`api_key` 必填、`interval_s` 缺省 300 下限 30；**无该段=禁用**，启动 INFO 一条不报错）。HTTP client 超时 10s；解析只取 id/name/addresses/online/lastSeen（**id 兼容数字/字符串两形态**，未知字段忽略——headscale 版本演进不炸；body ≤4MiB 封顶，**超限/读满上限未见结尾/中途截断一律显式报 malformed（R21-#1）**；非 200 报错含状态码+前 200B 说明；**HTTP 200 但 body 非法（{}/null/缺 nodes 键/尾随垃圾（含 `]`/`}` 起始与拼接值）/超限/截断）同样按拉取失败处理，保留旧数据不清库，只有严格合法的 nodes 数组（含空数组；二次 Decode 必须 io.EOF，registry decodeJSONStrict 同口径）才全量替换（R19-#1/R21-#1）**）。存储：migration **v3** `tailnet_nodes`（id/machine_name/ips/online/last_seen/updated_at），**每次拉取单事务全量替换**（先清后插，中途失败整体回滚保留旧数据（R19-#12 断言））；拉取失败不触库（旧数据保留）+ 连续失败计数（首个失败立即 WARN，其后节流 1/h **且节流窗口独立于失败计数/streak——恢复归零后再失败仍受窗口约束，窗口内降级 Debug（R21-#2）**；**计数在连续成功 3 次后才归零并 INFO 恢复——闪断不再反复突破节流（R19-#9）**）。E2E 实测：401 → `WARN consecutive_failures:1` + 数据原样；恢复 → `sync recovered after_failures:1` + 续替 |
+| **Web 只读面板**（`internal/panel/` + `internal/panel/web/`） | 纯静态 HTML/CSS/原生 JS 三件套 **embed 进二进制**（`//go:embed all:web`，离线/内网可用，无 Node/npm/CDN/外部字体）。与 agent API 同端口：`GET /` 面板页、`GET /api/panel/overview` 聚合 JSON（nodes（含 id/24h metrics 摘要）/services/agents/**service_issues 异常名单（R19-#4）**/tailnet 一次取齐，15s 轮询）；数据出口与 MCP 同源（`internal/meshview`，不复制 SQL）。**安全（DESIGN §8 全做 + R19-#7 严格化）**：Host/Origin 校验中间件（允许名单 localhost/127.0.0.1/[::1] 带或不带端口、大小写不敏感；url.Parse 严格解析——`attacker.com:127.0.0.1` rebinding 变体、非数字/越界/空端口、`[localhost]` 方括号非 IPv6、裸 `::1`、userinfo、携带 path 等畸形形式一律 403；Origin scheme 限 http(s)、拒绝 userinfo/path）；全路径 `X-Content-Type-Options: nosniff` + `Cache-Control: no-store`（403 也不例外）；无 Cookie 无状态只读（无 CSRF 面）；面板访问日志 DEBUG 不刷屏；未知路径 404、方法限定 GET（POST 405）；JS 动态数据全部 `textContent` 写入（DB 内容视为不可信，DESIGN §7-8） |
+| meshview 服务层（`internal/meshview/`） | MCP 五工具与面板 overview 的**同源只读数据出口**（SPEC §4.1「service 层复用，别复制 SQL」）：视图类型即 JSON 契约；节点视图含 `id`（R19-#2）；服务异常口径唯一谓词 `serviceIsIssue`：`status != active` 且 updated_at 未超 300s 宽限（`serviceIssueGrace`；`stale` 簿记态不计，陈旧行=离线节点遗留数据不当现行故障，单测双向钉住）——get_mesh_status 与面板 overview 的 `service_issues` 共用，前端只消费名单不做业务计算（R19-#4）；overview 节点卡带 24h metrics 摘要（复用 store `MetricsStatsSince`，R19-#3）。节点行对外视图 `NodeRecord` 不含 token_hash（只读消费方无需凭据材料） |
+| store 扩展 | migration v3（tailnet_nodes 表）；`OpenReadOnly`；`ReplaceTailnetNodes`（单事务全量替换，中途失败整体回滚保留旧数据（R19-#12））；`ListTailnetNodes`/`ListAllServices`/`ListAllAgents`/`ListNodes`（无 token_hash）/`NodeNameIDMap`/`MetricsStatsSince`（24h 均值峰值，NULL 语义保持；**total=0 的行不再整行剔除——占比分指标 NULLIF 求值，CPU 等可用指标照常参与（R19-#8）**）/`MetricsSeriesSince`（sparkline 序列，升序限条）/`LatestMetricsTime`（新鲜度）；`Close` 兼容只读句柄 |
+| config 扩展 | console `headscale:` 段（校验：url 合法性 + **scheme 限 http/https（R19-#10）**、api_key 非空、interval_s ≥30）；R17-#2 systemd/docker target ≤256 字节启动校验（与服务端入库截断口径对齐） |
+| 观察点修复 | ① `meshconsole --version` / `meshagent --version`（**语义版本 `m1b-b+git_<short_hash>` + commit，R19-#5**）+ 两二进制统一 usage/`-h` 风格；② Makefile 补 `-X main.commit` 注入（版本+commit 双注入）+ `bin/meshconsole` 重建依赖纳入 `internal/panel/web/*`；③ process 型自进程判定加固（详见 §三.3） |
+| R17 三条转来候选闭环 | ① `pki.go:74` tailnet_ip 非法即拒绝（旧实现静默忽略该 SAN 仍报成功）+ 单测；② `config.go:462` target 长度上限 + 单测；③ `runner.go:135` 注释勘误（null=400 违规，缺席才是无变化，与 R11-A 实现对齐） |
+| deploy/ | `console.example.yaml` 新增 headscale 段注释样例与 Web 面板说明 |
+| 依赖 | `github.com/modelcontextprotocol/go-sdk v1.8.0`（唯一新增直接依赖；间接：google/jsonschema-go、segmentio/encoding、golang-jwt、oauth2、x/time 等随 SDK 带入，go.sum 锁定） |
+
+## 二、Liquid Glass 面板设计说明（技能落地）
+
+**Aesthetic direction（写定）**：「控制室 / mission-control on glass」——深冷墨底 + 磷光 mint 品牌色（兼作 online/ok 状态色，品牌与语义统一）、amber=warn、red=crit；数据全部等宽字体的仪表盘气质。拒绝「三张等宽卡片居中 hero」模板脸。
+
+**签名时刻**：首页「仪表条」（glass-surface-soft 四联超大等宽数字 online/offline/svc issues/tailnet，与左侧超大 mono 标题呈不对称沉底对齐）+ offline/failed 状态的呼吸红点。
+
+- **五要素自证**（frost/atmosphere/token/排版/动效，逐条落到 glass.css 行为）见 REVIEW.md 自测报告「Liquid Glass 五要素自证」节。
+- **布局**：非对称 bento——7/5 与 5/7 交替；节点卡不等宽（主节点大卡：状态/心跳/uptime/cpu+mem sparkline（内联 SVG 手绘，NULL 断线）/disk meter；次节点小卡更小更密）；服务/agent/tailnet 清单用 `.glass-inset` 内嵌行（玻璃上玻璃，无嵌套 backdrop-filter）。
+- **取舍声明**：等宽字体用系统栈（JetBrains Mono/IBM Plex Mono 命中优先，回落 SF Mono/Menlo/Consolas）——离线硬约束下不引 webfont，代价是无网关机器上字形不可控；面板文案用英文控制室惯例（kicker/标签/大数字），设计性格优先。浅色主题按技能 theming.md 分层留好接缝（`[data-theme]` 语义层已就绪），M1b-b 仅交付深色（SPEC 口径），代码内 TODO 注释标明。
+- **动效纪律**：全站唯一 easing 签名 `cubic-bezier(0.22,1,0.36,1)`；载入一次性 stagger 编排（标题 clip 揭示→面板按序浮起，非 uniform fade-in-up）；刷新时数字 tween/状态点过渡；`prefers-reduced-motion` 全关；blob 漂移 26/31/37s 错频。
+
+## 三、观察点闭环（部署验证转来，SPEC §5）
+
+1. **`--version` 子命令**：两二进制新增 `--version/-version/version` → `<bin> <version> (commit <commit>)`；`-h/--help/help` 统一 usage 出口，`meshconsole pki -h`、`meshconsole mcp -h` 同风格（用法行 + flag 默认值）。实测（R19-#5 语义化后）：`meshconsole m1b-b+git_19f3a339 (commit 19f3a339)`。
+2. **ldflags 注入**：Makefile LDFLAGS 补 `-X main.commit=$(COMMIT)`；部署验证时显示旧号 `31eafac-dirty` 的根因是服务器上跑的是 M1a 期构建产物——**部署流程口径：拉新代码后必须重跑 `make build`/`make cross` 并重启 systemd**（`--version` 现可直接核对版本+commit）。另修 `bin/meshconsole` 目标依赖缺 `internal/panel/web/*`（改面板不重编会打进旧静态资源）。
+3. **process 型自进程判定**：核查结论=**代码不存在 exclude-self 设计**（裸 `pgrep -f`，pgrep 只排除自身不排除祖先；本机实测祖先可命中）。部署观察到的 inactive 最可能是该节点 target 与实际 cmdline 不符（配置层）或平台边缘致 pgrep 漏检。按 SPEC「等效方案」加固：pgrep exit 1 时以本进程命令行（os.Args，`/proc/self/cmdline` 跨平台等效物）按 pgrep 同口径 ERE 做确定性自核对，命中报 `active`+`count=1 (self…)` 如实标注来源，不命中维持 inactive。4 例单测 + 真机自探活/反例用例 + E2E（自探 target → active count=1）。
+
+## 四、部署上机项清单与已知限制（R19-#6 口径：本机未验证的明确列出，不含糊）
+
+### 部署上机项（本机无法验证，commit 后由 Hana 主会话上机执行）
+
+1. **真 headscale 连测**（云机现成实例）：配真 API key 拉到真实节点并入库展示（SPEC §7 第 4 项的前半）。本机仅有 mock E2E 兜底：节点解析入库、id 数字/字符串两形态、401 → WARN+旧数据保留、恢复 → INFO 续替、非法 200 body（{}/null/缺 nodes/尾随垃圾/超限/截断）→ 拉取失败不清库（R19-#1/R21-#1）均已覆盖；真机版本演进（字段增删）行为待上机核对。
+2. **浏览器人眼过面板**：布局/动效/深色玻璃质感/呼吸红点/数字 tween 的实际观感（SPEC §4.4 后半）。本机渲染管线已由 Node + 最小 DOM 桩冒烟实证（节点卡/仪表/清单行/sparkline/页脚全构建、15s 轮询钉住、并实抓修复过一处真实渲染缺陷），但玻璃质感只能人眼最终验收；需经隧道打开面板过一遍。
+3. **Windows 真机**（M1a 起遗留）：process 型在裸 Windows 的上报语义（pgrep 缺失 → unavailable+说明）。三平台编译通过，真机行为未验。
+
+### 已知限制（本机验证边界内的如实说明）
+
+4. MCP stdio：管道一次性写入全部帧后立即关 stdin 会随 EOF 快速退出（帧可能未及处理）；真实 MCP 客户端为常驻会话不受影响。E2E 采用分帧+间歇写入。
+5. 面板 poll 15s、sparkline 48 点、异常宽限 300s、headscale interval 缺省 300s 为固定常量（SPEC 口径），未入配置。
+6. tailnet_nodes.online 直接采信 headscale 报告；旧版 API 无该字段时按 offline 存（不推导不编造），last_seen 仍可见。
+7. MCP/面板共享 24h 摘要窗口与 48 点 sparkline 常量（metricsWindow/sparkPoints），超窗数据依 retention（7 天）仍在库，后续如需更长历史再扩展参数。
+8. `meshconsole mcp` 打开库要求 schema 已就绪（先跑过服务模式）；只读句柄不执行 migration，库不存在报错退出（提示先启动 console）。
+
+## 五、验证汇总（2026-10-08，R22 修复轮 2 后全量重测）
+
+`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` **132 用例全绿**（R20 收口基线 130 + R22 修复轮 2 新增 2：headscale 截断/超限、节流独立性；12 包全 ok）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` 面板 JS 语法过；Makefile 依赖行为实测（touch go.mod → bin 产物立即重编）。本机 E2E（R20 轮）：console+agent 全链路（心跳/服务清单/AI agent 发现/tailnet 并入）、面板 4.4 本机可验项（`curl | grep glass`、overview 聚合 JSON、非法 Host 403）、MCP 三方法握手+真数据、headscale 降级/恢复、`--version` 双二进制（`m1b-b+git_19f3a339`）。R19 修复轮真机冒烟补充复核：overview 输出节点 `id`/每节点 24h `metrics` 摘要/`service_issues` 名单；Host 畸形变体全 403；headscale 不可达 WARN 恰一条+旧数据保留。**真 headscale 连测与浏览器人眼验收未做**（见 §四 部署上机项清单）。对用户可见的行为变化：console 启动后多出面板入口（同端口 `/`）与可选 headscale 拉取循环；新增 `meshconsole mcp` 子命令与两二进制 `--version`（语义版本 `m1b-b+git_<hash>`）；pki 对非法 tailnet_ip 从静默忽略改为拒绝；R19/R21 两轮修复引入的行为收紧见 REVIEW.md R20/R22 节末「对用户可见的行为变化」（R21→R22 轮要点：headscale 200 响应的尾随垃圾/超限/截断一律按拉取失败保留旧数据；WARN 节流窗口独立于失败计数严格 1/h；面板 tailnet 空态转有数据不再提示文案与节点行同显；bin 产物随 go.mod/go.sum/Makefile 变更自动重建）。
+
+---
+
 # DELIVERY — M1b-a 交付说明（TLS 全覆盖 + 受管服务清单 + AI agent 发现）
 
 > 交付人：zcode · 2026-10-07（R10 审查 5 阻塞 + 2 建议、R11 复审新增 7 条裁决、R13 复审 4 条残留，逐条修复说明见 REVIEW.md「修复轮记录 · zcode m1b-a-fix」与 R14 节）
@@ -287,3 +348,28 @@ sqlite3 <db_path> "SELECT * FROM nodes; SELECT COUNT(*) FROM metrics;"
 curl -s http://127.0.0.1:7700/healthz
 # 401/403/400/413 与离线复活：kill agent 后等 ≥75s 查 nodes.status，再用原 state 重启 agent
 ```
+
+## 五、部署验证（2026-10-08，腾讯云 1.13.158.180 + Mac mini 跨机）
+
+**结论：M1b-a 全部核心功能在真实环境验证通过。** 部署形态：console systemd 常驻（/opt/meshconsole，MemoryMax 256M，ProtectSystem=strict），agent systemd 常驻（cloud-agent）+ Mac mini 经 SSH 隧道注册（mac-mini，node_id=3）。
+
+| # | 验证项 | 结果 |
+|---|--------|------|
+| 1 | CA 生成持久化 + SAN（127.0.0.1/公网 IP/主机名） | ✓（tailnet_ip 配置生效） |
+| 2 | console HTTPS systemd 部署 + 幂等重启 | ✓ |
+| 3 | agent 注册：one-shot token/到期/expected_node 绑定 | ✓（重放 401，消费即废） |
+| 4 | 心跳 + metrics 落库（15s 间隔，cpu/mem/disk/net/uptime/load） | ✓（首轮 cpu 如实标 waiting，不编数） |
+| 5 | 服务采集 systemd 型（headscale/meshconsole/dsh-tunnel） | ✓ 全 active |
+| 6 | 服务采集 docker 型（nextcloud-app） | ✓ active（docker ps 只读路径） |
+| 7 | 服务采集 process 型（mac meshagent） | ✓ 落库（inactive 判定见观察点③） |
+| 8 | AI agent 发现（custom zcode/codex，版本探测，invokable 恒 false） | ✓（zcode 3.14.4-31 / codex 0.160.0，invokable=0） |
+| 9 | 离线判定（无心跳 60s → offline） | ✓（node1 复现） |
+| 10 | 401（假注册 token/假 node token）| ✓ |
+| 11 | 403（跨节点心跳：node2 token 报 node1 名） | ✓ |
+| 12 | 400（services 显式 null/全空 metrics/严格 JSON） | ✓ |
+| 13 | 多节点并存（3 节点在线状态独立） | ✓ |
+| 14 | agent SIGTERM 重启恢复（state 续接不重注册） | ✓ |
+
+**观察点（非阻塞，转 M1b-b 候选）**：① `--version` flag 两二进制均缺；② agent 启动日志 version 显示 `31eafac-dirty`（M1a 旧 commit 号，ldflags 注入未随 M1b-a 更新）；③ process 型采集对 agent 自身进程判 inactive（疑似 exclude-self 设计，需核对源码确认意图）。
+
+**部署遗留**：console listen 127.0.0.1:7700（公网未放行，Mac 经隧道接入）；公网直连需腾讯云防火墙放行 TCP 7700 并将 listen 改绑（M1b-b Web 面板批次一并定稿）。

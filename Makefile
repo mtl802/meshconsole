@@ -1,6 +1,12 @@
 BINS := bin/meshconsole bin/meshagent
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+# R19-#5：版本语义化为批次号（M1B_B）+ git 短哈希后缀，经 ldflags 注入两二进制；
+# `meshconsole --version` / `meshagent --version` 输出版本形如 m1b-b+git_<short_hash>。
+M1B_B := m1b-b
+COMMIT ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null || echo none)
+VERSION ?= $(M1B_B)+git_$(COMMIT)
+# 观察点②：版本与 commit 双双注入两二进制（-X main.version / -X main.commit），
+# 与启动日志可核验。
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 CROSS_TARGETS := linux/amd64 darwin/arm64 windows/amd64
 
 GO ?= go
@@ -8,14 +14,22 @@ GO ?= go
 # console 配置文件路径（pki 目标读取其中的 pki_dir/tailnet_ip）。
 CONFIG ?= console.yaml
 
+# 面板静态资源（embed 进二进制）也纳入重建依赖：改 web/* 不重跑 build 会打出旧面板。
+WEB_ASSETS := $(shell find internal/panel/web -type f 2>/dev/null)
+
+# R21-#4：构建配方（Makefile）与依赖清单（go.mod/go.sum）变更触发 bin 重建，
+# 已有产物不再携带旧依赖/旧构建配方；commit 哈希变化不进依赖——不因提交触发
+# 全量重建，交付时显式 make cross 保证版本新鲜度。
+BUILD_DEPS := Makefile go.mod go.sum
+
 .PHONY: build cross test vet fmt clean pki
 
 build: $(BINS)
 
-bin/meshconsole: $(shell find cmd internal -name '*.go')
+bin/meshconsole: $(shell find cmd internal -name '*.go') $(WEB_ASSETS) $(BUILD_DEPS)
 	$(GO) build -ldflags '$(LDFLAGS)' -o $@ ./cmd/console
 
-bin/meshagent: $(shell find cmd internal -name '*.go')
+bin/meshagent: $(shell find cmd internal -name '*.go') $(BUILD_DEPS)
 	$(GO) build -ldflags '$(LDFLAGS)' -o $@ ./cmd/agent
 
 # pki：幂等生成 CA + 服务端证书到 pki_dir（缺省 ./pki，私钥 0600）。

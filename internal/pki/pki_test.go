@@ -569,3 +569,40 @@ func freshDirWithMismatchedCA(t *testing.T) string {
 	}
 	return dir
 }
+
+// TestEnsureRejectsInvalidTailnetIP R17-#1：tailnet_ip 配置了但非法 → 拒绝生成
+// （旧实现静默忽略该 SAN 仍报成功）。合法值不受影响（幂等用例另行覆盖）。
+func TestEnsureRejectsInvalidTailnetIP(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pki")
+	_, err := Ensure(Config{Dir: dir, TailnetIP: "not-an-ip"})
+	if err == nil || !strings.Contains(err.Error(), "tailnet_ip") {
+		t.Fatalf("err = %v, want tailnet_ip validation error", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Fatalf("no artifacts should be created on invalid input, got %d files", len(entries))
+	}
+	// 对照：合法 tailnet_ip 正常生成且 SAN 含该地址（既有用例也覆盖，这里快速复核）。
+	res, err := Ensure(Config{Dir: filepath.Join(t.TempDir(), "pki2"), TailnetIP: "100.64.0.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(res.ServerCertPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(raw)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ip := range cert.IPAddresses {
+		if ip.String() == "100.64.0.9" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("tailnet IP missing from SAN: %v", cert.IPAddresses)
+	}
+}

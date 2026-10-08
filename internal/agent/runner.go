@@ -132,7 +132,9 @@ func (e *heartbeatExtras) apply(ctx context.Context, body map[string]any) {
 	if e.services && e.checker != nil {
 		// 配置声明过 services（哪怕显式空列表）即每次上报：空列表驱动 console
 		// 侧把消失的服务转 stale（全量替换语义）。CheckAll 对空清单返回 nil，
-		// 必须转成空数组——null 会被 console 视作「字段缺席、无变化」。
+		// 必须转成空数组（R17-#3 注释勘误，与 R11-A 三态语义对齐）：console
+		// 侧「字段缺席」才是无变化；显式 null 是协议违规、一律 400——发 null
+		// 不会被视为缺席，而是整条心跳被拒。
 		svcs := e.checker.CheckAll(ctx)
 		if svcs == nil {
 			svcs = []collect.ServiceStatus{}

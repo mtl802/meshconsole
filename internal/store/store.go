@@ -78,8 +78,23 @@ func dsn(path string) string {
 	return "file:" + path + "?" + v.Encode()
 }
 
+// dsnReadOnly 构造只读 DSN：mode=ro（文件层只读，库文件不存在时直接报错而不
+// 创建）+ query_only=1（连接层再挡一道写路径，双保险）。不设 journal_mode 等
+// 写语义 PRAGMA——只读连接不得改动库文件。
+func dsnReadOnly(path string) string {
+	v := url.Values{}
+	v.Add("mode", "ro")
+	v.Add("_pragma", "busy_timeout=5000")
+	v.Add("_pragma", "query_only=1")
+	return "file:" + path + "?" + v.Encode()
+}
+
 func openDB(path string, maxOpen int) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dsn(path))
+	return openDBWithDsn(dsn(path), maxOpen)
+}
+
+func openDBWithDsn(dsn string, maxOpen int) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -118,12 +133,28 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error {
+	if s.write == nil {
+		// 只读句柄（OpenReadOnly）：仅读池。
+		return s.read.Close()
+	}
 	errW := s.write.Close()
 	errR := s.read.Close()
 	if errW != nil {
 		return errW
 	}
 	return errR
+}
+
+// OpenReadOnly 以只读模式打开库（MCP/面板等只读消费方专用，SPEC-M1b-b §2）：
+// mode=ro + query_only=1 双保险，库文件不存在时报错而不创建；不执行 migration
+// （schema 由 console 服务模式负责）。返回的 Store 仅可调用读路径方法，
+// 写句柄为 nil，任何写方法都会以错误暴露而非静默。
+func OpenReadOnly(path string) (*Store, error) {
+	read, err := openDBWithDsn(dsnReadOnly(path), 2)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only db: %w", err)
+	}
+	return &Store{write: nil, read: read}, nil
 }
 
 // migrations 按版本递增排列；只执行 schema_migrations 中缺失的版本。
@@ -212,6 +243,24 @@ CREATE INDEX IF NOT EXISTS idx_ai_agents_node_updated ON ai_agents(node_id, upda
 CREATE INDEX IF NOT EXISTS idx_ai_agents_updated ON ai_agents(updated_at);
 `,
 	},
+	{
+		// M1b-b（SPEC §3）：Headscale 集成落库。id 为 headscale 侧节点 id（外部
+		// 主键，非自增）；每次拉取全量替换（事务内先清后插）。last_seen 为
+		// headscale 报告的节点最近可见时刻（unix 秒，可空）；updated_at 为本库
+		// 本次替换时刻——两者语义不同（拉取失败保留旧数据时不前移）。
+		Version: 3,
+		SQL: `
+CREATE TABLE IF NOT EXISTS tailnet_nodes (
+	id           INTEGER PRIMARY KEY,
+	machine_name TEXT    NOT NULL,
+	ips          TEXT    NOT NULL DEFAULT '',
+	online       INTEGER NOT NULL DEFAULT 0,
+	last_seen    INTEGER,
+	updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tailnet_nodes_updated ON tailnet_nodes(updated_at);
+`,
+	},
 }
 
 func (s *Store) migrate() error {
@@ -269,6 +318,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 // 否则攻击者可凭已消费 token 借「重名 409 / 未占用 401」的差异探测节点名存在性。
 // 任一步失败整体回滚，未消费的 token 不被误耗。
 func (s *Store) RegisterNode(ctx context.Context, name, role, osName, arch, nodeTokenHash, regTokenHash string, regTokenExpiresAt int64) (*Node, error) {
+	if err := s.writable(); err != nil {
+		return nil, err
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -348,6 +400,9 @@ func scanNode(row rowScanner) (*Node, error) {
 // 并写入一条 metrics。nodeID 与 nodeName 须与 token 解析出的节点一致（由 registry 层校验）。
 // 返回 false 表示节点不存在（token 失效）。
 func (s *Store) Heartbeat(ctx context.Context, n *MetricsRow, agentVersion string) (bool, error) {
+	if err := s.writable(); err != nil {
+		return false, err
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -398,6 +453,9 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 // 的半轮数据，合并后与单条心跳同原子性。services/agents 传 nil 表示字段缺席
 // （无变化不覆盖）。返回 false 表示节点不存在（token 失效）。
 func (s *Store) HeartbeatFull(ctx context.Context, n *MetricsRow, agentVersion string, services *[]ServiceRow, agents *[]AgentRow) (bool, error) {
+	if err := s.writable(); err != nil {
+		return false, err
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -423,6 +481,9 @@ func (s *Store) HeartbeatFull(ctx context.Context, n *MetricsRow, agentVersion s
 
 // SweepOffline 将 last_seen 早于 cutoff 的在线节点标记为 offline，返回受影响行数。
 func (s *Store) SweepOffline(ctx context.Context, cutoff int64) (int64, error) {
+	if err := s.writable(); err != nil {
+		return 0, err
+	}
 	res, err := s.write.ExecContext(ctx,
 		`UPDATE nodes SET status = 'offline' WHERE status = 'online' AND last_seen < ?`, cutoff)
 	if err != nil {
@@ -433,6 +494,9 @@ func (s *Store) SweepOffline(ctx context.Context, cutoff int64) (int64, error) {
 
 // CleanupMetrics 删除 ts 早于 cutoff 的指标行，返回删除行数。
 func (s *Store) CleanupMetrics(ctx context.Context, cutoff int64) (int64, error) {
+	if err := s.writable(); err != nil {
+		return 0, err
+	}
 	res, err := s.write.ExecContext(ctx, `DELETE FROM metrics WHERE ts < ?`, cutoff)
 	if err != nil {
 		return 0, err
@@ -459,12 +523,18 @@ FROM nodes WHERE name = ?`, name)
 
 // SetNodeLastSeen 直接改写节点 last_seen（运维调整/测试构造过期态）。
 func (s *Store) SetNodeLastSeen(ctx context.Context, nodeID, unix int64) error {
+	if err := s.writable(); err != nil {
+		return err
+	}
 	_, err := s.write.ExecContext(ctx, `UPDATE nodes SET last_seen = ? WHERE id = ?`, unix, nodeID)
 	return err
 }
 
 // DeleteNode 删除节点及其指标行（管理操作；节点 token 随行失效）。
 func (s *Store) DeleteNode(ctx context.Context, nodeID int64) (int64, error) {
+	if err := s.writable(); err != nil {
+		return 0, err
+	}
 	res, err := s.write.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, nodeID)
 	if err != nil {
 		return 0, err
@@ -534,6 +604,9 @@ type AgentRow struct {
 // 'stale'（保留行与历史，不删除）。单事务完成。
 // 返回 false 表示节点不存在（心跳竞态中被删除），调用方按凭据失效处理。
 func (s *Store) ReplaceNodeServices(ctx context.Context, nodeID int64, svcs []ServiceRow) (bool, error) {
+	if err := s.writable(); err != nil {
+		return false, err
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -581,6 +654,9 @@ ON CONFLICT(node_id, name) DO UPDATE SET
 
 // ReplaceNodeAgents 与 ReplaceNodeServices 同语义，作用于 ai_agents 表。
 func (s *Store) ReplaceNodeAgents(ctx context.Context, nodeID int64, ags []AgentRow) (bool, error) {
+	if err := s.writable(); err != nil {
+		return false, err
+	}
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -726,6 +802,273 @@ FROM ai_agents WHERE node_id = ? ORDER BY name`, nodeID)
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ---- M1b-b：tailnet（Headscale）与只读聚合查询 ----
+
+// ErrReadOnly 只读句柄（OpenReadOnly）上禁止的写路径。
+var ErrReadOnly = errors.New("store opened read-only; write path unavailable")
+
+// writable 写路径守卫：OpenReadOnly 句柄上任何写方法直接报错而非 panic。
+func (s *Store) writable() error {
+	if s.write == nil {
+		return ErrReadOnly
+	}
+	return nil
+}
+
+// TailnetNodeRow 为 tailnet_nodes 表行（Headscale 拉取结果，只读镜像）。
+type TailnetNodeRow struct {
+	ID          int64
+	MachineName string
+	// IPs 为该节点的 tailscale 地址（逗号连接，按 headscale 返回顺序）。
+	IPs       string
+	Online    bool
+	LastSeen  sql.NullInt64 // unix 秒；headscale 未给出时 NULL
+	UpdatedAt int64         // unix 秒，由 store 统一取 now
+}
+
+// ReplaceTailnetNodes 单事务全量替换 tailnet_nodes（SPEC-M1b-b §3：每次拉取
+// 全量替换）。拉取失败时调用方不调用本方法（旧数据原样保留）。
+func (s *Store) ReplaceTailnetNodes(ctx context.Context, nodes []TailnetNodeRow) error {
+	if err := s.writable(); err != nil {
+		return err
+	}
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tailnet_nodes`); err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		var lastSeen any
+		if n.LastSeen.Valid {
+			lastSeen = n.LastSeen.Int64
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO tailnet_nodes(id, machine_name, ips, online, last_seen, updated_at)
+VALUES(?, ?, ?, ?, ?, ?)`,
+			n.ID, n.MachineName, n.IPs, boolToInt(n.Online), lastSeen, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// TailnetNodeRecord 为读出的 tailnet_nodes 行。
+type TailnetNodeRecord struct {
+	ID          int64
+	MachineName string
+	IPs         string
+	Online      bool
+	LastSeen    sql.NullInt64
+	UpdatedAt   int64
+}
+
+// ListTailnetNodes 列出全部 tailnet 节点（按 id 排序）。
+func (s *Store) ListTailnetNodes(ctx context.Context) ([]TailnetNodeRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT id, machine_name, ips, online, last_seen, updated_at
+FROM tailnet_nodes ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TailnetNodeRecord
+	for rows.Next() {
+		var r TailnetNodeRecord
+		var online int
+		if err := rows.Scan(&r.ID, &r.MachineName, &r.IPs, &online, &r.LastSeen, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		r.Online = online == 1
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListAllServices 列出全网服务行（按 updated_at 倒序、名称次序稳定）。
+func (s *Store) ListAllServices(ctx context.Context) ([]ServiceRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT node_id, name, type, target, status, detail, updated_at
+FROM services ORDER BY name, node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ServiceRecord
+	for rows.Next() {
+		var r ServiceRecord
+		if err := rows.Scan(&r.NodeID, &r.Name, &r.Type, &r.Target, &r.Status, &r.Detail, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListAllAgents 列出全网 AI agent 行。
+func (s *Store) ListAllAgents(ctx context.Context) ([]AgentRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT node_id, name, type, version, path, status, invokable, detail, updated_at
+FROM ai_agents ORDER BY name, node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentRecord
+	for rows.Next() {
+		var r AgentRecord
+		if err := rows.Scan(&r.NodeID, &r.Name, &r.Type, &r.Version, &r.Path, &r.Status, &r.Invokable, &r.Detail, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// MetricsStats 为某节点时间窗口内的指标摘要（MCP get_node 与面板共用）。
+// 均值/峰值均为 NULL 时表示窗口内无该指标数据（不填 0）。
+type MetricsStats struct {
+	WindowSeconds int64
+	Samples       int
+	CPUAvg        sql.NullFloat64
+	CPUMax        sql.NullFloat64
+	// MemPctAvg/MemPctMax 基于窗口内有 mem_used 且 mem_total>0 的样本。
+	MemPctAvg sql.NullFloat64
+	MemPctMax sql.NullFloat64
+	// DiskPctMax 为窗口内磁盘占用峰值（used/total，百分比）。
+	DiskPctMax sql.NullFloat64
+}
+
+// MetricsStatsSince 汇总某节点 since（unix 秒）之后的指标。
+// mem/disk total 为 0 的行不再被 WHERE 整行剔除（R19-#8）：占比分指标经
+// NULLIF(total,0) 求值——除零样本只让对应 mem/disk 摘要保持 NULL，CPU 等
+// 其余可用指标照常参与聚合（COUNT 为窗口内全部样本数）。
+func (s *Store) MetricsStatsSince(ctx context.Context, nodeID int64, since int64) (*MetricsStats, error) {
+	st := &MetricsStats{WindowSeconds: time.Now().Unix() - since}
+	err := s.read.QueryRowContext(ctx, `
+SELECT COUNT(*), AVG(cpu_pct), MAX(cpu_pct),
+       AVG(mem_used * 100.0 / NULLIF(mem_total, 0)),
+       MAX(mem_used * 100.0 / NULLIF(mem_total, 0)),
+       MAX(disk_used * 100.0 / NULLIF(disk_total, 0))
+FROM metrics
+WHERE node_id = ? AND ts >= ?`, nodeID, since).Scan(
+		&st.Samples, &st.CPUAvg, &st.CPUMax, &st.MemPctAvg, &st.MemPctMax, &st.DiskPctMax)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// MetricsPoint 为 sparkline 单点（cpu 与内存占比同一样本）。
+type MetricsPoint struct {
+	TS     int64
+	CPUPct sql.NullFloat64
+	MemPct sql.NullFloat64 // mem_total 缺失/为 0 的样本为 NULL
+}
+
+// MetricsSeriesSince 取某节点 since 之后、至多 limit 条样本（时间升序返回，
+// 取的是最新 limit 条——超窗时丢弃最旧样本）。
+func (s *Store) MetricsSeriesSince(ctx context.Context, nodeID int64, since int64, limit int) ([]MetricsPoint, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT ts, cpu_pct, mem_used * 100.0 / NULLIF(mem_total, 0)
+FROM (SELECT ts, cpu_pct, mem_used, mem_total FROM metrics
+      WHERE node_id = ? AND ts >= ? ORDER BY id DESC LIMIT ?)
+ORDER BY ts`, nodeID, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MetricsPoint
+	for rows.Next() {
+		var p MetricsPoint
+		if err := rows.Scan(&p.TS, &p.CPUPct, &p.MemPct); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// LatestMetricsTime 返回全库最新一条 metrics 的 ts（数据新鲜度口径）；
+// 无数据返回 ok=false。
+func (s *Store) LatestMetricsTime(ctx context.Context) (int64, bool, error) {
+	var ts sql.NullInt64
+	if err := s.read.QueryRowContext(ctx, `SELECT MAX(ts) FROM metrics`).Scan(&ts); err != nil {
+		return 0, false, err
+	}
+	if !ts.Valid {
+		return 0, false, nil
+	}
+	return ts.Int64, true, nil
+}
+
+// NodeRecord 为对外只读视图的节点行（不含 token_hash——只读消费方无需凭据材料）。
+type NodeRecord struct {
+	ID           int64
+	Name         string
+	Role         string
+	OS           string
+	Arch         string
+	TailnetIP    string
+	PublicIP     string
+	AgentVersion string
+	Status       string
+	LastSeen     sql.NullInt64
+	LastSuccess  sql.NullInt64
+	CreatedAt    int64
+}
+
+// ListNodes 列出全部节点（按名称排序；不含 token_hash）。
+func (s *Store) ListNodes(ctx context.Context) ([]NodeRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT id, name, role, os, arch, tailnet_ip, public_ip, agent_version, status,
+       last_seen, last_success, created_at
+FROM nodes ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NodeRecord
+	for rows.Next() {
+		var r NodeRecord
+		if err := rows.Scan(&r.ID, &r.Name, &r.Role, &r.OS, &r.Arch, &r.TailnetIP,
+			&r.PublicIP, &r.AgentVersion, &r.Status, &r.LastSeen, &r.LastSuccess, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// NodeNameIDMap 返回 node_id → name 映射（meshview 组装视图用；只读）。
+func (s *Store) NodeNameIDMap(ctx context.Context) (map[int64]string, error) {
+	rows, err := s.read.QueryContext(ctx, `SELECT id, name FROM nodes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]string{}
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		out[id] = name
 	}
 	return out, rows.Err()
 }

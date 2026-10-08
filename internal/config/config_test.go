@@ -561,3 +561,55 @@ func TestConsolePKIFields(t *testing.T) {
 		t.Fatal("max_connections=0 must be rejected")
 	}
 }
+
+// TestServiceTargetLengthCap R17-#2：systemd/docker target 超过 256 字节 → 启动
+// 拒绝（与服务端入库截断口径一致，防运行期静默截断导致状态错位）。
+func TestServiceTargetLengthCap(t *testing.T) {
+	long := strings.Repeat("a", 257)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "agent.yaml")
+	body := "services:\n  - name: svc\n    type: systemd\n    target: " + long + "\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAgent(p); err == nil || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("err = %v, want target length cap rejection", err)
+	}
+	// 256 字节整边界合法。
+	ok := "services:\n  - name: svc\n    type: systemd\n    target: " + strings.Repeat("a", 256) + "\n"
+	if err := os.WriteFile(p, []byte(ok), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadAgent(p); err != nil {
+		t.Fatalf("256-byte target should pass: %v", err)
+	}
+}
+
+// TestHeadscaleURLScheme R19-#10：headscale url 的 scheme 限 http/https——
+// 其他 scheme（ftp/file/ssh/javascript 等）与无 scheme 形式启动即拒绝；
+// http/https 正常加载。
+func TestHeadscaleURLScheme(t *testing.T) {
+	dir := t.TempDir()
+	write := func(u string) string {
+		path := filepath.Join(dir, "console.yaml")
+		body := "headscale:\n  url: \"" + u + "\"\n  api_key: \"k\"\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, bad := range []string{"ftp://127.0.0.1:8080", "file:///tmp/hs", "ssh://127.0.0.1", "127.0.0.1:8080", "javascript:alert(1)"} {
+		if _, err := LoadConsoleForPKI(write(bad)); err == nil || !strings.Contains(err.Error(), "HTTP(S)") {
+			t.Fatalf("headscale url %q: err = %v, want HTTP(S) scheme rejection", bad, err)
+		}
+	}
+	for _, good := range []string{"http://127.0.0.1:8080", "https://headscale.internal:8443"} {
+		cfg, err := LoadConsoleForPKI(write(good))
+		if err != nil {
+			t.Fatalf("headscale url %q: %v", good, err)
+		}
+		if cfg.Headscale == nil || cfg.Headscale.URL != good {
+			t.Fatalf("headscale url = %+v, want %q", cfg.Headscale, good)
+		}
+	}
+}

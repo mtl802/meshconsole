@@ -23,7 +23,11 @@ import (
 	"github.com/mtl802/meshconsole/internal/config"
 )
 
-var version = "dev"
+var (
+	// version/commit 由 Makefile ldflags 注入（观察点①②）。
+	version = "dev"
+	commit  = "none"
+)
 
 func newLogger(level string) *slog.Logger {
 	var lv slog.Level
@@ -41,13 +45,14 @@ func newLogger(level string) *slog.Logger {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `meshagent (%s)
+	fmt.Fprintf(os.Stderr, `meshagent (%s · commit %s)
 用法:
   meshagent register -console <url> -token <注册token> -name <名称> [-role <角色>] [-state <path>]
                      [-ca-cert <CA证书路径>] [-fingerprint <SHA-256指纹>]
                      （https 地址必须带 -ca-cert 或 -fingerprint 之一）
   meshagent run [-config <path>] [-state <path>]
-`, version)
+  meshagent --version
+`, version, commit)
 	os.Exit(2)
 }
 
@@ -193,7 +198,11 @@ func main() {
 		os.Exit(cmdRegister(os.Args[2:]))
 	case "run":
 		os.Exit(cmdRun(os.Args[2:]))
-	case "-h", "-help", "--help":
+	case "--version", "-version", "version":
+		// 观察点①：输出语义版本 + commit（Makefile ldflags 注入）。
+		fmt.Printf("meshagent %s (commit %s)\n", version, commit)
+		return
+	case "-h", "-help", "--help", "help":
 		usage()
 	default:
 		fmt.Fprintf(os.Stderr, "未知子命令: %s\n", os.Args[1])

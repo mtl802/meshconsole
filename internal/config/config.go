@@ -106,8 +106,23 @@ type Console struct {
 	TailnetIP string `yaml:"tailnet_ip"`
 	// MaxConnections 为连接总数上限（DESIGN §7-4/§7-9，LimitListener，默认 256）。
 	// 第 max_connections+1 条并发连接在内核 accept 队列排队而非被拒。
-	MaxConnections int    `yaml:"max_connections"`
-	LogLevel       string `yaml:"log_level"`
+	MaxConnections int `yaml:"max_connections"`
+	// Headscale 为 Headscale 集成配置（M1b-b，只读拉取）。nil（配置无该段）=
+	// 集成禁用（启动日志 INFO 一次，不报错）。
+	Headscale *HeadscaleConfig `yaml:"headscale"`
+	LogLevel  string           `yaml:"log_level"`
+}
+
+// HeadscaleConfig 为 headscale REST 拉取配置（SPEC-M1b-b §3）。
+// url 默认 http://127.0.0.1:8080；interval_s 默认 300s。API key 由部署带外
+// 注入（DESIGN §7-9：不入 git）。
+type HeadscaleConfig struct {
+	// URL 为 headscale API 基地址（如 http://127.0.0.1:8080），不带末尾斜杠。
+	URL string `yaml:"url"`
+	// APIKey 为 headscale 预生成 API key（Authorization: Bearer）。
+	APIKey string `yaml:"api_key"`
+	// IntervalS 为拉取周期秒数；缺省 300（DESIGN §4.1-F：低频只读拉取）。
+	IntervalS int `yaml:"interval_s"`
 }
 
 // CertKeyPaths 返回服务端证书与私钥路径（显式配置优先，缺省落 pki_dir）。
@@ -286,7 +301,39 @@ func parseConsole(path string) (*Console, bool, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	if err := cfg.validateHeadscale(); err != nil {
+		return nil, false, err
+	}
 	return cfg, true, nil
+}
+
+// validateHeadscale 校验 headscale 段（未配置 = 集成禁用，合法）。
+// url/api_key 缺省与错误口径见 SPEC-M1b-b §3；interval_s 下限 30s（只读拉取保持低频）。
+// R19-#10：url 的 scheme 限 http/https——其他 scheme（ftp/file/ssh 等）与无
+// scheme 形式一律启动报错，不留到运行期拉取才失败。
+func (c *Console) validateHeadscale() error {
+	if c.Headscale == nil {
+		return nil
+	}
+	h := c.Headscale
+	h.URL = strings.TrimSpace(h.URL)
+	if h.URL == "" {
+		h.URL = "http://127.0.0.1:8080"
+	}
+	if u, err := url.Parse(h.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("console.headscale.url 须为合法 HTTP(S) 基地址（scheme 限 http/https，如 http://127.0.0.1:8080）")
+	}
+	h.APIKey = strings.TrimSpace(h.APIKey)
+	if h.APIKey == "" {
+		return fmt.Errorf("console.headscale.api_key 不得为空（headscale 预生成 API key；不需要集成时请删除 headscale 段）")
+	}
+	if h.IntervalS == 0 {
+		h.IntervalS = 300
+	}
+	if h.IntervalS < 30 {
+		return fmt.Errorf("console.headscale.interval_s 不得低于 30（只读拉取保持低频）")
+	}
+	return nil
 }
 
 // LoadConsole 载入控制台配置（服务模式，含注册 token 强制校验）。
@@ -414,6 +461,11 @@ func validateAgentServices(services []ServiceDecl) error {
 		seen[s.Name] = true
 		switch s.Type {
 		case "systemd", "docker":
+			// R17-#2：长度上限与服务端入库截断口径（256 字节）一致——超长在
+			// 启动即拒绝，避免运行期被静默截断后 agent 与 console 状态错位。
+			if len(s.Target) > 256 {
+				return fmt.Errorf("agent.services[%d] (%s): target 过长（≤256 字节），got %d", i, s.Type, len(s.Target))
+			}
 			if !ValidServiceTarget(s.Target) {
 				return fmt.Errorf("agent.services[%d] (%s): target 须匹配 [a-zA-Z0-9_@.-] 且非空，got %q", i, s.Type, s.Target)
 			}

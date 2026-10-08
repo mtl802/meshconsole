@@ -1,7 +1,9 @@
 // meshconsole 控制台入口。子命令：
 //
-//	meshconsole            服务模式：HTTPS 监听（默认）
+//	meshconsole            服务模式：HTTPS 监听（agent API + 只读面板）
+//	meshconsole mcp        MCP server（stdio 传输，只读工具，零网络暴露）
 //	meshconsole pki        生成/校验 CA 与服务端证书（幂等，不覆盖已有私钥）
+//	meshconsole --version  打印语义版本与 commit
 package main
 
 import (
@@ -20,14 +22,25 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/mtl802/meshconsole/internal/config"
+	"github.com/mtl802/meshconsole/internal/headscale"
+	"github.com/mtl802/meshconsole/internal/mcpserver"
+	"github.com/mtl802/meshconsole/internal/meshview"
+	"github.com/mtl802/meshconsole/internal/panel"
 	"github.com/mtl802/meshconsole/internal/pki"
 	"github.com/mtl802/meshconsole/internal/registry"
 	"github.com/mtl802/meshconsole/internal/store"
 	"golang.org/x/net/netutil"
 )
 
-var version = "dev"
+var (
+	// version/commit 由 Makefile ldflags 注入（观察点②）：-X main.version、
+	// -X main.commit。未注入时 version=dev、commit=none。
+	version = "dev"
+	commit  = "none"
+)
 
 const (
 	// shutdownGrace 为排空在途请求的宽限期：读超时 30s + 余量（R3-#5）。
@@ -52,15 +65,86 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv}))
 }
 
+// stderrLogger 供 MCP/pki 等子命令使用：stdout 是协议/数据通道，日志只能走
+// stderr（MCP stdio 传输下日志进 stdout 会污染 JSON-RPC 帧）。
+func stderrLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stderr, nil))
+}
+
+// printVersion 输出语义版本 + commit（观察点①：--version 子命令）。
+func printVersion(w interface{ Write([]byte) (int, error) }, bin string) {
+	fmt.Fprintf(w, "%s %s (commit %s)\n", bin, version, commit)
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `meshconsole (%s · commit %s)
+用法:
+  meshconsole [-config <path>]       服务模式：HTTPS 监听（agent API + 只读面板）
+  meshconsole mcp [-config <path>]   MCP server：stdio 传输，五个只读工具，零网络暴露
+  meshconsole pki [-config <path>]   生成/校验 CA 与服务端证书（幂等，不覆盖私钥）
+  meshconsole --version              打印语义版本与 commit
+`, version, commit)
+	os.Exit(2)
+}
+
+// cmdVersion 处理 --version/-version/version（观察点①）。
+func cmdVersion() int {
+	printVersion(os.Stdout, "meshconsole")
+	return 0
+}
+
+// cmdMCP 执行 `meshconsole mcp`：只读 MCP server（stdio）。
+// 复用 console.yaml（只读 db_path 等字段，不强制注册 token——stdio 本机进程
+// 模型无需 TLS/token，SPEC-M1b-b §2）；库以只读模式打开（mode=ro +
+// query_only=1），不存在任何写路径。
+func cmdMCP(args []string) int {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "用法: meshconsole mcp [-config <path>]\n（五个只读工具: list_nodes / get_node / list_services / list_agents / get_mesh_status；日志走 stderr，stdout 为 JSON-RPC 通道）\n")
+		fs.PrintDefaults()
+	}
+	cfgPath := fs.String("config", "console.yaml", "配置文件路径（读取 db_path）")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	log := stderrLogger()
+	cfg, err := config.LoadConsoleForPKI(*cfgPath)
+	if err != nil {
+		log.Error("load config", "err", err)
+		return 1
+	}
+	st, err := store.OpenReadOnly(cfg.DBPath)
+	if err != nil {
+		log.Error("open store read-only", "db", cfg.DBPath, "err", err)
+		return 1
+	}
+	defer st.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	log.Info("mcp server starting (stdio)", "version", version, "commit", commit,
+		"db", cfg.DBPath, "read_only", true)
+	if err := mcpserver.New(st, version, nil).Run(ctx, &mcp.StdioTransport{}); err != nil {
+		log.Error("mcp server", "err", err)
+		return 1
+	}
+	log.Info("mcp server stopped")
+	return 0
+}
+
 // cmdPKI 执行 `meshconsole pki`：按配置幂等生成 pki 目录（CA + 服务端证书），
 // 打印服务端证书指纹（供 agent 配置 fingerprint 粘贴）。
 func cmdPKI(args []string) int {
 	fs := flag.NewFlagSet("pki", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "用法: meshconsole pki [-config <path>]\n（幂等生成 CA + 服务端证书到 pki_dir；已存在则不覆盖，输出 SHA-256 指纹供 agent 配置）\n")
+		fs.PrintDefaults()
+	}
 	cfgPath := fs.String("config", "console.yaml", "配置文件路径（读取 pki_dir/tailnet_ip/tls_cert/tls_key）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := stderrLogger()
 	// pki 子命令不强制注册 token（生成证书是部署前置动作，与 token 配置无关）。
 	cfg, err := config.LoadConsoleForPKI(*cfgPath)
 	if err != nil {
@@ -125,11 +209,21 @@ func drainHTTPSeq(log *slog.Logger, srv *http.Server, inFlight *sync.WaitGroup, 
 }
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "pki" {
-		os.Exit(cmdPKI(os.Args[2:]))
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "pki":
+			os.Exit(cmdPKI(os.Args[2:]))
+		case "mcp":
+			os.Exit(cmdMCP(os.Args[2:]))
+		case "--version", "-version", "version":
+			os.Exit(cmdVersion())
+		case "-h", "-help", "--help", "help":
+			usage()
+		}
 	}
 
 	cfgPath := flag.String("config", "console.yaml", "配置文件路径")
+	flag.Usage = usage
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -140,9 +234,9 @@ func main() {
 	}
 	log = newLogger(cfg.LogLevel)
 	certPath, keyPath := cfg.CertKeyPaths()
-	log.Info("meshconsole starting", "version", version, "listen", cfg.Listen,
+	log.Info("meshconsole starting", "version", version, "commit", commit, "listen", cfg.Listen,
 		"db", cfg.DBPath, "tls_cert", certPath, "tls_key", keyPath,
-		"max_connections", cfg.MaxConnections)
+		"max_connections", cfg.MaxConnections, "headscale", cfg.Headscale != nil)
 
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -158,12 +252,23 @@ func main() {
 	go registry.SweepLoop(ctx, st, log, time.Duration(cfg.OfflineAfterS)*time.Second)
 	go registry.CleanupLoop(ctx, st, log, cfg.MetricsRetentionDays)
 
+	// Headscale 集成（M1b-b，只读拉取）：配置无 headscale 段 = 禁用（INFO 一次）。
+	if cfg.Headscale != nil {
+		fetcher := headscale.NewFetcher(headscale.NewClient(cfg.Headscale.URL, cfg.Headscale.APIKey), st)
+		go fetcher.Run(ctx, time.Duration(cfg.Headscale.IntervalS)*time.Second, log)
+	} else {
+		log.Info("headscale integration disabled", "reason", "no headscale section in config")
+	}
+
 	mux := http.NewServeMux()
 	// /healthz：唯一免认证端点，仅返回 ok（DESIGN §7-2）。
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Web 只读面板（M1b-b）：GET / 与 GET /api/panel/overview，Host/Origin
+	// 校验 + 安全头（internal/panel guard），数据与 MCP 同源（meshview）。
+	panel.New(meshview.New(st), log).RegisterRoutes(mux)
 	registry.New(st, log, cfg.RegistrationTokens).RegisterRoutes(mux)
 
 	// 在途 handler 计数：drainHTTP 第三段靠它确认「没有任何 handler 还在碰 DB」。

@@ -71,6 +71,11 @@ func Ensure(cfg Config) (*Result, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("pki 目录为空")
 	}
+	// R17-#1：tailnet_ip 非法不再静默忽略（旧实现 ParseIP 失败时跳过该 SAN 仍报
+	// 成功——证书缺配置要求的 SAN 而部署方不知情）。配置了就必须合法。
+	if cfg.TailnetIP != "" && net.ParseIP(cfg.TailnetIP) == nil {
+		return nil, fmt.Errorf("tailnet_ip %q 不是合法 IP 地址（期望如 100.64.0.1）；修正配置后重试", cfg.TailnetIP)
+	}
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create pki dir: %w", err)
 	}

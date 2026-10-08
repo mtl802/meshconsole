@@ -1,0 +1,462 @@
+/* ============================================================================
+   MeshConsole panel — Liquid Glass material system (SPEC-M1b-b §4.3)
+   ----------------------------------------------------------------------------
+   设计系统取自 docs/skills/liquid-glass-frontend（伦哥点名技能）：
+   只取其 CSS 材质与设计原则，丢弃 Next.js/Tailwind/motion 构建链 ——
+   本文件为纯手写 CSS，无任何外部依赖（面板须内网/离线可用）。
+
+   五要素自证（对应技能 references）：
+   1. frost        —— .glass-surface: blur(34px)+saturate(190%) + specular 顶边
+   2. atmosphere   —— body 后景 blob 渐变场 + 弧线 + 颗粒（玻璃必须有可折射物）
+   3. token        —— 全站色板派生自三个 RGB 三元组（见 --primary/--accent/--alarm）
+   4. 排版         —— 数据一律等宽（系统 mono 栈，离线取舍见 DELIVERY），
+                      标题 = 超大 mono + 一处衬线斜体 accent
+   5. 动效         —— 单一 easing 签名（--ease）贯穿：载入 stagger 编排、
+                      数字 tween、离线呼吸红点；prefers-reduced-motion 全关
+
+   浅色主题：M1b-b 仅交付深色。token 已按 theming.md 分层（[data-app] 语义层），
+   浅色只需加 [data-theme="light"] 覆盖块（更薄面板 + 更高 saturate，见技能
+   references/liquid-glass.md「反直觉」一节）。TODO(light-theme)。
+   ============================================================================ */
+
+/* ---- 三个 RGB 三元组：全站色板唯一来源（re-skin = 改这里） ----
+   控制室方向：状态色即品牌色 —— mint(online/ok)、amber(warn)、red(crit)。
+   与技能样例（primary/primary-soft/accent）的差异：本面板需要红/黄/绿三态
+   信号色，soft tint 改由 color-mix 从主色派生，三元组纪律不变。 */
+:root {
+  --primary: 52 211 153;   /* mint — 品牌主色 + online/ok 状态 */
+  --accent: 245 158 11;    /* amber — warn / degraded */
+  --alarm: 248 113 113;    /* red — offline / failed / crit */
+  /* 派生色（禁止在组件里写死 hex） */
+  --primary-soft: color-mix(in srgb, rgb(var(--primary)), white 45%);
+  --primary-dim: rgb(var(--primary) / 0.14);
+  --accent-rgb: var(--accent);
+  --alarm-rgb: var(--alarm);
+}
+
+/* ---- 语义 token（[data-app] 层，组件只引用语义，不碰原色） ---- */
+:root, [data-app] {
+  --app-bg: #070B11;
+  --app-panel: #0D141E;
+  --app-elev: #16202D;
+  --app-border: rgba(214, 232, 244, 0.10);
+  --app-border-strong: rgba(214, 232, 244, 0.20);
+  --app-text: #E8EFF5;
+  --app-text-soft: #94A8B9;
+  --app-text-faint: #5E7080;
+  --app-hover: rgba(214, 232, 244, 0.05);
+  --app-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.8);
+  --aura: 0.30;            /* 玻璃背后色晕强度（深色 = 富） */
+
+  /* 等宽栈（离线取舍：不引 webfont，本机装有 JetBrains Mono / IBM Plex Mono
+     则自动命中，否则落系统 mono —— 取舍说明见 DELIVERY） */
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-ui: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  --font-serif: ui-serif, "New York", Georgia, serif;
+
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);   /* 全站唯一 easing 签名 */
+  --radius: 20px;
+  --radius-sm: 12px;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--app-bg);
+  color: var(--app-text);
+  font-family: var(--font-ui);
+  overflow-x: hidden;
+}
+::selection { background: rgb(var(--primary) / 0.85); color: #06251A; }
+
+/* ============================================================================
+   ATMOSPHERE —— 玻璃之下必须有可折射的颜色（技能 liquid-glass.md「aura」节）
+   ============================================================================ */
+.atmosphere {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  overflow: hidden;
+}
+.blob {
+  position: absolute; border-radius: 999px;
+  filter: blur(76px); mix-blend-mode: screen;
+  opacity: var(--aura);
+  will-change: transform;
+}
+.blob--a {
+  width: 52vw; height: 52vw; left: 46%; top: -14%;
+  background: radial-gradient(circle, rgb(var(--primary) / 0.5), transparent 70%);
+  animation: floatA 26s var(--ease) infinite;
+}
+.blob--b {
+  width: 40vw; height: 40vw; left: -8%; top: 42%;
+  background: radial-gradient(circle, rgb(var(--accent) / 0.34), transparent 70%);
+  animation: floatB 31s var(--ease) infinite;
+}
+.blob--c {
+  width: 30vw; height: 30vw; left: 62%; top: 66%;
+  background: radial-gradient(circle, rgb(var(--alarm) / 0.18), transparent 70%);
+  animation: floatC 37s var(--ease) infinite;
+}
+@keyframes floatA {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%      { transform: translate(-9vw, 7vh) scale(1.14); }
+  66%      { transform: translate(6vw, -6vh) scale(0.94); }
+}
+@keyframes floatB {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50%      { transform: translate(11vw, -9vh) scale(1.18); }
+}
+@keyframes floatC {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50%      { transform: translate(-8vw, -10vh) scale(1.1); }
+}
+/* 细线弧：大圆弧出血到视口外（技能 layout-composition.md 线稿层） */
+.arc {
+  position: absolute; border-radius: 999px;
+  border: 1px solid var(--app-border);
+  right: -28vw; top: 8%; width: 90vw; height: 90vw;
+}
+/* 控制室网格：极淡的方格，给仪表盘一层“图纸”质感 */
+.grid-lines {
+  position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(214, 232, 244, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(214, 232, 244, 0.028) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 30%, transparent 78%);
+  -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 30%, transparent 78%);
+}
+/* 颗粒：模拟质感 + 掩盖渐变 banding（技能 typography-color.md「texture」节） */
+.grain {
+  position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  opacity: 0.05; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' filter='url(%23n)'/></svg>");
+}
+
+/* ============================================================================
+   GLASS MATERIAL —— 真 frost：重 blur + saturate + specular 顶边
+   （ utilities 移植自技能 assets/globals.css，去 Tailwind 化）
+   ============================================================================ */
+.glass-surface {
+  background: color-mix(in srgb, var(--app-panel) 42%, transparent);
+  -webkit-backdrop-filter: blur(34px) saturate(190%);
+  backdrop-filter: blur(34px) saturate(190%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.14),
+    inset 0 0 0 1px var(--app-border);
+  border-radius: var(--radius);
+}
+.glass-surface-soft {
+  background: color-mix(in srgb, var(--app-panel) 46%, transparent);
+  -webkit-backdrop-filter: blur(44px) saturate(200%);
+  backdrop-filter: blur(44px) saturate(200%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.22),
+    inset 0 0 0 1px var(--app-border),
+    0 20px 55px -20px rgb(0 0 0 / 0.55);
+  border-radius: var(--radius);
+}
+/* 玻璃面板内部的内嵌层（行/块）：绝不叠 backdrop-filter —— 嵌套会打断 GPU
+   合成（技能第一大坑）。父层已 frost，内嵌只做半透明提亮 + 顶缘反光。 */
+.glass-inset {
+  background: color-mix(in srgb, var(--app-elev) 55%, transparent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.09);
+  border-radius: var(--radius-sm);
+}
+.glass-inset-hover { transition: background-color .25s var(--ease), box-shadow .25s var(--ease); }
+.glass-inset-hover:hover {
+  background: color-mix(in srgb, var(--app-elev) 72%, transparent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.16), inset 0 0 0 1px rgb(255 255 255 / 0.05);
+}
+
+/* ============================================================================
+   TYPOGRAPHY —— 数据一律等宽；标题超大 mono + 衬线斜体 accent
+   ============================================================================ */
+.kicker {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  color: rgb(var(--primary) / 0.9);
+  margin: 0 0 14px;
+}
+.display {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: clamp(2.6rem, 5.2vw, 4.6rem);
+  letter-spacing: -0.04em;
+  line-height: 0.94;
+  margin: 0;
+  color: var(--app-text);
+}
+.display em {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  color: rgb(var(--primary));
+}
+.mono { font-family: var(--font-mono); }
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+}
+.label {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--app-text-faint);
+}
+
+/* ============================================================================
+   SHELL / LAYOUT —— 非对称 bento（技能 layout-composition.md）：
+   7/5 与 5/7 交替，节点卡「主大次小」，拒绝等宽三卡模板脸
+   ============================================================================ */
+.shell {
+  position: relative; z-index: 2;
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: clamp(28px, 5vh, 64px) clamp(18px, 3.5vw, 44px) 40px;
+  display: flex; flex-direction: column; gap: 34px;
+}
+.masthead {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 28px;
+  align-items: end;                 /* 右侧仪表条沉底 —— 刻意的不对称 */
+}
+.readout {
+  justify-self: end;
+  width: 100%;
+  max-width: 560px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  padding: 18px 8px 14px;
+}
+.gauge {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 2px 6px;
+}
+.gauge + .gauge { border-left: 1px solid var(--app-border); }
+.gauge-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: clamp(1.9rem, 3.2vw, 2.7rem);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  color: var(--app-text);
+  transition: color .4s var(--ease);
+}
+.gauge-num.is-zero { color: var(--app-text-faint); }
+.gauge-num.has-issue { color: rgb(var(--alarm)); }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 22px;
+}
+.col-7 { grid-column: span 7; }
+.col-5 { grid-column: span 5; }
+.stack { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+
+@media (max-width: 980px) {
+  .masthead { grid-template-columns: 1fr; align-items: start; }
+  .readout { justify-self: start; }
+  .col-7, .col-5 { grid-column: span 12; }
+}
+
+/* ============================================================================
+   COMPONENTS
+   ============================================================================ */
+.panel { padding: 22px 22px 18px; display: flex; flex-direction: column; min-width: 0; }
+.panel-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  margin-bottom: 14px;
+}
+.panel-title {
+  font-family: var(--font-mono);
+  font-size: 0.8rem; font-weight: 600;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  margin: 0;
+  color: var(--app-text);
+}
+.panel-meta {
+  font-family: var(--font-mono);
+  font-size: 0.68rem; letter-spacing: 0.08em;
+  color: var(--app-text-faint);
+}
+.panel-body { display: flex; flex-direction: column; gap: 8px; }
+.panel-foot {
+  margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--app-border);
+  font-family: var(--font-mono);
+  font-size: 0.66rem; letter-spacing: 0.06em;
+  color: var(--app-text-faint);
+}
+.empty {
+  font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.06em;
+  color: var(--app-text-faint);
+  padding: 14px 4px 8px;
+}
+
+/* ---- 节点卡（主卡） ---- */
+.node-card { padding: 24px 24px 20px; position: relative; overflow: hidden; }
+.node-card .aura {
+  position: absolute; right: -48px; top: -48px; width: 190px; height: 190px;
+  border-radius: 999px; filter: blur(46px); pointer-events: none;
+  background: rgb(var(--primary) / 0.16);
+}
+.node-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.node-name {
+  font-family: var(--font-mono);
+  font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em;
+}
+.node-chip {
+  font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--app-text-soft);
+  border: 1px solid var(--app-border-strong);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.node-kv {
+  display: grid; grid-template-columns: repeat(4, auto); gap: 4px 22px;
+  margin: 16px 0 4px; width: fit-content;
+}
+.node-kv .label { display: block; margin-bottom: 3px; }
+.node-kv .val {
+  font-family: var(--font-mono); font-size: 0.86rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--app-text);
+}
+.spark-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 14px; }
+.spark-block { min-width: 0; }
+.spark-head {
+  display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px;
+}
+.spark-val { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.spark-val small { font-size: 0.68rem; font-weight: 400; color: var(--app-text-faint); margin-left: 2px; }
+.spark-block svg { display: block; width: 100%; height: 54px; }
+.disk-meter { margin-top: 16px; }
+.disk-bar {
+  height: 5px; border-radius: 999px; overflow: hidden; margin-top: 6px;
+  background: color-mix(in srgb, var(--app-elev) 80%, transparent);
+}
+.disk-bar > i {
+  display: block; height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, rgb(var(--primary) / 0.9), rgb(var(--primary) / 0.55));
+  transition: width .6s var(--ease);
+}
+.disk-bar.warn > i { background: linear-gradient(90deg, rgb(var(--accent) / 0.95), rgb(var(--accent) / 0.6)); }
+
+/* ---- 节点小卡（次节点）：更小、更密、与主卡不同形（不等宽纪律） ---- */
+.node-mini {
+  display: grid; grid-template-columns: auto 1fr auto; gap: 4px 14px; align-items: center;
+  padding: 12px 16px;
+}
+.node-mini .node-name { font-size: 0.95rem; }
+.node-mini .mini-meta {
+  font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.05em;
+  color: var(--app-text-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.node-mini .mini-cpu {
+  font-family: var(--font-mono); font-size: 0.86rem; font-variant-numeric: tabular-nums;
+  color: var(--app-text); text-align: right;
+}
+.node-mini .mini-cpu small { color: var(--app-text-faint); font-size: 0.62rem; }
+
+/* ---- 清单行（服务 / agent / tailnet）：glass-inset 语义 ---- */
+.row {
+  display: grid; align-items: center; gap: 12px;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+.row .row-name { font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .row-sub { font-size: 0.68rem; color: var(--app-text-faint); letter-spacing: 0.04em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-services { grid-template-columns: 14px 1.2fr 1fr auto; }
+.row-agents   { grid-template-columns: 14px 1fr 0.9fr 1fr auto; }
+.row-tailnet  { grid-template-columns: 14px 1.1fr 1fr auto; }
+@media (max-width: 720px) {
+  .row-services, .row-agents, .row-tailnet { grid-template-columns: 14px 1fr auto; }
+  .row .hide-sm { display: none; }
+}
+.type-chip {
+  font-size: 0.6rem; letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--app-text-soft);
+  border: 1px solid var(--app-border);
+  border-radius: 999px; padding: 2px 8px;
+  justify-self: end;
+}
+.detail-line {
+  grid-column: 2 / -1;
+  font-size: 0.66rem; color: var(--app-text-faint); letter-spacing: 0.03em;
+  white-space: normal;
+}
+
+/* ---- 状态点：色点 + 文字双通道（不依赖颜色单通道） ---- */
+.dot {
+  width: 8px; height: 8px; border-radius: 999px;
+  display: inline-block; flex: none;
+  background: var(--app-text-faint);
+  transition: background-color .4s var(--ease), box-shadow .4s var(--ease);
+}
+.dot--ok   { background: rgb(var(--primary)); box-shadow: 0 0 10px rgb(var(--primary) / 0.55); }
+.dot--warn { background: rgb(var(--accent)); box-shadow: 0 0 10px rgb(var(--accent) / 0.5); }
+.dot--crit { background: rgb(var(--alarm)); box-shadow: 0 0 10px rgb(var(--alarm) / 0.55); }
+.dot--dim  { background: var(--app-text-faint); }
+.dot-text { font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.status-cell { display: inline-flex; align-items: center; gap: 8px; }
+/* offline / 异常：呼吸红点（可注意的视觉处理） */
+.breathing { animation: breathe 2.4s var(--ease) infinite; }
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 4px rgb(var(--alarm) / 0.4); opacity: 1; }
+  50%      { box-shadow: 0 0 16px rgb(var(--alarm) / 0.95); opacity: 0.55; }
+}
+.status-warn-text { color: rgb(var(--accent)); }
+.status-crit-text { color: rgb(var(--alarm)); }
+
+/* ---- 页脚 ---- */
+.pagefoot {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem; letter-spacing: 0.08em;
+  color: var(--app-text-faint);
+}
+.pagefoot .push { flex: 1; }
+.readonly-pill {
+  font-size: 0.62rem; letter-spacing: 0.28em;
+  color: rgb(var(--primary) / 0.95);
+  border: 1px solid rgb(var(--primary) / 0.35);
+  border-radius: 999px;
+  padding: 5px 14px 5px 16px;
+  background: rgb(var(--primary) / 0.07);
+}
+.fresh-flash { animation: freshFlash 0.9s var(--ease) 1; }
+@keyframes freshFlash { 0% { color: rgb(var(--primary)); } 100% { color: var(--app-text-faint); } }
+
+/* ============================================================================
+   MOTION —— 载入 stagger 编排（一次性）+ 统一 easing 签名
+   （拒绝全元素 uniform fade-in-up：头部做 clip 揭示，面板按序浮起，
+     数字由 JS tween；reduced-motion 全关）
+   ============================================================================ */
+.reveal {
+  opacity: 0;
+  transform: translateY(18px);
+  animation: rise .9s var(--ease) forwards;
+  animation-delay: var(--d, 0s);
+}
+.reveal--clip { opacity: 1; transform: none; clip-path: inset(0 0 110% 0); animation: wipe 1s var(--ease) forwards; animation-delay: var(--d, 0s); }
+@keyframes rise { to { opacity: 1; transform: translateY(0); } }
+@keyframes wipe { to { clip-path: inset(0 0 -10% 0); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .blob, .breathing { animation: none !important; }
+  .reveal, .reveal--clip { animation-duration: 0.01s !important; animation-delay: 0s !important; }
+  * { transition-duration: 0.01s !important; }
+}

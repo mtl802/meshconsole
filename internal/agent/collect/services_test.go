@@ -310,7 +310,7 @@ func TestTruncatedMarkedInDetail(t *testing.T) {
 	}
 	c := newTestChecker(t, []config.ServiceDecl{
 		{Name: "s", Type: "systemd", Target: "u"},
-		{Name: "p", Type: "process", Target: "x"},
+		{Name: "p", Type: "process", Target: "no-such-target-xyzq"},
 		{Name: "d", Type: "docker", Target: "c"},
 	}, r)
 	got := c.CheckAll(context.Background())
@@ -327,7 +327,7 @@ func TestTruncatedMarkedInDetail(t *testing.T) {
 	r2.inject = func(name string, args ...string) (cmdResult, error) {
 		return cmdResult{truncated: true}, exitErr(1)
 	}
-	c2 := newTestChecker(t, []config.ServiceDecl{{Name: "p", Type: "process", Target: "x"}}, r2)
+	c2 := newTestChecker(t, []config.ServiceDecl{{Name: "p", Type: "process", Target: "no-such-target-xyzq"}}, r2)
 	got2 := c2.CheckAll(context.Background())
 	if got2[0].Status != "inactive" || !contains(got2[0].Detail, truncNote) {
 		t.Fatalf("truncated inactive must carry note: %+v", got2[0])

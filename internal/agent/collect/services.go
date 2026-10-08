@@ -16,7 +16,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -105,6 +107,10 @@ type ServiceChecker struct {
 	runner    cmdRunner
 	// budget 为整轮查询总预算（测试可注入）；零值取 scanBudget。
 	budget time.Duration
+	// selfArgs 为本进程命令行（观察点③自进程核对用；测试可注入）。nil 时取
+	// os.Args 快照。用参数注入而非直接读 os.Args，单测可模拟「agent 自身命中
+	// target」与「不命中」两种形态。
+	selfArgs func() []string
 }
 
 // NewServiceChecker 构造；decls 已经过 LoadAgent 校验（type/target 合法）。
@@ -114,6 +120,24 @@ func NewServiceChecker(decls []config.ServiceDecl, dockerBin string) *ServiceChe
 		dockerBin = "docker"
 	}
 	return &ServiceChecker{decls: decls, dockerBin: dockerBin, runner: execRunner{}}
+}
+
+// selfMatches 自进程核对（观察点③）：本进程命令行是否命中 target。
+// pgrep -f 使用 ERE，这里同口径编译后匹配；target 不是合法正则时退化为
+// 子串匹配（pgrep 在多数实现对非法正则也按字面处理，语义对齐取宽松侧——
+// 只影响「pgrep 漏检自进程」的兜底路径，不改变 pgrep 正常路径的结果）。
+func (c *ServiceChecker) selfMatches(target string) bool {
+	args := c.selfArgs
+	if args == nil {
+		snapshot := make([]string, len(os.Args))
+		copy(snapshot, os.Args)
+		args = func() []string { return snapshot }
+	}
+	full := strings.Join(args(), " ")
+	if re, err := regexp.Compile(target); err == nil {
+		return re.MatchString(full)
+	}
+	return strings.Contains(full, target)
 }
 
 // CheckAll 逐条查询（串行：M1 规模 ≤32 条、单条 5s 超时，正常环境远低于心跳
@@ -290,6 +314,19 @@ func (c *ServiceChecker) checkProcess(ctx context.Context, st *ServiceStatus) {
 		var ec exitCoder
 		switch {
 		case errors.As(err, &ec) && ec.ExitCode() == 1:
+			// 观察点③（部署验证转来）：pgrep 报「无匹配」时先做自进程核对再判
+			// inactive。pgrep 只排除 pgrep 自身、不排除其祖先（agent 进程），
+			// 实测（macOS/Linux）agent 自身含 target 时通常已被 pgrep 计入；
+			// 但平台实现差异、僵尸态空 cmdline、进程名截断等边缘可使
+			// 「目标=agent 自身」漏检为 inactive。此处用本进程命令行（/proc/
+			// self/cmdline 的跨平台等效物 os.Args）做确定性复核：自身命中即
+			// 目标进程存在（就是本进程），如实报 active 并注明 self 计数来源，
+			// 不编造其余进程。
+			if c.selfMatches(st.Target) {
+				st.Status = "active"
+				st.Detail = "count=1 (self process matched; pgrep reported no other)"
+				return
+			}
 			st.Status = "inactive"
 		case errors.As(err, &ec) && ec.ExitCode() >= 2:
 			st.Status = "unknown"

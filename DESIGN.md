@@ -1,5 +1,10 @@
 # MeshConsole 组网控制台 · 详细设计
 
+> 版本 v0.8（设计稿） · 2026-10-08
+> v0.8 修订：§7-4 重写「公网面板例外」——三层认证（面板=账号会话 / MCP=Bearer
+> token / agent=来源收敛+token）、登录防护与限流、并发三闸、公网启动门槛、
+> 证书信任与 pin 更新流程、回滚路径；删除「公网无暴露端口」绝对表述（改为
+> 「公网暴露须满足本节全部条件」）；§8 补账号/会话/token 运行条款（M1b-c2）。
 > 版本 v0.7（设计稿，第六轮 codex 复审修订） · 2026-10-07
 > v0.7 修订：幂等键释放改 archived_key 独立归档字段（消除 expired: 命名空间冲突）、
 > L2 状态机移除 unknown 并明确结果不确定路径、degraded 语义统一（可附加于任意状态）。
@@ -100,8 +105,10 @@
                      └─────────────────┘
 ```
 
-通信原则：**一切走 Tailnet，公网无暴露端口**。meshconsole 只监听 Headscale 分配的
-Tailnet IP（或 localhost），腾讯云防火墙不放行新端口。
+通信原则：**一切优先走 Tailnet；公网暴露是例外形态，须满足 §7-4 全部条件**
+（三层认证 + 登录防护 + 启动门槛 + 防火墙收敛）。meshconsole 缺省只监听
+Headscale 分配的 Tailnet IP（或 localhost）；经伦哥批准的公网形态下，腾讯云
+防火墙仅放行 TCP 7700，边界依赖 §7-4 防线而非网络隐匿。
 信任边界修正：Tailnet 内部仍是需要设防的领地——节点间用 Tailnet ACL 收敛访问，
 云服务器主机防火墙（ufw/iptables）限制 7700 只允许本机与授权源；MCP 端点校验
 Origin 头与请求体/连接限额。传输统一 HTTPS：**CA 与证书由首次部署脚本生成并持久化**
@@ -443,9 +450,35 @@ API key 走环境变量；首次配置时通过带外方式（SSH/手动拷贝�
    **轮换流程**：①带外向全部客户端预装新 CA（此时客户端同时信任新旧）→ ②服务端切换
    用新 CA 签发证书 → ③确认全部客户端已信任新 CA（心跳/握手验证）→ ④移除旧指纹、
    服务端吊销旧证书；证书有效性不等价于客户端信任，以客户端实际握手为准
-4. **信任边界**：公网无暴露端口；Tailnet 内以 ACL + 主机防火墙限制 7700 访问源；
-   MCP 端点校验 Origin；控制台对请求体/连接数限额（M1a 已实现请求体限额与
-   handler 并发 ≤64；连接总数限额随 TLS 于 M1b 实现）
+4. **信任边界与公网面板例外**（v0.8 重写，M1b-c2 落地）：公网暴露不是缺省
+   形态，但也不再绝对禁止——**公网暴露须满足本条全部条件**，未满足前回环/
+   Tailnet 是唯一入口。当前批准的公网形态与防线：
+
+   - **三层认证**（网络形态无差别，始终开启，无「内网免登录」路径）：
+     ①面板 = 账号会话（登录发 256bit 会话 token，Cookie `mc_session`
+     HttpOnly/Secure/SameSite=Lax；滑动续期、30 天绝对期限；未登录一律
+     302 /login，匿名可及仅登录页/静态资源/healthz）；
+     ②MCP = Bearer API token（api_tokens 哈希查表，401 不泄露工具列表）；
+     ③agent = 来源收敛（RemoteAddr 限回环/私网/Tailnet CGNAT 段，公网 403，
+     不读转发头）+ 节点 token / 一次性注册 token（网络过滤非身份认证，
+     token 校验独立保留）。
+   - **登录防护与限流**：per-IP 5 次失败/分 → 429（滑动窗 cap 4096）；全局
+     bcrypt 并发 ≤2（排队有上限）；未知用户名也执行 dummy bcrypt（防时序
+     枚举）；改密/禁用用户即时撤销其全部会话与 API token。
+   - **并发配额三闸独立**：agent API ≤64、面板 overview ≤8、MCP ≤4——公网
+     流量不挤占 agent 心跳通道。
+   - **公网模式启动门槛**（实际绑定地址非 {127/8, ::1} 即公网形态，任一失败
+     拒绝启动）：存在 ≥1 个启用用户；config 文件普通文件且 0600 且属运行
+     用户；panel_allowed_hosts 合法。数据文件权限强制：data 目录 0700、
+     DB/WAL/SHM 0600。
+   - **证书信任与 pin 更新流程**：公网访问凭同一自建 CA。ca_cert 模式 agent
+     零动作（链验证不依赖 SAN 变更）；fingerprint 模式 agent 在切换流量前
+     先更新指纹（服务端重签证书 → 带外取新指纹 → 更新 agent 配置 → 切换）；
+     浏览器首次访问经带外渠道核对指纹/导入 CA，验收一律禁用 -k。
+   - **回滚路径**：撤防火墙放行 + 恢复 .bak 证书 + listen 改回 Tailnet IP
+     绑定；账号体系与来源收敛在回环形态下原样生效，回滚不降级安全性。
+   - 其余既有限额保留：MCP 端点校验 Origin 头；请求体 ≤1MB、连接总数
+     LimitListener、handler 并发上限（M1a/M1b 已实现）。
 5. **最小权限执行**：meshconsole 与 meshagent 均以专用非 root 用户运行；
    Linux 服务操作经固定动作的提权 helper（sudo 白名单仅限 `systemctl restart/stop/start <固定unit>`
    与 `docker restart/stop/start <固定容器名>`），不给代理任意 sudo；
@@ -498,6 +531,24 @@ API key 走环境变量；首次配置时通过带外方式（SSH/手动拷贝�
 
 - agent 调用产生的任务日志落在控制台侧 /opt/meshconsole/tasks/<id>.log，不污染代码目录
 - meshagent 被远程调用时永远显式设定 cwd（来自任务白名单校验结果），进程级隔离于自身安装目录
+
+### 账号/会话/token 运行条款（v0.8 新增，M1b-c2）
+
+- **账号引导**：CLI（`meshconsole user add`）先跑 migration 再操作，bootstrap
+  不依赖既有数据；交互输入口令（bcrypt cost 10，两遍确认），无明文口令参数
+  （不走 shell 历史/进程列表）。
+- **会话**：登录发 256bit token，服务端只存 SHA-256；Cookie `mc_session`
+  （Path=/、host-only、HttpOnly、Secure、SameSite=Lax）；每次认证请求滑动
+  续期（节流 ≤1 次/小时/会话），绝对期限 30 天不越过；过期/撤销行由后台
+  循环低频回收。
+- **API token**：`token create` 签发 mcp_ 前缀 256bit 明文一次，服务端只存
+  哈希；可带到期与说明；`token revoke` 按 id 即时吊销；MCP HTTP 端点以
+  `Authorization: Bearer` 使用。
+- **撤销语义**：改密（passwd）与禁用（disable）在单事务内撤销该用户全部
+  session 与 api_tokens——凭据撤销即时生效，无宽限窗口；禁用最后一个启用
+  用户被拒绝（防自锁门外）。
+- **数据面**：账号数据落在 data 目录（0700）/ SQLite（0600，WAL/SHM 同）；
+  stdio MCP 只读打开不迁移，CLI 与服务模式共享同一 migration 序。
 
 ## 9. 分期计划
 

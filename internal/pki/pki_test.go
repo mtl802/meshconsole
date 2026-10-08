@@ -397,7 +397,10 @@ func rewriteServerCert(t *testing.T, dir string, mutate func(tpl *x509.Certifica
 	if err != nil {
 		t.Fatal(err)
 	}
-	dnsNames, ipAddrs := sans(Config{TailnetIP: "100.64.0.9"})
+	dnsNames, ipAddrs, err := sans(Config{TailnetIP: "100.64.0.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	tpl := &x509.Certificate{
 		SerialNumber: randomSerial(),
 		Subject:      pkix.Name{CommonName: "meshconsole", Organization: []string{"meshconsole"}},

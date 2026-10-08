@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -110,7 +111,26 @@ type Console struct {
 	// Headscale 为 Headscale 集成配置（M1b-b，只读拉取）。nil（配置无该段）=
 	// 集成禁用（启动日志 INFO 一次，不报错）。
 	Headscale *HeadscaleConfig `yaml:"headscale"`
-	LogLevel  string           `yaml:"log_level"`
+	// PanelAllowedHosts 为面板 Host/Origin 白名单（SPEC-M1b-c2 §4）。nil（配置
+	// 未出现该键）= 缺省回环名单（localhost/127.0.0.1/::1，与历史行为一致）；
+	// 显式给出（含空数组）→ 整体替换——显式空数组等价「仅接受回环 Host」。
+	// 条目为裸主机名/IP 字面量（不带 scheme/端口/path），加载时规范化去重。
+	PanelAllowedHosts *[]string `yaml:"panel_allowed_hosts"`
+	// AgentAllowedCIDRs 为 /api/agent/* 来源收敛网段（SPEC §5）。nil = 缺省
+	// 私网清单（127/8、::1、10/8、172.16/12、192.168/16、100.64/10）；显式空
+	// 数组 = 仅回环。注意：这是网络层过滤非身份认证，节点 token 校验独立保留。
+	AgentAllowedCIDRs *[]string `yaml:"agent_allowed_cidrs"`
+	// TLSExtraSANs 为追加 SAN（SPEC §6）：IP 字面量 → IP SAN，合法 DNS 名 →
+	// DNS SAN；URL/端口/CIDR/空值一律拒绝，规范化去重。校验在 pki 生成侧
+	// 任何写入之前统一执行（internal/pki NormalizeSANs）。部署值示例
+	// ["1.13.158.180"]。
+	TLSExtraSANs []string `yaml:"tls_extra_sans"`
+	LogLevel     string   `yaml:"log_level"`
+
+	// panelHosts / agentCIDRs 为加载期规范化产物（不入 YAML）。hostAllowed
+	// 与 registry 来源过滤直接消费。
+	panelHosts []string
+	agentCIDRs []*net.IPNet
 }
 
 // HeadscaleConfig 为 headscale REST 拉取配置（SPEC-M1b-b §3）。
@@ -305,10 +325,192 @@ func parseConsole(path string) (*Console, bool, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	// SPEC-M1b-c2 §4/§5：Host 白名单与 agent 来源网段加载期统一校验、规范化
+	// 去重后落内部字段——非法项启动即报错，不留到运行期。
+	hosts, err := normalizeHostList(cfg.PanelAllowedHosts, "console.panel_allowed_hosts")
+	if err != nil {
+		return nil, false, err
+	}
+	cfg.panelHosts = hosts
+	cidrs, err := parseCIDRList(cfg.AgentAllowedCIDRs, "console.agent_allowed_cidrs")
+	if err != nil {
+		return nil, false, err
+	}
+	cfg.agentCIDRs = cidrs
 	if err := cfg.validateHeadscale(); err != nil {
 		return nil, false, err
 	}
 	return cfg, true, nil
+}
+
+// defaultPanelHosts 为 Host 白名单缺省名单（回环形态，与历史硬编码一致）。
+func defaultPanelHosts() []string {
+	return []string{"localhost", "127.0.0.1", "::1"}
+}
+
+// defaultAgentCIDRs 为 /api/agent/* 来源缺省网段（SPEC §5：回环 + 私网 +
+// Tailnet CGNAT 段）。
+func defaultAgentCIDRs() []*net.IPNet {
+	var out []*net.IPNet
+	for _, s := range []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"} {
+		_, n, _ := net.ParseCIDR(s)
+		out = append(out, n)
+	}
+	return out
+}
+
+// normalizeHostList 规范化 Host 白名单：nil → 缺省回环名单；显式空数组 → 仅
+// 回环（与缺省同值，SPEC §4 口径——公网形态下回环 Host 是最低可用面）；条目
+// 须为裸主机名/IP 字面量——不带 scheme、端口、path/query/fragment/userinfo，
+// 小写规范化去重（保持原序）。
+func normalizeHostList(raw *[]string, field string) ([]string, error) {
+	if raw == nil || len(*raw) == 0 {
+		return defaultPanelHosts(), nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for i, item := range *raw {
+		s := strings.TrimSpace(item)
+		if s == "" {
+			return nil, fmt.Errorf("%s[%d]: 条目不得为空（裸主机名或 IP 字面量，如 1.13.158.180）", field, i)
+		}
+		if strings.ContainsAny(s, " \t\r\n") {
+			return nil, fmt.Errorf("%s[%d]: %q 含空白字符", field, i, item)
+		}
+		// IP 字面量直通（裸 IPv6 形如 ::1 含多个冒号，url.Parse 无法按
+		// authority 解析——先剥方括号再 ParseIP，规范化取 ip.String()）。
+		bare := s
+		if strings.HasPrefix(bare, "[") && strings.HasSuffix(bare, "]") {
+			bare = bare[1 : len(bare)-1]
+		}
+		if ip := net.ParseIP(bare); ip != nil {
+			if host := ip.String(); !seen[host] {
+				seen[host] = true
+				out = append(out, host)
+			}
+			continue
+		}
+		if strings.Contains(s, "://") {
+			return nil, fmt.Errorf("%s[%d]: %q 是 URL——条目为裸主机名/IP 字面量", field, i, item)
+		}
+		u, err := url.Parse("http://" + s)
+		if err != nil || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("%s[%d]: %q 不是合法的裸主机名/IP 字面量（不得含 scheme/端口/path）", field, i, item)
+		}
+		if u.Port() != "" {
+			return nil, fmt.Errorf("%s[%d]: %q 不得携带端口（名单匹配的是主机名，端口在请求侧任意）", field, i, item)
+		}
+		host := strings.ToLower(u.Hostname())
+		if host == "" {
+			return nil, fmt.Errorf("%s[%d]: %q 缺主机名", field, i, item)
+		}
+		if !validHostname(host) {
+			return nil, fmt.Errorf("%s[%d]: %q 不是合法 DNS 主机名", field, i, item)
+		}
+		if !seen[host] {
+			seen[host] = true
+			out = append(out, host)
+		}
+	}
+	return out, nil
+}
+
+// validHostname 按 RFC 1123 校验主机名（标签 1-63 字符、[a-z0-9-]、首尾不连字符、
+// 总长 ≤253；单标签合法——localhost 即单标签）。
+func validHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// parseCIDRList 解析 agent 来源网段：nil → 缺省私网清单；显式空数组 → 仅回环
+// （SPEC §5 口径）。条目须为合法 CIDR。
+func parseCIDRList(raw *[]string, field string) ([]*net.IPNet, error) {
+	if raw == nil {
+		return defaultAgentCIDRs(), nil
+	}
+	if len(*raw) == 0 {
+		return []*net.IPNet{
+			mustCIDR("127.0.0.0/8"),
+			mustCIDR("::1/128"),
+		}, nil
+	}
+	out := make([]*net.IPNet, 0, len(*raw))
+	for i, item := range *raw {
+		s := strings.TrimSpace(item)
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			return nil, fmt.Errorf("%s[%d]: %q 不是合法 CIDR（如 100.64.0.0/10）", field, i, item)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic("config: bad builtin cidr " + s)
+	}
+	return n
+}
+
+// AllowedHosts 返回规范化后的面板 Host 白名单（加载期已校验）。
+func (c *Console) AllowedHosts() []string { return c.panelHosts }
+
+// AgentCIDRs 返回解析后的 agent 来源网段（加载期已校验）。
+func (c *Console) AgentCIDRs() []*net.IPNet { return c.agentCIDRs }
+
+// CheckConfigFileSecurity 为公网模式的启动门槛之一（SPEC §4）：config 文件须
+// 为普通文件，且平台专属的权限约束成立——unix 形态为 0600 + 属运行用户；
+// Windows 形态为 ACL/属主校验（仅 当前用户/SYSTEM/Administrators 持有访问权、
+// 属主为当前用户或管理员组，R33-#2 实装）。任一约束无法确认即按检查失败处理
+// （公网形态拒绝启动并给 remediation），不允许静默放行。
+func CheckConfigFileSecurity(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat config %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("公网模式启动被拒绝：%s 不是普通文件", path)
+	}
+	return checkConfigPlatformSecurity(path)
+}
+
+// aclVerdict 为 Windows ACL 检查的判定核心（R33-#2）：纯函数、平台无关，
+// 单测在任意平台覆盖错误路径。规则＝属主合规（ownerSelfOK：属主为当前用户
+// 或管理员组）且 DACL 中每条生效的允许 ACE 的 trustee 都在可信集
+// {当前用户, SYSTEM, BUILTIN\Administrators} 内——即 config 仅这三类账户持有
+// 访问权。path 仅用于错误信息中的 remediation 指引。
+func aclVerdict(path string, ownerSelfOK bool, allowTrustees, trusted []string) error {
+	if !ownerSelfOK {
+		return fmt.Errorf("公网模式启动被拒绝：config 文件 %s 的属主既非运行用户也非管理员组；请将文件属主改为运行用户（或由 Administrators 持有）后重试", path)
+	}
+	trust := make(map[string]bool, len(trusted))
+	for _, s := range trusted {
+		trust[s] = true
+	}
+	for _, a := range allowTrustees {
+		if !trust[a] {
+			return fmt.Errorf("公网模式启动被拒绝：config 文件 %s 的 ACL 向受信账户之外授予权限（公网形态要求仅 属主/SYSTEM/Administrators 可访问）；请执行 `icacls %s /inheritance:r` 后仅授予运行用户与 SYSTEM、Administrators 权限", path, path)
+		}
+	}
+	return nil
 }
 
 // validateHeadscale 校验 headscale 段（未配置 = 集成禁用，合法）。

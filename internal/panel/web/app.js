@@ -64,6 +64,17 @@ function statusKind(kind, s) {
     default: return 'dim';
   }
 }
+// 状态值 → 用户可见中文（M1b-c2 §3）：API/DB 值保持英文机器契约，翻译只在
+// 渲染层发生；未登记的值原样透出（不猜）。
+const STATUS_ZH = {
+  online: '在线', offline: '离线',
+  active: '运行中', inactive: '已停止', failed: '失败',
+  unavailable: '不可用', unknown: '未知', stale: '已过期',
+};
+function statusText(kind, s) {
+  if (kind === 'agent' && s === 'active') return '活跃';
+  return STATUS_ZH[s] || s;
+}
 const KIND_CLASS = { ok: 'dot--ok', warn: 'dot--warn', crit: 'dot--crit', dim: 'dot--dim' };
 // 状态点与状态文字一律原地改 className/textContent（R19-#11）：.dot 的
 // background/box-shadow transition 只在元素不销毁重建时才能连续过渡。
@@ -98,9 +109,9 @@ function el(tag, cls) {
 function relTime(ts, now) {
   if (!ts) return '—';
   const d = Math.max(0, (now - ts) * 1000);
-  if (d < 60000) return Math.floor(d / 1000) + 's';
-  if (d < 3600000) return Math.floor(d / 60000) + 'm' + String(Math.floor((d % 60000) / 1000)).padStart(2, '0') + 's';
-  return Math.floor(d / 3600000) + 'h' + String(Math.floor((d % 3600000) / 60000)).padStart(2, '0') + 'm';
+  if (d < 60000) return Math.floor(d / 1000) + ' 秒';
+  if (d < 3600000) return Math.floor(d / 60000) + ' 分' + String(Math.floor((d % 60000) / 1000)).padStart(2, '0') + ' 秒';
+  return Math.floor(d / 3600000) + ' 小时' + String(Math.floor((d % 3600000) / 60000)).padStart(2, '0') + ' 分';
 }
 // 任务活动计时（本地每秒走动）：s → h:mm:ss / mm:ss
 function fmtDur(totalS) {
@@ -315,7 +326,7 @@ function updateTaskCard(card, t, now, truncNodes) {
   card._agent.title = t.node + ' / ' + t.agent_name + ' · pid ' + t.pid;
   card._cpu.textContent = 'cpu ' + fmtPct(t.cpu_pct) + '%';
   card._cpu.title = 'mem ' + fmtPct(t.mem_pct) + '%';
-  const cmdText = t.cmd || '(no cmdline)';
+  const cmdText = t.cmd || '（无命令行）';
   card._cmd.textContent = cmdText;
   card._cmd.title = cmdText;
 
@@ -324,11 +335,11 @@ function updateTaskCard(card, t, now, truncNodes) {
   // 止并转 warn——过期快照不是「正在运行」，不冒充活性。
   const stale = !!t.stale;
   if (stale) {
-    card._flag.textContent = 'snapshot stale';
-    card._flag.title = 'node offline or task snapshot not refreshed — timer frozen, not live';
+    card._flag.textContent = '快照过期';
+    card._flag.title = '节点失联或任务快照未刷新 —— 计时已冻结，并非正在运行';
   } else if (truncNodes && truncNodes.has(t.node)) {
-    card._flag.textContent = 'list truncated';
-    card._flag.title = "node hit the per-beat task cap — this list is incomplete";
+    card._flag.textContent = '清单截断';
+    card._flag.title = '该节点任务清单触顶单拍上限 —— 本清单不完整';
   } else {
     card._flag.textContent = '';
     card._flag.title = '';
@@ -346,8 +357,8 @@ function updateTaskCard(card, t, now, truncNodes) {
     liveRows.add(card);
   }
   card._since.textContent = t.started_at
-    ? 'since ' + new Date(t.started_at * 1000).toLocaleTimeString()
-    : 'since unknown';
+    ? '启动于 ' + new Date(t.started_at * 1000).toLocaleTimeString()
+    : '启动时刻未知';
 }
 
 /* ---------- 终端卡（每终端一张：状态/角色/sparkline/disk/agent 清单） ---------- */
@@ -374,7 +385,7 @@ function buildNodeCard() {
     const block = el('div', 'spark-block glass-inset');
     const headRow = el('div', 'spark-head');
     const lbl = el('span', 'label');
-    lbl.textContent = key === 'cpu' ? 'cpu' : 'memory';
+    lbl.textContent = key === 'cpu' ? 'cpu' : '内存';
     const val = el('span', 'spark-val');
     const valTxt = document.createTextNode('—');
     const valUnit = el('small');
@@ -393,7 +404,7 @@ function buildNodeCard() {
 
   const disk = el('div', 'disk-meter');
   const diskLbl = el('span', 'label');
-  diskLbl.textContent = 'disk';
+  diskLbl.textContent = '磁盘';
   const diskVal = el('span', 'disk-val');
   const track = el('div', 'disk-track');
   const fill = el('i');
@@ -408,7 +419,7 @@ function buildNodeCard() {
 
   const agents = el('div', 'node-agents');
   const agLbl = el('span', 'label');
-  agLbl.textContent = 'agents';
+  agLbl.textContent = 'AI agents';
   const agList = el('div');
   agList.style.display = 'flex';
   agList.style.flexDirection = 'column';
@@ -424,9 +435,9 @@ function updateNodeCard(card, ncard, agentsOfNode, now) {
   const n = ncard.node;
   setDot(card._dot, statusKind('node', n.status), n.status === 'offline');
   card._name.textContent = n.name;
-  card._role.textContent = n.role || 'node';
+  card._role.textContent = n.role || '节点';
   card._role.style.display = n.role ? '' : 'none';
-  card._hb.textContent = 'hb ' + relTime(n.last_seen, now);
+  card._hb.textContent = '心跳 ' + relTime(n.last_seen, now);
   card._hb.title = n.last_seen ? 'last_seen ' + new Date(n.last_seen * 1000).toLocaleTimeString() : '';
 
   const cpu = ncard.latest ? ncard.latest.cpu_pct : null;
@@ -470,10 +481,10 @@ function updateAgentLine(row, a, now) {
   row._sub.title = a.path || '';
   // last_activity：会话目录最近 mtime（只 stat 不读内容）；文件数为辅证。
   if (a.last_activity) {
-    row._act.textContent = 'act ' + relTime(a.last_activity, now);
-    row._act.title = a.session_files != null ? a.session_files + ' session files (stat only)' : '';
+    row._act.textContent = '活跃 ' + relTime(a.last_activity, now);
+    row._act.title = a.session_files != null ? a.session_files + ' 个会话文件（仅 stat）' : '';
   } else {
-    row._act.textContent = 'no sessions';
+    row._act.textContent = '无会话记录';
     row._act.title = '';
   }
 }
@@ -508,7 +519,7 @@ function updateServiceRow(row, s) {
   row._name.title = s.node + ' / ' + s.name;
   row._sub.textContent = s.node;
   row._chip.textContent = s.type;
-  setDotText(row._st, kind, s.status);
+  setDotText(row._st, kind, statusText('service', s.status));
   row._detail.textContent = s.detail || '';
   row._detail.style.display = s.detail ? '' : 'none';
 }
@@ -533,7 +544,7 @@ function updateTailnetRow(row, t, now) {
   setDot(row._dot, t.online ? 'ok' : 'dim', false);
   row._name.textContent = t.machine_name;
   row._ips.textContent = (t.ips || []).join(' · ');
-  row._seen.textContent = 'seen ' + relTime(t.last_seen, now);
+  row._seen.textContent = '最近可见 ' + relTime(t.last_seen, now);
 }
 
 /* ---------- 主渲染 ---------- */
@@ -553,10 +564,10 @@ function render(ov) {
     buildTaskCard, (row, t) => updateTaskCard(row, t, now, truncNodes));
   const staleCount = tasks.filter((t) => t.stale).length;
   $('tasks-meta').textContent = tasks.length
-    ? (tasks.length - staleCount) + ' running'
-      + (staleCount ? ' · ' + staleCount + ' stale' : '')
-      + (truncNodes.size ? ' · list truncated' : '')
-    : 'all quiet';
+    ? (tasks.length - staleCount) + ' 运行中'
+      + (staleCount ? ' · ' + staleCount + ' 过期' : '')
+      + (truncNodes.size ? ' · 清单截断' : '')
+    : '全部安静';
 
   // 终端区：每终端一张卡；agent 清单按节点过滤自带 last_activity。
   const agentsByNode = {};
@@ -570,15 +581,15 @@ function render(ov) {
   });
   syncList($('nodes-grid'), nodes, (n) => n.node.name, buildNodeCard,
     (row, n) => updateNodeCard(row, n, agentsByNode[n.node.name] || [], now));
-  $('nodes-meta').textContent = nodes.length + ' nodes';
+  $('nodes-meta').textContent = nodes.length + ' 台终端';
 
   syncList($('services-list'), ov.services || [], (s) => s.node + '/' + s.name, buildServiceRow, (row, s) => updateServiceRow(row, s));
-  $('services-meta').textContent = (ov.services || []).length + ' tracked';
+  $('services-meta').textContent = (ov.services || []).length + ' 个受管';
 
   const tn = ov.tailnet;
   if (tn && tn.nodes && tn.nodes.length) {
     syncList($('tailnet-list'), tn.nodes, (t) => t.id, buildTailnetRow, (row, t) => updateTailnetRow(row, t, now));
-    $('tailnet-meta').textContent = tn.online + '/' + tn.tracked + ' online';
+    $('tailnet-meta').textContent = tn.online + '/' + tn.tracked + ' 在线';
   } else {
     syncList($('tailnet-list'), [], (t) => t.id, buildTailnetRow, () => {});
     $('tailnet-meta').textContent = 'headscale';
@@ -593,10 +604,10 @@ function renderFreshness(ov) {
   if (ov.freshness) {
     const age = now - ov.freshness;
     dot.className = 'dot ' + (age <= 90 ? 'dot--ok' : 'dot--warn');
-    text.textContent = 'data age ' + relTime(ov.freshness, now) + ' · latest metric ' + new Date(ov.freshness * 1000).toLocaleTimeString();
+    text.textContent = '数据时延 ' + relTime(ov.freshness, now) + ' · 最新指标 ' + new Date(ov.freshness * 1000).toLocaleTimeString();
   } else {
     dot.className = 'dot dot--dim';
-    text.textContent = 'no metrics in store yet';
+    text.textContent = '库中暂无指标数据';
   }
   text.classList.remove('fresh-flash');
   void text.offsetWidth; // 重启动画
@@ -608,8 +619,16 @@ function renderFreshness(ov) {
 // 期限后，旧任务卡不得继续冒充运行中。期限取服务端 taskStaleAfter 同窗口
 // 90s（R27-#3 口径，约 6 拍轮询）——窗口内保留旧数据原样，过线即冻结。
 const FETCH_STALE_MS = 90 * 1000;
+// 单次拉取超时（R31-#1/R33-#6）：fetch 挂起（既不成功也不失败）时由
+// AbortController 强制收敛，配合防重入保证轮询循环永不卡死。取 10s——
+// 远小于轮询间隔 ×2，正常响应不受影响。
+const FETCH_TIMEOUT_MS = 10 * 1000;
 let lastGoodOv = null;
 let lastGoodAt = 0;
+let tickInflight = false;
+// staleShown 冻结去重：同一轮失联期只渲染一次 stale 快照——后续 tick 不再
+// 重写新鲜度行（crit 文案由 catch 维持，避免「冻结行/crit 行」逐拍互斥闪烁）。
+let staleShown = false;
 
 // renderStaleSnapshot 把上一次成功 overview 以「全部任务 stale」的形态重渲：
 // 冻结完全复用 render/updateTaskCard 既有语义（计时移出 liveRows 停走、呼吸
@@ -623,19 +642,39 @@ function renderStaleSnapshot() {
 }
 
 async function tick() {
+  // 新鲜度独立校验（R31-#1/R33-#6）：不依赖 catch——每次 tick 先看 lastGoodAt，
+  // fetch 挂起/慢响应/静默丢包都不影响过线冻结（一轮失联只渲一次，见 staleShown）。
+  if (lastGoodOv && Date.now() - lastGoodAt > FETCH_STALE_MS) {
+    if (!staleShown) {
+      renderStaleSnapshot();
+      staleShown = true;
+    }
+  }
+  // 轮询防重入：前序请求未返回不叠发（配合下方超时，挂起请求至多占用一拍）。
+  if (tickInflight) return;
+  tickInflight = true;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch('/api/panel/overview', { headers: { Accept: 'application/json' } });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const ov = await res.json();
+    let res, ov;
+    try {
+      res = await fetch('/api/panel/overview', { headers: { Accept: 'application/json' }, signal: ctl.signal });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      ov = await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
     lastGoodOv = ov;
     lastGoodAt = Date.now();
+    staleShown = false;
     render(ov);
   } catch (err) {
-    // 刚失败一两拍时旧数据仍在新鲜度窗口内，保持原样；超线才冻结。
-    if (lastGoodOv && Date.now() - lastGoodAt > FETCH_STALE_MS) renderStaleSnapshot();
+    const reason = err && err.name === 'AbortError' ? '请求超时' : (err && err.message) || '未知错误';
     const dot = $('fresh-dot'), text = $('fresh-text');
     dot.className = 'dot dot--crit';
-    text.textContent = 'fetch failed (' + err.message + ') · retrying in 15s';
+    text.textContent = '拉取失败（' + reason + '）· 15s 后重试';
+  } finally {
+    tickInflight = false;
   }
 }
 

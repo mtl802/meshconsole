@@ -1,8 +1,10 @@
 // meshconsole 控制台入口。子命令：
 //
-//	meshconsole            服务模式：HTTPS 监听（agent API + 只读面板）
+//	meshconsole            服务模式：HTTPS 监听（agent API + 面板 + 公网 MCP）
 //	meshconsole mcp        MCP server（stdio 传输，只读工具，零网络暴露）
 //	meshconsole pki        生成/校验 CA 与服务端证书（幂等，不覆盖已有私钥）
+//	meshconsole user       账号管理（add/passwd/disable/enable，见 usercmd.go）
+//	meshconsole token      MCP API token 管理（create/list/revoke，见 usercmd.go）
 //	meshconsole --version  打印语义版本与 commit
 package main
 
@@ -18,12 +20,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/mtl802/meshconsole/internal/auth"
 	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/headscale"
 	"github.com/mtl802/meshconsole/internal/mcpserver"
@@ -79,9 +83,13 @@ func printVersion(w interface{ Write([]byte) (int, error) }, bin string) {
 func usage() {
 	fmt.Fprintf(os.Stderr, `meshconsole (%s · commit %s)
 用法:
-  meshconsole [-config <path>]       服务模式：HTTPS 监听（agent API + 只读面板）
+  meshconsole [-config <path>]       服务模式：HTTPS 监听（agent API + 面板 + 公网 MCP）
   meshconsole mcp [-config <path>]   MCP server：stdio 传输，六个只读工具，零网络暴露
   meshconsole pki [-config <path>]   生成/校验 CA 与服务端证书（幂等，不覆盖私钥）
+  meshconsole user <add|passwd|disable|enable> <用户名> [-config <path>]
+                                     账号管理（交互口令；改密/禁用撤销全部会话与 token）
+  meshconsole token <create|list|revoke> ... [-config <path>]
+                                     MCP API token 管理（明文仅显示一次）
   meshconsole --version              打印语义版本与 commit
 `, version, commit)
 	os.Exit(2)
@@ -91,6 +99,24 @@ func usage() {
 func cmdVersion() int {
 	printVersion(os.Stdout, "meshconsole")
 	return 0
+}
+
+// configFlag 从子命令参数里提取 -config 值（user/token 子命令先于各自 flag
+// 解析打开库，需要提前拿到配置路径；缺省与服务模式一致 console.yaml）。
+func configFlag(args []string) string {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "-config" || args[i] == "--config":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		case strings.HasPrefix(args[i], "-config="), strings.HasPrefix(args[i], "--config="):
+			if _, v, ok := strings.Cut(args[i], "="); ok {
+				return v
+			}
+		}
+	}
+	return "console.yaml"
 }
 
 // cmdMCP 执行 `meshconsole mcp`：只读 MCP server（stdio）。
@@ -154,6 +180,7 @@ func cmdPKI(args []string) int {
 	res, err := pki.Ensure(pki.Config{
 		Dir:       cfg.PKIDir,
 		TailnetIP: cfg.TailnetIP,
+		ExtraSANs: cfg.TLSExtraSANs,
 	})
 	if err != nil {
 		log.Error("pki ensure", "err", err)
@@ -215,6 +242,10 @@ func main() {
 			os.Exit(cmdPKI(os.Args[2:]))
 		case "mcp":
 			os.Exit(cmdMCP(os.Args[2:]))
+		case "user":
+			os.Exit(cmdUser(os.Args[2:], configFlag(os.Args[2:]), readPasswordTwice))
+		case "token":
+			os.Exit(cmdToken(os.Args[2:], configFlag(os.Args[2:])))
 		case "--version", "-version", "version":
 			os.Exit(cmdVersion())
 		case "-h", "-help", "--help", "help":
@@ -248,9 +279,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 离线巡检与指标保留清理（SPEC §2/§4）。
+	// 离线巡检与指标保留清理（SPEC §2/§4）+ 会话过期清理（M1b-c2：sessions
+	// 表随登录/登出增删，过期行由本循环低频回收）。
 	go registry.SweepLoop(ctx, st, log, time.Duration(cfg.OfflineAfterS)*time.Second)
 	go registry.CleanupLoop(ctx, st, log, cfg.MetricsRetentionDays)
+	go auth.SessionCleanupLoop(ctx, st, log, 10*time.Minute)
 
 	// Headscale 集成（M1b-b，只读拉取）：配置无 headscale 段 = 禁用（INFO 一次）。
 	if cfg.Headscale != nil {
@@ -260,23 +293,37 @@ func main() {
 		log.Info("headscale integration disabled", "reason", "no headscale section in config")
 	}
 
+	// 账号会话管理（M1b-c2 §1）：认证在所有网络形态始终开启，无开关。
+	authMgr := auth.New(st, log)
+
 	mux := http.NewServeMux()
-	// /healthz：唯一免认证端点，仅返回 ok（DESIGN §7-2）。
+	// /healthz：唯一免认证端点，仅返回 ok（DESIGN §7-2；SPEC-M1b-c2 §1 豁免清单）。
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		_, _ = w.Write([]byte("ok"))
 	})
-	// Web 只读面板（M1b-b）：GET / 与 GET /api/panel/overview，Host/Origin
-	// 校验 + 安全头（internal/panel guard），数据与 MCP 同源（meshview）。
-	panel.New(meshview.New(st), log).RegisterRoutes(mux)
-	registry.New(st, log, cfg.RegistrationTokens).RegisterRoutes(mux)
+	// Web 面板（M1b-b + M1b-c2）：会话守卫 + 登录/登出 + Host/Origin 校验
+	// （白名单来自 panel_allowed_hosts）+ overview 并发闸 8。
+	panel.New(meshview.New(st), log, authMgr, cfg.AllowedHosts()).RegisterRoutes(mux)
+	// agent API（M1b-a + M1b-c2 §5）：来源 CIDR 收敛（agent_allowed_cidrs）
+	// + 一次性注册 token / 节点 token 认证。
+	registry.New(st, log, cfg.RegistrationTokens, cfg.AgentCIDRs()).RegisterRoutes(mux)
+	// MCP 公网 HTTP（M1b-c2 §2）：Bearer api_token 认证 + 独立并发闸 4 +
+	// JSON 同步响应模式（SDK Stateless）。stdio MCP（子命令）不受影响。
+	mux.Handle("/mcp", mcpserver.NewHTTPHandler(st, version, authMgr))
 
 	// 在途 handler 计数：drainHTTP 第三段靠它确认「没有任何 handler 还在碰 DB」。
 	var inFlight sync.WaitGroup
+	// 全局安全头（R33-#4，SPEC §7「全链 no-store/nosniff」）：包装根 handler 的
+	// ResponseWriter，在 WriteHeader 拦截点统一落头——mux 默认 404/405、agent
+	// API 各拒绝路径（401/403/413/503）与全部业务响应一律覆盖，无遗漏路径；
+	// agent 仅按状态码分支不解析响应头（SPEC §3 已核实），兼容性不回退。
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		inFlight.Add(1)
 		defer inFlight.Done()
-		mux.ServeHTTP(w, r)
+		mux.ServeHTTP(&secureHeaderWriter{ResponseWriter: w}, r)
 	})
 
 	srv := &http.Server{
@@ -299,14 +346,24 @@ func main() {
 		close(shutdownDone)
 	}()
 
-	ln, err := listenTLS(cfg)
+	tcpLn, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		log.Error("listen", "addr", cfg.Listen, "err", err)
 		os.Exit(1)
 	}
-	log.Info("listening", "addr", cfg.Listen, "tls", true)
+	// 公网模式启动门槛（SPEC-M1b-c2 §4）：按实际绑定地址（listener 解析结果）
+	// 判定——非 {127/8, ::1（含 IPv4-mapped 规范化，IsLoopback 覆盖）} 即公网
+	// 模式；0.0.0.0/::/空 host 绑定结果为非回环。任一检查失败拒绝启动。
+	if err := publicModeGate(tcpLn.Addr(), cfg, *cfgPath, st, log); err != nil {
+		tcpLn.Close()
+		log.Error("startup gate failed", "addr", cfg.Listen, "err", err)
+		os.Exit(1)
+	}
+	ln := tlsWrap(cfg, tcpLn)
+	log.Info("listening", "addr", cfg.Listen, "tls", true,
+		"mode", listenMode(tcpLn.Addr()))
 	// R5 裁决落地（M1b-a）：连接总数上限由 golang.org/x/net/netutil.LimitListener
-	// 实现（listenTLS 内，默认 256 可配）——该实现带 done-channel 修复，listener
+	// 实现（tlsWrap 内，默认 256 可配）——该实现带 done-channel 修复，listener
 	// Close 时阻塞中的 acquire 立即返回，与 Shutdown 无互锁；超额连接在内核
 	// accept 队列排队而非被拒。请求并发防线保留在 handler 层 limitConcurrent(64)。
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -322,25 +379,110 @@ func main() {
 	log.Info("stopped")
 }
 
-// listenTLS 组装监听链：TCP → LimitListener（连接总数上限，SPEC-M1b-a §1）→
-// TLS（console 启动仅加载 pki 证书，不生成；HTTPS 全覆盖，无明文入口）。
+// tlsWrap 组装 TLS 包装链：LimitListener（连接总数上限，SPEC-M1b-a §1）→ TLS
+// （console 启动仅加载 pki 证书，不生成；HTTPS 全覆盖，无明文入口）。
 // ServerTLSConfig 会把 pki_dir/ca.crt 追加进下发链（确为签发方时），
-// 供仅配置指纹的 agent 做完整 x509 验证（R10-#1）。
-func listenTLS(cfg *config.Console) (net.Listener, error) {
+// 供仅配置指纹的 agent 做完整 x509 验证（R10-#1）。在 TCP listen 与公网门槛
+// 检查之后调用（门槛失败时不做任何 TLS/证书加载）。
+func tlsWrap(cfg *config.Console, tcpLn net.Listener) net.Listener {
 	certPath, keyPath := cfg.CertKeyPaths()
 	tlsCfg, err := pki.ServerTLSConfig(certPath, keyPath, filepath.Join(cfg.PKIDir, pki.CACertFile))
 	if err != nil {
-		return nil, err
-	}
-	tcpLn, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return nil, err
+		tcpLn.Close()
+		logFatal("load tls config", err)
 	}
 	ln := tls.NewListener(netutil.LimitListener(tcpLn, cfg.MaxConnections), tlsCfg)
-	// net/http 服务端没有 TLS 握手超时字段（ReadHeaderTimeout 在握手之后才生效）：
-	// 在 Accept 后对未握手连接设总 deadline 防 slowloris 占满连接配额；
-	// 握手成功后 http 层会按 ReadHeaderTimeout/WriteTimeout 重设，不受影响。
-	return handshakeDeadlineListener{Listener: ln, timeout: 10 * time.Second}, nil
+	return handshakeDeadlineListener{Listener: ln, timeout: 10 * time.Second}
+}
+
+// listenMode 报告监听形态（日志用）：回环 / 公网。
+func listenMode(addr net.Addr) string {
+	if isLoopbackAddr(addr) {
+		return "loopback"
+	}
+	return "public"
+}
+
+// isLoopbackAddr 判定监听地址是否回环：127/8、::1，IPv4-mapped 先规范化
+// （net.IP.IsLoopback 内建该语义）；0.0.0.0/::/空 host 均为非回环。
+func isLoopbackAddr(addr net.Addr) bool {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	return tcp.IP != nil && tcp.IP.IsLoopback()
+}
+
+// publicModeGate 公网模式启动门槛（SPEC-M1b-c2 §4）：回环监听直接放行；
+// 非回环（公网形态）逐项检查，任一失败返回指明原因的错误（拒绝启动）：
+// ①存在 ≥1 个 enabled 用户；②config 文件普通文件且 0600 且属运行用户
+// （Windows 仅普通文件，ACL 等价约束）；③panel_allowed_hosts 非空（合法性
+// 与显式空数组语义已在 config 加载期校验并规范化，此处兜底复核）。
+// 认证开关不在此列——认证在所有网络形态始终开启（无「内网免登录」路径），
+// 非回环绑定只是额外的启动门槛，不是认证开关。
+func publicModeGate(addr net.Addr, cfg *config.Console, cfgPath string, st *store.Store, log *slog.Logger) error {
+	if isLoopbackAddr(addr) {
+		return nil
+	}
+	log.Warn("public network mode detected: startup gate applies",
+		"addr", addr.String(), "checks", "enabled_user/config_perm/allowed_hosts")
+	// ① 至少一个启用用户——否则公网形态无人可登录，面板全 302、MCP 全 401。
+	n, err := st.CountEnabledUsers(context.Background())
+	if err != nil {
+		return fmt.Errorf("统计启用用户失败: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("公网模式启动被拒绝：尚无任何启用用户——先执行 `meshconsole user add <用户名>` 创建账号（认证始终开启，公网形态必须有可登录用户）")
+	}
+	// ② config 文件本身的安全约束（含账号口令哈希的部署不该以宽松权限暴露）。
+	if err := config.CheckConfigFileSecurity(cfgPath); err != nil {
+		return err
+	}
+	// ③ Host 白名单非空兜底（正常路径由 config 加载校验保证）。
+	if len(cfg.AllowedHosts()) == 0 {
+		return fmt.Errorf("公网模式启动被拒绝：panel_allowed_hosts 解析结果为空")
+	}
+	return nil
+}
+
+// logFatal 为 tlsWrap 内 fatal 退出（保持调用点简洁）。
+func logFatal(msg string, err error) {
+	fmt.Fprintf(os.Stderr, "%s: %v\n", msg, err)
+	os.Exit(1)
+}
+
+// secureHeaderWriter 为全局安全头包装（R33-#4）：WriteHeader 拦截点统一写入
+// X-Content-Type-Options: nosniff 与 Cache-Control: no-store，覆盖 mux 默认
+// 错误响应与全部 handler 的错误/成功路径；隐式 200（直接 Write 不调
+// WriteHeader）同覆盖。头为强制覆写（非缺失才补）——与既有各 handler 自行
+// 设置的同名头一致，保证 SPEC §7 字面口径成立。
+type secureHeaderWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *secureHeaderWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Cache-Control", "no-store")
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *secureHeaderWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush 透传（MCP SDK 的响应刷新路径需要）。
+func (w *secureHeaderWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 type handshakeDeadlineListener struct {

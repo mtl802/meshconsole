@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="robots" content="noindex">
+<title>MeshConsole — 登录</title>
+<link rel="stylesheet" href="/glass.css">
+<style>
+  /* 登录页局部样式：复用 glass token，仅卡片与表单布局在此定义 */
+  .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+  .login-card{width:min(360px,100%);padding:36px 32px 28px;border-radius:24px;
+    background:var(--surface-glass, rgba(255,255,255,.6));backdrop-filter:blur(24px) saturate(1.4);
+    -webkit-backdrop-filter:blur(24px) saturate(1.4);
+    border:1px solid var(--stroke-glass, rgba(11,60,47,.12));
+    box-shadow:0 24px 60px -24px rgba(11,60,47,.25)}
+  .login-kicker{font:600 11px/1 var(--font-mono, ui-monospace, monospace);letter-spacing:.18em;
+    text-transform:uppercase;color:var(--ink-dim, #5b7a6e);margin:0 0 10px}
+  .login-title{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0 0 24px;color:var(--ink, #0b3c2f)}
+  .login-field{display:block;margin-bottom:14px}
+  .login-field span{display:block;font-size:12px;font-weight:600;color:var(--ink-dim, #5b7a6e);margin:0 0 6px}
+  .login-field input{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:12px;
+    border:1px solid var(--stroke-glass, rgba(11,60,47,.16));background:rgba(255,255,255,.75);
+    font:inherit;font-size:14px;color:var(--ink, #0b3c2f);outline:none;transition:border-color .2s, box-shadow .2s}
+  .login-field input:focus{border-color:var(--primary, rgb(4 120 87));box-shadow:0 0 0 3px rgb(4 120 87 / .15)}
+  .login-btn{width:100%;margin-top:10px;padding:12px;border:0;border-radius:12px;cursor:pointer;
+    background:var(--primary, rgb(4 120 87));color:#fff;font:inherit;font-size:14px;font-weight:650;
+    transition:transform .2s var(--ease, ease), box-shadow .2s}
+  .login-btn:hover{box-shadow:0 10px 24px -10px rgb(4 120 87 / .55)}
+  .login-btn:active{transform:scale(.98)}
+  .login-err{margin:0 0 16px;padding:10px 12px;border-radius:10px;font-size:13px;
+    background:rgb(196 74 58 / .12);color:#a03a2c;border:1px solid rgb(196 74 58 / .3)}
+  .login-err:empty{display:none}
+  .login-foot{margin:22px 0 0;font-size:11px;color:var(--ink-dim, #5b7a6e);text-align:center}
+</style>
+</head>
+<body data-app data-theme="light">
+<div class="atmosphere" aria-hidden="true">
+  <div class="blob blob--a"></div>
+  <div class="blob blob--b"></div>
+  <div class="blob blob--c"></div>
+  <div class="arc"></div>
+  <div class="grid-lines"></div>
+</div>
+<div class="grain" aria-hidden="true"></div>
+
+<main class="login-wrap">
+  <section class="login-card glass-surface" aria-label="登录 MeshConsole">
+    <p class="login-kicker">meshconsole // agent control plane</p>
+    <h1 class="login-title">登录控制台</h1>
+    <p class="login-err">{{.Error}}</p>
+    <form method="post" action="/login">
+      <label class="login-field">
+        <span>用户名</span>
+        <input name="username" autocomplete="username" required autofocus>
+      </label>
+      <label class="login-field">
+        <span>口令</span>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button class="login-btn" type="submit">登录</button>
+    </form>
+    <p class="login-foot">只读面板 · 会话 30 天内有效 · 连续失败将触发限流</p>
+  </section>
+</main>
+</body>
+</html>

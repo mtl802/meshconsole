@@ -576,3 +576,21 @@ body {
   .reveal, .reveal--clip { animation-duration: 0.01s !important; animation-delay: 0s !important; }
   * { transition-duration: 0.01s !important; }
 }
+
+/* ---- 登出按钮（M1b-c2）：固定右上角，不挤占 masthead 网格 ---- */
+.logout-form { position: fixed; top: 18px; right: 22px; z-index: 40; }
+.logout-btn {
+  font: 600 12px/1 var(--font-mono);
+  letter-spacing: .12em;
+  color: var(--app-text-soft);
+  background: var(--surface-glass);
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  padding: 8px 16px;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: color .25s var(--ease), border-color .25s var(--ease), box-shadow .25s var(--ease);
+}
+.logout-btn:hover { color: rgb(var(--alarm)); border-color: rgb(var(--alarm) / .45); box-shadow: 0 8px 20px -12px rgb(var(--alarm) / .5); }
+.logout-btn:active { transform: scale(.97); }

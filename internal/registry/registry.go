@@ -1,13 +1,18 @@
 // Package registry 实现 /api/agent/* 节点注册与心跳端点。
 //
-// 安全口径（DESIGN §7-2/§7-4/§7-9）：
+// 安全口径（DESIGN §7-2/§7-4/§7-9、SPEC-M1b-c2 §5）：
 //   - 除 /healthz 外全端点认证；认证失败一律 401，不泄露原因细节；
+//   - 来源收敛（网络过滤非身份认证）：RemoteAddr 须落在允许网段（缺省=回环+
+//     私网+Tailnet CGNAT 段，agent_allowed_cidrs 可覆写），网段外一律 403；
+//     不读任何转发头（X-Forwarded-For 等客户端可控，不可作来源依据）；
 //   - register 校验一次性注册 token（短期、可绑定预期节点，DESIGN §4.1-A），
 //     其余端点校验节点 token（SHA-256 哈希比对，DB 等值查询外再经应用层
 //     constant-time 复核）；
 //   - 节点 token 与节点绑定，心跳 body 的 node 必须与 token 匹配，跨节点 403；
 //   - 请求体上限 1MB、并发上限有界，超限拒绝；
-//   - 客户端可控字符串（collect_errors）入库与入日志前截断、去控制字符。
+//   - 客户端可控字符串（collect_errors）入库与入日志前截断、去控制字符；
+//   - 错误响应体中文化（SPEC §3 用户可见 API 错误；agent 仅按状态码分支，
+//     不解析错误文本，改写无兼容影响）。
 package registry
 
 import (
@@ -24,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -54,6 +60,8 @@ type Handler struct {
 	log *slog.Logger
 	// regTokens 为配置注入的一次性注册 token（哈希 + 到期 + 预期节点绑定）。
 	regTokens []regTokenEntry
+	// srcCIDRs 为来源收敛网段（SPEC-M1b-c2 §5；加载期已校验，非 nil）。
+	srcCIDRs []*net.IPNet
 }
 
 type regTokenEntry struct {
@@ -64,8 +72,13 @@ type regTokenEntry struct {
 	expectedNode string
 }
 
-func New(st *store.Store, log *slog.Logger, registrationTokens []config.RegistrationToken) *Handler {
-	h := &Handler{st: st, log: log}
+// New 构造 Handler。allowedCIDRs 为来源收敛网段（config 加载期解析产物）；
+// 传 nil 时取缺省私网清单（测试便利，生产路径由 config 统一产出）。
+func New(st *store.Store, log *slog.Logger, registrationTokens []config.RegistrationToken, allowedCIDRs []*net.IPNet) *Handler {
+	h := &Handler{st: st, log: log, srcCIDRs: allowedCIDRs}
+	if h.srcCIDRs == nil {
+		h.srcCIDRs = defaultSourceCIDRs()
+	}
 	for _, t := range registrationTokens {
 		sum := sha256.Sum256([]byte(t.Token))
 		h.regTokens = append(h.regTokens, regTokenEntry{
@@ -75,6 +88,41 @@ func New(st *store.Store, log *slog.Logger, registrationTokens []config.Registra
 		})
 	}
 	return h
+}
+
+// defaultSourceCIDRs 为来源收敛缺省网段（SPEC §5：回环 + 私网 + Tailnet CGNAT）。
+func defaultSourceCIDRs() []*net.IPNet {
+	var out []*net.IPNet
+	for _, s := range []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"} {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			panic("registry: bad builtin cidr " + s)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// sourceAllowed 报告 RemoteAddr 是否落在允许网段。IPv4-mapped 地址先规范化
+// （::ffff:100.64.0.3 → 100.64.0.3，与 IPv4 网段同口径比对）；解析失败一律拒绝。
+func sourceAllowed(remoteAddr string, cidrs []*net.IPNet) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, n := range cidrs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 认证中间件 ----
@@ -103,8 +151,25 @@ func tokenHashHex(token string) string {
 func unauthorized(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	// 不携带任何失败原因细节。
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+	// 不携带任何失败原因细节（文案中文化，SPEC §3）。
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "认证失败"})
+}
+
+// sourceFilter 为来源收敛中间件（SPEC-M1b-c2 §5）：RemoteAddr 不在允许网段
+// 一律 403。网络过滤非身份认证——token 校验独立保留；不读任何转发头
+// （X-Forwarded-For/X-Real-IP 等客户端可控，不可作来源依据）。
+func (h *Handler) sourceFilter(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !sourceAllowed(r.RemoteAddr, h.srcCIDRs) {
+			h.log.Warn("agent request rejected: source not allowed",
+				"remote_addr", r.RemoteAddr, "path", r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "来源地址不在允许网段"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // requireRegToken 验证一次性注册 token：constant-time 全量比对（无提前退出）、
@@ -186,7 +251,7 @@ func limitConcurrent(sem chan struct{}, next http.Handler) http.Handler {
 			defer func() { <-sem }()
 			next.ServeHTTP(w, r)
 		default:
-			httpError(w, http.StatusServiceUnavailable, "busy")
+			httpError(w, http.StatusServiceUnavailable, "繁忙，请稍后再试")
 		}
 	})
 }
@@ -217,13 +282,14 @@ var (
 )
 
 // RegisterRoutes 将 agent API 挂到 mux（/healthz 由调用方单独注册，唯一免认证端点）。
+// 两路由均先过来源收敛（SPEC-M1b-c2 §5）再进 token 认证。
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// 注册与心跳共享同一并发配额：两路由在处理请求合计不超 maxInFlight（审查 R7）。
 	sem := make(chan struct{}, maxInFlight)
 	mux.Handle("POST /api/agent/register",
-		limitConcurrent(sem, limitBody(h.requireRegToken(http.HandlerFunc(h.handleRegister)))))
+		h.sourceFilter(limitConcurrent(sem, limitBody(h.requireRegToken(http.HandlerFunc(h.handleRegister))))))
 	mux.Handle("POST /api/agent/heartbeat",
-		limitConcurrent(sem, limitBody(h.requireNodeToken(http.HandlerFunc(h.handleHeartbeat)))))
+		h.sourceFilter(limitConcurrent(sem, limitBody(h.requireNodeToken(http.HandlerFunc(h.handleHeartbeat))))))
 }
 
 // ---- register ----
@@ -263,13 +329,13 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if !validLabel(req.Name, 64) {
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 	req.Role, req.OS, req.Arch = strings.TrimSpace(req.Role), strings.TrimSpace(req.OS), strings.TrimSpace(req.Arch)
 	for _, s := range []string{req.Role, req.OS, req.Arch} {
 		if len(s) > 64 {
-			httpError(w, http.StatusBadRequest, "bad_request")
+			httpError(w, http.StatusBadRequest, "请求无效")
 			return
 		}
 	}
@@ -287,7 +353,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	nodeToken, err := newNodeToken()
 	if err != nil {
 		h.log.Error("generate node token", "err", err)
-		httpError(w, http.StatusInternalServerError, "internal")
+		httpError(w, http.StatusInternalServerError, "内部错误")
 		return
 	}
 	hash := tokenHashHex(nodeToken)
@@ -305,7 +371,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrDuplicateNode):
 		// 重复注册防护：名字已占用，直接拒绝，不签发、不覆盖。
 		h.log.Warn("register rejected: duplicate node name", "name", req.Name)
-		httpError(w, http.StatusConflict, "conflict")
+		httpError(w, http.StatusConflict, "节点名已被占用")
 		return
 	case errors.Is(err, store.ErrTokenUsed), errors.Is(err, store.ErrTokenExpired):
 		// 一次性 token 已用过/已到期（先于重名检查，不可借 409 探测节点名，审查 R1-#3）：
@@ -314,7 +380,7 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 		h.log.Error("register node", "err", err)
-		httpError(w, http.StatusInternalServerError, "internal")
+		httpError(w, http.StatusInternalServerError, "内部错误")
 		return
 	}
 
@@ -709,26 +775,26 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// 节点 token 只能上报本节点数据。
 	if strings.TrimSpace(req.Node) != node.Name {
 		h.log.Warn("heartbeat node mismatch", "token_node", node.Name, "body_node", req.Node)
-		httpError(w, http.StatusForbidden, "forbidden")
+		httpError(w, http.StatusForbidden, "节点身份不匹配")
 		return
 	}
 	if err := validateMetrics(&req.Metrics); err != nil {
 		h.log.Warn("heartbeat metrics out of range", "node", node.Name, "reason", err.Error())
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 	// 全空指标且无任何采集错误说明 → 400（R3）：正常 agent 心跳必带指标或
 	// 错误说明，两者皆空的心跳只会在库里长出无法解读的空行。
 	if metricsAllEmpty(&req.Metrics) && len(req.CollectErrors) == 0 {
 		h.log.Warn("heartbeat with no metrics and no collect_errors", "node", node.Name)
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 
 	collectErrors, ok := sanitizeCollectErrors(req.CollectErrors)
 	if !ok {
 		h.log.Warn("heartbeat collect_errors malformed", "node", node.Name)
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 	errJSON := ""
@@ -757,7 +823,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	svcPresent, svcIn, err := optionalArray[serviceIn](req.Services)
 	if err != nil {
 		h.log.Warn("heartbeat services field malformed", "node", node.Name, "reason", err.Error())
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 	var svcRows []store.ServiceRow
@@ -765,7 +831,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rows, verr := validateServices(svcIn)
 		if verr != nil {
 			h.log.Warn("heartbeat services invalid", "node", node.Name, "reason", verr.Error())
-			httpError(w, http.StatusBadRequest, "bad_request")
+			httpError(w, http.StatusBadRequest, "请求无效")
 			return
 		}
 		svcRows = rows
@@ -773,7 +839,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	agPresent, agIn, err := optionalArray[agentIn](req.Agents)
 	if err != nil {
 		h.log.Warn("heartbeat agents field malformed", "node", node.Name, "reason", err.Error())
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 	var agentRows []store.AgentRow
@@ -781,7 +847,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rows, verr := validateAgents(agIn)
 		if verr != nil {
 			h.log.Warn("heartbeat agents invalid", "node", node.Name, "reason", verr.Error())
-			httpError(w, http.StatusBadRequest, "bad_request")
+			httpError(w, http.StatusBadRequest, "请求无效")
 			return
 		}
 		agentRows = rows
@@ -791,7 +857,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	tkPresent, tkIn, err := optionalArray[agentTaskIn](req.AgentTasks)
 	if err != nil {
 		h.log.Warn("heartbeat agent_tasks field malformed", "node", node.Name, "reason", err.Error())
-		httpError(w, http.StatusBadRequest, "bad_request")
+		httpError(w, http.StatusBadRequest, "请求无效")
 		return
 	}
 	var taskRows []store.AgentTaskRow
@@ -799,7 +865,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		rows, verr := validateAgentTasks(tkIn)
 		if verr != nil {
 			h.log.Warn("heartbeat agent_tasks invalid", "node", node.Name, "reason", verr.Error())
-			httpError(w, http.StatusBadRequest, "bad_request")
+			httpError(w, http.StatusBadRequest, "请求无效")
 			return
 		}
 		taskRows = rows
@@ -814,7 +880,7 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		taskRowsOrNil(tkPresent, taskRows), tasksTruncated)
 	if err != nil {
 		h.log.Error("store heartbeat", "node", node.Name, "err", err)
-		httpError(w, http.StatusInternalServerError, "internal")
+		httpError(w, http.StatusInternalServerError, "内部错误")
 		return
 	}
 	if !stOK {
@@ -840,11 +906,11 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // badRequest 统一处理请求体类错误：超限 413，其余 400；响应不带细节。
 func (h *Handler) badRequest(w http.ResponseWriter, err error) {
 	if errors.Is(err, errTooLarge) {
-		httpError(w, http.StatusRequestEntityTooLarge, "too_large")
+		httpError(w, http.StatusRequestEntityTooLarge, "请求体过大")
 		return
 	}
 	h.log.Warn("bad request body", "reason", err.Error())
-	httpError(w, http.StatusBadRequest, "bad_request")
+	httpError(w, http.StatusBadRequest, "请求无效")
 }
 
 func httpError(w http.ResponseWriter, code int, msg string) {

@@ -26,6 +26,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -46,9 +48,85 @@ type Config struct {
 	Dir string
 	// TailnetIP 为控制台所在节点的 Tailnet IP（可选，进 SAN）。
 	TailnetIP string
-	// ExtraDNS / ExtraIPs 为追加 SAN（可选）。
-	ExtraDNS []string
-	ExtraIPs []string
+	// ExtraSANs 为追加 SAN（SPEC-M1b-c2 §6）：任何 PKI 写入前经 NormalizeSANs
+	// 统一校验——IP 字面量 → IP SAN，合法 DNS 名 → DNS SAN，URL/端口/CIDR/空值
+	// 显式报错，规范化去重。部署值示例 ["1.13.158.180"]。
+	ExtraSANs []string
+}
+
+// SANEntry 为校验后的单条 SAN（DNS 与 IP 二选一）。
+type SANEntry struct {
+	DNS string
+	IP  net.IP
+}
+
+// NormalizeSANs 统一校验并规范化追加 SAN（SPEC §6：任何 PKI 写入前执行）：
+//   - IP 字面量（含 IPv6）→ IP SAN；
+//   - 合法 DNS 主机名（RFC 1123，单标签合法）→ DNS SAN（小写、去尾点）；
+//   - URL（含 scheme）、携带端口、CIDR、空值/空白 → 显式报错（修复旧
+//     ExtraIPs 对非法值静默跳过的缺陷——配置要求的 SAN 缺失而部署方不知情）；
+//   - 规范化后去重（保持首现顺序）。
+func NormalizeSANs(raw []string) ([]SANEntry, error) {
+	var out []SANEntry
+	seen := map[string]bool{}
+	for i, item := range raw {
+		s := strings.TrimSpace(item)
+		field := func(reason string) error {
+			return fmt.Errorf("tls_extra_sans[%d] %q %s（期望 IP 字面量或 DNS 主机名，如 1.13.158.180 / panel.example.com）", i, item, reason)
+		}
+		switch {
+		case s == "":
+			return nil, field("为空")
+		case strings.Contains(s, "://"):
+			return nil, field("是 URL——SAN 不接受 URL")
+		case strings.Contains(s, "/"):
+			return nil, field("是 CIDR——SAN 不接受网段")
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			key := "ip:" + ip.String()
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, SANEntry{IP: ip})
+			}
+			continue
+		}
+		if host, port, err := net.SplitHostPort(s); err == nil && port != "" && host != "" {
+			if _, perr := strconv.Atoi(port); perr == nil {
+				return nil, field("携带端口——SAN 条目为裸主机名/IP，端口由监听地址承载")
+			}
+		}
+		dns := strings.ToLower(strings.TrimSuffix(s, "."))
+		if !validDNSName(dns) {
+			return nil, field("既不是 IP 字面量也不是合法 DNS 名")
+		}
+		if !seen["dns:"+dns] {
+			seen["dns:"+dns] = true
+			out = append(out, SANEntry{DNS: dns})
+		}
+	}
+	return out, nil
+}
+
+// validDNSName 按 RFC 1123 校验主机名（与 config 白名单同规则）。
+func validDNSName(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // Result 汇报一次 Ensure 的动作与产物位置。
@@ -75,6 +153,11 @@ func Ensure(cfg Config) (*Result, error) {
 	// 成功——证书缺配置要求的 SAN 而部署方不知情）。配置了就必须合法。
 	if cfg.TailnetIP != "" && net.ParseIP(cfg.TailnetIP) == nil {
 		return nil, fmt.Errorf("tailnet_ip %q 不是合法 IP 地址（期望如 100.64.0.1）；修正配置后重试", cfg.TailnetIP)
+	}
+	// SPEC-M1b-c2 §6：任何 PKI 写入前统一校验追加 SAN（在 MkdirAll 之前——
+	// 非法配置不得留下半个 pki 目录）；规范化产物经 sans() 再次求取使用。
+	if _, err := NormalizeSANs(cfg.ExtraSANs); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create pki dir: %w", err)
@@ -409,7 +492,10 @@ func needsRenewal(srvCertPath string, caCert *x509.Certificate, srvKey *ecdsa.Pr
 		return true, nil
 	}
 	// SAN 覆盖检查：配置要求的 DNS/IP 必须全部已在证书中。
-	wantDNS, wantIPs := sans(cfg)
+	wantDNS, wantIPs, err := sans(cfg)
+	if err != nil {
+		return false, err
+	}
 	haveDNS := map[string]bool{}
 	for _, d := range cert.DNSNames {
 		haveDNS[d] = true
@@ -437,29 +523,39 @@ func needsRenewal(srvCertPath string, caCert *x509.Certificate, srvKey *ecdsa.Pr
 }
 
 // sans 汇总要求的 SAN：DNS 恒含 localhost 与本机主机名；IP 恒含 127.0.0.1 与 ::1，
-// 配置了 tailnet_ip 再追加（SPEC：SAN 必须覆盖 localhost、127.0.0.1、tailnet IP、主机名）。
-func sans(cfg Config) (dns []string, ips []net.IP) {
+// 配置了 tailnet_ip 再追加，ExtraSANs 经 NormalizeSANs 校验后并入
+// （SPEC：SAN 必须覆盖 localhost、127.0.0.1、tailnet IP、主机名与配置的追加条目）。
+func sans(cfg Config) (dns []string, ips []net.IP, err error) {
 	dns = []string{"localhost"}
 	if h, err := os.Hostname(); err == nil && h != "" {
 		dns = append(dns, h)
 	}
-	dns = append(dns, cfg.ExtraDNS...)
 	ips = append(ips, net.ParseIP("127.0.0.1"), net.ParseIP("::1"))
 	if cfg.TailnetIP != "" {
 		if ip := net.ParseIP(cfg.TailnetIP); ip != nil {
 			ips = append(ips, ip)
 		}
 	}
-	for _, s := range cfg.ExtraIPs {
-		if ip := net.ParseIP(s); ip != nil {
-			ips = append(ips, ip)
+	// Ensure 入口已统一校验过；此处校验属防御性兜底（needsRenewal 也会走到）。
+	extra, err := NormalizeSANs(cfg.ExtraSANs)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, e := range extra {
+		if e.DNS != "" {
+			dns = append(dns, e.DNS)
+		} else if e.IP != nil {
+			ips = append(ips, e.IP)
 		}
 	}
-	return dns, ips
+	return dns, ips, nil
 }
 
 func issueServerCert(caCert *x509.Certificate, caKey, srvKey *ecdsa.PrivateKey, cfg Config) (*x509.Certificate, error) {
-	dnsNames, ipAddrs := sans(cfg)
+	dnsNames, ipAddrs, err := sans(cfg)
+	if err != nil {
+		return nil, err
+	}
 	tpl := &x509.Certificate{
 		SerialNumber: randomSerial(),
 		Subject:      pkix.Name{CommonName: "meshconsole", Organization: []string{"meshconsole"}},

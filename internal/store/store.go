@@ -111,10 +111,16 @@ func openDBWithDsn(dsn string, maxOpen int) (*sql.DB, error) {
 }
 
 // Open 打开数据库并执行增量 schema migration。
+// 数据文件权限口径（SPEC-M1b-c2 §4）：data 目录 0700、DB/WAL/SHM 0600——
+// 面板公网形态下这些文件含节点 token 哈希与口令哈希，全局可读等于泄露。
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create db dir: %w", err)
+		}
+		// MkdirAll 受 umask 影响且目录可能以更宽权限预先存在：显式收紧一次。
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("chmod db dir: %w", err)
 		}
 	}
 	write, err := openDB(path, 1)
@@ -127,11 +133,33 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open read db: %w", err)
 	}
 	s := &Store{write: write, read: read}
+	if err := tightenDataPerms(path); err != nil {
+		s.Close()
+		return nil, err
+	}
 	if err := s.migrate(); err != nil {
 		s.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// tightenDataPerms 收紧数据文件权限：DB 与 WAL/SHM 一律 0600（SPEC-M1b-c2 §4）。
+// WAL/SHM 尚不存在时跳过——SQLite 新建它们时沿用主库文件的权限位，主库 0600
+// 即传导；已存在的旧文件（历史版本以 0644 创建）就地收紧。
+func tightenDataPerms(dbPath string) error {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if _, err := os.Stat(p); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("stat %s: %w", p, err)
+		}
+		if err := os.Chmod(p, 0o600); err != nil {
+			return fmt.Errorf("chmod %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -298,6 +326,51 @@ CREATE INDEX IF NOT EXISTS idx_agent_tasks_updated ON agent_tasks(updated_at);
 		Version: 5,
 		SQL: `
 ALTER TABLE nodes ADD COLUMN tasks_truncated INTEGER NOT NULL DEFAULT 0;
+`,
+	},
+	{
+		// M1b-c2（SPEC §1）：账号体系——users/sessions/api_tokens。会话与 API
+		// token 库里只存 SHA-256 哈希；sessions.created_at 承载 30 天绝对期限
+		// 基点（滑动续期不得越过）；api_tokens.token_hash 唯一索引即查表键。
+		// 注：SPEC 原文称「migration v5」，v5 已被 m1b-c-fix 的 tasks_truncated
+		// 占用（R27-#4），按既有序号顺延为 v6——结构以 SPEC 表定义为准。
+		Version: 6,
+		SQL: `
+CREATE TABLE IF NOT EXISTS users (
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	username      TEXT    NOT NULL UNIQUE,
+	password_hash TEXT    NOT NULL,
+	enabled       INTEGER NOT NULL DEFAULT 1,
+	created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+	token_hash TEXT    PRIMARY KEY,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	token_hash  TEXT    NOT NULL UNIQUE,
+	user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	description TEXT    NOT NULL DEFAULT '',
+	expires_at  INTEGER,
+	created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+`,
+	},
+	{
+		// m1b-c2-fix（R33-#1）：口令状态版本。会话签发在写入时刻按
+		// 「password_version + enabled」复核——改密/禁用递增版本后，凭据校验与
+		// 会话插入之间发生的撤销动作会使旧凭据的签发落空（无活会话可拿）。
+		Version: 7,
+		SQL: `
+ALTER TABLE users ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1;
 `,
 	},
 }
@@ -1096,6 +1169,66 @@ func scanAgentTaskRows(rows *sql.Rows) ([]AgentTaskRecord, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListAgentTaskSnapshot 单只读事务取得全网任务快照与节点状态表（R31-#2 →
+// R33-#7）：agent_tasks 与 nodes（status/tasks_truncated）取自同一 WAL 读
+// 快照——并发心跳不再出现「旧任务清单配新截断标记/新状态」的错配，meshview
+// 组装任务视图与截断标记并集共用这一份读取。
+func (s *Store) ListAgentTaskSnapshot(ctx context.Context) ([]AgentTaskRecord, []NodeRecord, error) {
+	tx, err := s.read.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	tasks, err := scanAgentTaskRowsFrom(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodes, err := scanNodeRecordsFrom(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tasks, nodes, tx.Commit()
+}
+
+// scanAgentTaskRowsFrom 在 q（读库或只读事务）上取全网任务快照。
+func scanAgentTaskRowsFrom(ctx context.Context, q queryContext) ([]AgentTaskRecord, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT node_id, pid, agent_name, cmd, elapsed_s, cpu_pct, mem_pct, started_at, updated_at
+FROM agent_tasks ORDER BY node_id, agent_name, pid`)
+	if err != nil {
+		return nil, err
+	}
+	return scanAgentTaskRows(rows)
+}
+
+// scanNodeRecordsFrom 在 q（读库或只读事务）上取节点状态表（不含 token_hash）。
+func scanNodeRecordsFrom(ctx context.Context, q queryContext) ([]NodeRecord, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT id, name, role, os, arch, tailnet_ip, public_ip, agent_version, status,
+       last_seen, last_success, created_at, tasks_truncated
+FROM nodes ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NodeRecord
+	for rows.Next() {
+		var r NodeRecord
+		if err := rows.Scan(&r.ID, &r.Name, &r.Role, &r.OS, &r.Arch, &r.TailnetIP,
+			&r.PublicIP, &r.AgentVersion, &r.Status, &r.LastSeen, &r.LastSuccess, &r.CreatedAt,
+			&r.TasksTruncated); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// queryContext 抽象 *sql.DB 与 *sql.Tx 共有的查询入口（同一事务内多查询用）。
+type queryContext interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // MetricsStats 为某节点时间窗口内的指标摘要（MCP get_node 与面板共用）。

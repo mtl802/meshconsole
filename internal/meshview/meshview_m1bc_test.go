@@ -103,6 +103,54 @@ func TestAgentTasksNodeFilter(t *testing.T) {
 	}
 }
 
+// TestAgentTasksSnapshotConsistency 任务清单与截断标记同一读事务（R31-#2 →
+// R33-#7）：AgentTasksSnapshot 一次取得 tasks 与 tasks_truncated 并集，口径
+// 与 MCP 消费一致——按节点过滤取该节点标记、未知节点 false、被截断节点零任务
+// 时标记仍为 true（并集按节点计，不因空快照翻转）。
+func TestAgentTasksSnapshotConsistency(t *testing.T) {
+	st, path := seed(t)
+	q := meshview.New(st)
+	ctx := context.Background()
+	n, err := st.GetNodeByName(ctx, "cloud-1")
+	if err != nil || n == nil {
+		t.Fatalf("seed node missing: %v", err)
+	}
+	cpu := 42.0
+	if _, err := st.HeartbeatFull(ctx, &store.MetricsRow{
+		NodeID: n.ID, TS: time.Now().Unix(), CPUPct: &cpu,
+	}, "agent-1", nil, nil,
+		&[]store.AgentTaskRow{{PID: 7, AgentName: "zcode", ElapsedS: 10, CPUPct: &cpu}}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 全网：任务 + 截断标记同批返回。
+	tasks, truncated, err := q.AgentTasksSnapshot(ctx, "")
+	if err != nil || len(tasks) != 1 || !truncated {
+		t.Fatalf("all = (%d tasks, trunc=%v) err=%v, want 1+true", len(tasks), truncated, err)
+	}
+	// 按节点过滤 = 该节点自己的标记。
+	tasks, truncated, err = q.AgentTasksSnapshot(ctx, "cloud-1")
+	if err != nil || len(tasks) != 1 || !truncated {
+		t.Fatalf("cloud-1 = (%d tasks, trunc=%v) err=%v, want 1+true", len(tasks), truncated, err)
+	}
+	// 未知节点：空清单 + false。
+	_, truncated, err = q.AgentTasksSnapshot(ctx, "ghost")
+	if err != nil || truncated {
+		t.Fatalf("ghost trunc=%v err=%v, want false", truncated, err)
+	}
+	// 被截断标记的节点当前零任务：标记保持 true（按节点计的并集语义）。
+	rawExec(t, path, `UPDATE nodes SET tasks_truncated = 1 WHERE name = 'mac-mini'`)
+	_, truncated, err = q.AgentTasksSnapshot(ctx, "mac-mini")
+	if err != nil || !truncated {
+		t.Fatalf("mac-mini zero-task trunc=%v err=%v, want true", truncated, err)
+	}
+	// AgentTasks（overview 用薄封装）行为不回退。
+	tasks, err = q.AgentTasks(ctx, "")
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("AgentTasks wrapper = %v err=%v", tasks, err)
+	}
+}
+
 // rawExec 测试直连库执行写语句（视图层只读，构造数据态走原始 SQL，backdateService 同口径）。
 func rawExec(t *testing.T, path, q string, args ...any) {
 	t.Helper()

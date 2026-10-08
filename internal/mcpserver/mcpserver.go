@@ -141,31 +141,14 @@ func New(st *store.Store, version string, opts *mcp.ServerOptions) *mcp.Server {
 		Description: "列出当前运行中的 agent 任务快照（节点/agent 名/命令/已运行时长/cpu/mem/启动时刻；进程消失即从快照移除，无历史），可按节点名过滤。" +
 			"tasks_truncated=true 表示涉及节点的清单触顶 64 条截断、返回仅为前 64 条",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listAgentTasksIn) (*mcp.CallToolResult, listAgentTasksOut, error) {
-		tasks, err := q.AgentTasks(ctx, in.Node)
+		// 任务清单与截断标记在同一只读事务内取得（R31-#2 → R33-#7）：并发心跳
+		// 下不再出现旧任务快照配新截断标记的错配。并集口径：未过滤=全网任一
+		// 节点截断即 true，按节点过滤=该节点自己的标记；无涉及节点=false。
+		tasks, truncated, err := q.AgentTasksSnapshot(ctx, in.Node)
 		if err != nil {
 			return nil, listAgentTasksOut{}, err
 		}
-		if tasks == nil {
-			tasks = []meshview.AgentTask{}
-		}
-		// 截断标记透出（R29-#3）：nodes.tasks_truncated 已落库（R27-#4），
-		// 视图按过滤口径取并集——未过滤=全网任一节点截断即 true，按节点过滤
-		// =该节点自己的标记；无涉及节点（未知节点过滤）为 false。
-		nodes, err := q.Nodes(ctx)
-		if err != nil {
-			return nil, listAgentTasksOut{}, err
-		}
-		out := listAgentTasksOut{Tasks: tasks}
-		for _, n := range nodes {
-			if in.Node != "" && n.Name != in.Node {
-				continue
-			}
-			if n.TasksTruncated {
-				out.TasksTruncated = true
-				break
-			}
-		}
-		return nil, out, nil
+		return nil, listAgentTasksOut{Tasks: tasks, TasksTruncated: truncated}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

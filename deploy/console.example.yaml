@@ -43,6 +43,12 @@ pki_dir: "./pki"
 # 使 agent 可经 https://<tailnet-ip>:7700 连接并验证通过。
 # tailnet_ip: "100.64.0.1"
 
+# 追加 SAN（M1b-c2 §6）：条目为 IP 字面量或 DNS 主机名——URL/端口/CIDR/空值
+# 一律在 pki 生成时报错，规范化去重。任何 PKI 写入前统一校验；变更后
+# `make pki` 会自动重签证书（CA/私钥不动，agent 链验证不受影响）。
+# 公网部署示例值：
+# tls_extra_sans: ["1.13.158.180"]
+
 # ---- 生产部署安全注意（M1b-b 落地，DESIGN §7-5）----
 # agent 侧 docker 型服务查询走 docker CLI：普通 docker CLI 等价于宿主 root，
 # 生产部署中节点上的 docker 访问必须以只读 helper 或 socket-proxy 提供受限
@@ -59,12 +65,35 @@ pki_dir: "./pki"
 #   api_key: "headscale-preauth-api-key"  # `headscale apikeys create` 预生成；不入 git
 #   interval_s: 300                  # 拉取周期，缺省 300s，下限 30s（保持低频只读）
 
-# ---- Web 只读面板（M1b-b；SPEC-M1b-b §4）----
+# ---- Web 面板与账号（M1b-b + M1b-c2 §1）----
 # 与 agent API 同端口：GET / 面板页、GET /api/panel/overview 聚合 JSON（15s 轮询）。
-# 仅 Host 为 localhost/127.0.0.1/[::1]（带或不带端口）的请求可达，畸形形式
-# （非数字/空端口、[localhost] 等方括号非 IPv6、userinfo、携带 path）同样 403；
-# 无 Cookie 无登录——面板安全边界 = 监听地址（本机/隧道），请保持 listen 不放公网。
-# 静态资源 embed 进二进制，离线可用；浏览器直接打开 https://127.0.0.1:7700/。
+# 认证在所有网络形态始终开启（含回环）：未登录一律 302 /login，匿名可及仅
+# 登录页/静态资源/healthz。账号走 CLI 管理（交互口令，bcrypt cost 10）：
+#   meshconsole user add lunge            # 创建用户（口令两遍确认）
+#   meshconsole user passwd/disable/enable lunge
+#   meshconsole token create lunge        # MCP API token（明文仅显示一次）
+# 会话 Cookie mc_session（HttpOnly/Secure/SameSite=Lax），滑动续期、30 天绝对期限；
+# 登录防护：per-IP 5 次失败/分 429、全局 bcrypt 并发 ≤2、未知用户 dummy bcrypt；
+# 改密/禁用即撤销该用户全部会话与 token。
+#
+# 面板 Host/Origin 白名单（缺省 = 回环名单 localhost/127.0.0.1/::1；显式空数组
+# 同义；条目为裸主机名/IP，不带 scheme/端口）。畸形 Host（非数字/空端口、
+# [localhost] 等方括号非 IPv6、userinfo、携带 path）一律 403。
+# 公网部署示例值：
+# panel_allowed_hosts: ["localhost", "127.0.0.1", "::1", "100.64.0.3", "1.13.158.180"]
+
+# ---- agent API 来源收敛（M1b-c2 §5）----
+# /api/agent/* 的 RemoteAddr 网段过滤（网络过滤非身份认证，节点 token 校验
+# 独立保留；不读任何转发头）。缺省 = 回环 + 私网 + Tailnet CGNAT 段
+# （127/8、::1、10/8、172.16/12、192.168/16、100.64/10）；显式空数组 = 仅回环。
+# 公网暴露后保持缺省即可（公网来源 403）：
+# agent_allowed_cidrs: []
+
+# ---- 公网模式启动门槛（M1b-c2 §4）----
+# 实际绑定地址非回环（如 0.0.0.0:7700）即公网模式，启动逐项检查、任一失败
+# 拒绝启动：①存在 ≥1 个启用用户；②本 config 文件普通文件且 0600 且属运行
+# 用户（Windows 为 ACL 等价约束）；③panel_allowed_hosts 合法（加载期校验）。
+# 数据文件权限强制 data 目录 0700、DB/WAL/SHM 0600。
 
 # ---- 资源限额 ----
 

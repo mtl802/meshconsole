@@ -1,3 +1,73 @@
+# DELIVERY — M1b-c2 交付说明（账号体系 + 公网 MCP + 全面中文化）
+
+> 交付人：zcode · 2026-10-08
+> 依据：SPEC-M1b-c2.md v4 定稿（唯一需求源，逐条执行）
+> 基线：M1b-c（fix2 后）。状态：**本机可验证项全部自测通过（含二进制级 E2E 验收矩阵 16 项实过）；公网绑定门槛上机实跑、浏览器人眼、云机真 agent 连测列部署上机项**（证据见 REVIEW.md R32 节）。**R33 首审 7 条已修完（m1b-c2-fix，REVIEW.md R34 节）；R35 复审残余 3 条（1 阻塞 + 2 建议）已修完（m1b-c2-fix2，REVIEW.md R36 节），未执行 git commit。**
+
+## 一、交付物清单
+
+| 域 | 内容 |
+|---|---|
+| 账号体系 | migration **v6**（users/sessions/api_tokens，SPEC 原文 v5 与既占序号冲突顺延，表结构以 SPEC 为准）+ **v7**（`users.password_version`，R33-#1 签发复核）；`internal/auth`（登录/会话/登录防护/API token 认证；**会话签发以单条条件插入复核密码版本与启用态**——改密/禁用在凭据校验后的间隙完成也拒绝签发，旧凭据换不来活会话）；CLI `user add/passwd/disable/enable` + `token create/list/revoke`（交互口令，bootstrap 先迁移；**flag 解析失败与多余位置参数一律报错退出 2 不产生任何变更，R33-#5/R35-#3**） |
+| 会话安全 | Cookie `mc_session`（HttpOnly/Secure/SameSite=Lax/host-only）；滑动续期 + 30 天绝对期限；改密/禁用单事务撤销全部 session+api_tokens；最后启用用户保护 |
+| 登录防护 | per-IP 5 次/分 429（滑动窗 cap 4096）；全局 bcrypt 并发 ≤2（排队上限 32/等待 5s）；未知用户 dummy bcrypt；失败统一文案防枚举 |
+| 公网 MCP | `POST /mcp` 官方 go-sdk v1.8.0（go.mod 锁定未变）`Stateless + JSONResponse` = JSON 同步响应模式（无 SSE）；Bearer api_token 认证（401 中文化不泄露工具）；独立 semaphore 4；body 1MB；**SDK 层英文错误经 HTTP 层响应拦截映射为中文错误体——JSON-RPC 与 text/plain 两条路径全闭合（含空 POST、Last-Event-ID POST、未收录文案兜底通用中文），JSON-RPC code/HTTP 状态码原样保留，不泄露工具清单与内部细节，R33-#3/R35-#2** |
+| 公网门槛 | 实际绑定地址判型；≥1 启用用户 + config 权限 + Host 白名单三项检查拒绝启动；**config 检查 unix=0600+属主，Windows=x/sys/windows 实装 ACL/属主校验（仅 当前用户/SYSTEM/Administrators 持有访问权——允许型 ACE 含普通/callback/object/callback-object 四型全解析，拒绝型不参与放行判定，无法判定/解析失败即按失败拒绝启动；属主为当前用户或管理员组；R33-#2 实装、R35-#1 收紧）**；数据文件 data 0700 / DB/WAL/SHM 0600 |
+| 来源收敛 | `/api/agent/*` RemoteAddr CIDR 过滤（缺省回环+私网+100.64/10；显式空=仅回环）；公网 403；token 校验独立；不读转发头 |
+| 安全头 | 全链 no-store/nosniff：root handler `secureHeaderWriter` 全局包装（含 mux 默认 404/405 与 agent API 全部拒绝路径，R33-#4） |
+| SAN | `tls_extra_sans` 统一校验（IP→IP SAN / DNS→DNS SAN / URL·端口·CIDR·空值报错 / 去重），修 ExtraIPs 静默跳过；变更自动重签 |
+| 并发三闸 | agent API 64 / overview 8 / MCP 4，相互独立 |
+| 中文化 | 面板 UI 全量 + 登录页新增 + API 错误体 + MCP HTTP 错误（含 SDK 层错误映射；渲染层翻译，机器契约保持英文）；代码注释与日志键英文不变 |
+| DESIGN | §0 同步：v0.8（§7-4 重写「公网面板例外」三层认证/限流/三闸/门槛/pin 更新/回滚；§8 补账号条款；删除「公网无暴露端口」绝对表述） |
+
+新依赖：`golang.org/x/crypto v0.57.0`（bcrypt）、`golang.org/x/term v0.46.0`（交互口令）；go-sdk v1.8.0 锁定不变（**兼容客户端声明：实现 MCP Streamable HTTP（2025-06-18+）的标准客户端，含 HanaAgent connector**）。
+
+## 二、公网部署 runbook（伦哥操作，按序执行）
+
+0. **前置**：服务器拉取本批产物（`bin/meshconsole-linux-amd64`）替换 /opt/meshconsole/meshconsole；`make pki` 幂等不覆盖私钥。
+1. **建账号**：`meshconsole user add lunge`（交互口令两遍）→ `meshconsole token create lunge -desc "HanaAgent Mac"`，**明文只显示一次，当场保存**。
+2. **改 config**（/opt/meshconsole/console.yaml，改完 `chmod 600`）：
+   - `panel_allowed_hosts: ["localhost", "127.0.0.1", "::1", "100.64.0.3", "1.13.158.180"]`
+   - `tls_extra_sans: ["1.13.158.180"]`
+   - `listen: "0.0.0.0:7700"`
+3. **重签证书**（备份旧对）：`cp pki/server.crt{,.bak} && cp pki/server.key{,.bak}` → `meshconsole pki -config console.yaml`（CA/私钥不动，仅 server.crt 重签带公网 IP SAN）→ 输出新 fingerprint 记录在案。
+4. **重启 console**（systemd restart meshconsole）。启动日志核对：`listening addr=0.0.0.0:7700 mode=public`；门槛失败会拒绝启动并指明原因（无启用用户/权限不对/白名单非法）。
+5. **客户端更新顺序**：ca_cert 模式 agent **零动作**（当前部署均为 ca_cert，核对即可）；fingerprint 模式 agent 先拿第 3 步新指纹更新配置再切流量；浏览器首次访问经带外核对指纹/导入 CA（**验收一律禁用 -k**）。
+6. **防火墙**：腾讯云放行 TCP 7700（伦哥在云控制台操作）。
+7. **验收矩阵**（逐项打勾）：
+   - [ ] 公网匿名 `https://1.13.158.180:7700/` → 302 /login；`/api/panel/overview` 匿名 → 302（无业务数据）
+   - [ ] 登录页中文 → 登录成功 → 面板中文（导航/状态/空态）
+   - [ ] 错密码 ×5 → 401；第 6 次 → 429
+   - [ ] 登出 → 会话即失效（后退 302 /login）
+   - [ ] `/mcp` 无 token → 401（中文，不泄露工具名）；带 token → initialize/tools/list 正常、description 中文
+   - [ ] mesh 心跳不回退（cloud-agent 心跳 200，在线状态保持）
+   - [ ] 公网匿名仅得 /login + 静态 + /healthz
+   - [ ] 公网来源 `POST /api/agent/*` → 403「来源地址不在允许网段」（mesh 内 agent 不受影响）
+8. **回滚**：撤防火墙 7700 放行 → `cp pki/server.crt.bak pki/server.crt`（如已重签）→ config `listen: "100.64.0.3:7700"` → 重启。账号体系与来源收敛回环/Tailnet 形态原样生效，回滚不降级安全性。
+
+### 部署上机项（本机沙盒边界，commit 后由 Hana 主会话执行）
+
+- 公网绑定门槛实跑：0.0.0.0:7700 + 无用户 → 拒绝启动；建用户后正常（逻辑已由 `TestPublicModeGate` 四态钉住，上机核验日志 `mode=public`）。
+- Windows 上机核验：config ACL/属主检查已代码实装（`config_owner_windows.go`，x/sys/windows；判定核心 `aclVerdict` 与 ACE 分类器 `classifyDACLACE`/`daclAllowTrustees` 单测覆盖全部判定分支——含 callback/object 允许型与无法判定类型拒绝，R35-#1，交叉编译过）——上机验证 `icacls` 裁剪继承后启动放行、残留 Everyone 授权（含藏身 callback/object 允许型）时拒绝启动且报错含 remediation。
+- 浏览器人眼：登录页/面板中文化 + 登出按钮（固定右上角）+ Liquid Glass 亮色回归。
+- HanaAgent 实配 `https://1.13.158.180:7700/mcp` + Bearer token 连测六工具。
+
+## 〇、修复轮 m1b-c2-fix（R33 全 7 条，2026-10-08）
+
+R33 裁决 2 阻塞 + 3 建议 + 2 条 R31 候选核销全部修完（逐条文件:行号见 REVIEW.md R34）。行为变化：① **会话签发竞态关闭**——migration v7 增 `users.password_version`，改密/禁用递增版本，签发以单条条件插入复核「版本+启用态」，改密/禁用在登录凭据校验后的间隙完成也拒绝签发（并发交错单测钉死）；② **Windows config ACL/属主检查实装**——公网形态下校验仅 当前用户/SYSTEM/Administrators 持有访问权且属主合规，取不到 ACL 即拒绝启动（此前直接放行）；③ MCP SDK 层英文错误（unknown tool 等）映射为中文错误体，JSON-RPC code/id/data 保留；④ 安全头全局包装，mux 404/405 与 agent API 拒绝路径全覆盖 no-store/nosniff；⑤ `token create` flag 解析失败 exit 2 不签发；⑥ 面板轮询：tick 起始独立新鲜度校验 + fetch 10s AbortController 超时 + 防重入（挂起不再冻结失效、不再叠发）；⑦ `list_agent_tasks` 任务清单与截断标记改单只读事务取得。验证：vet/gofmt 零输出、211 用例全绿（+9）、make cross 三平台、node --check + DOM 桩冒烟 + 二进制 E2E 冒烟（登录/改密撤销/重登、MCP 中文错误与六工具、404/401 安全头、agent 兼容）全过。
+
+## 〇′、修复轮 m1b-c2-fix2（R35 全 3 条，2026-10-08）
+
+R35 复审裁决 1 阻塞 + 2 建议全部修完（逐条文件:行号见 REVIEW.md R36）。行为变化：① **Windows ACL「跳过」语义彻底清除**——callback/object/callback-object 允许型 ACE 的 trustee 按 winnt.h 布局解析并纳入可信集判定（此前一概跳过即不可信账户藏身其上可绕过启动检查）；拒绝型只收权不授权、不参与放行判定；无法判定/解析失败的 ACE 类型一律按检查失败拒绝启动（判定核心 `config_acl.go` 平台无关纯函数，5 新用例任意平台覆盖）；② MCP 空 POST、带 Last-Event-ID 的 POST 返回中文错误体（状态码不变），text/plain 未收录英文文案兜底「请求处理失败」不再透出；③ `token create`/`user` 各子命令/`token list`/`token revoke` 收到多余位置参数即退出码 2、零变更（`token create <用户名> extra -expires <未来>` 此前会把 -expires 静默忽略后照签长期 token，已堵死）。验证：vet/gofmt 零输出、218 用例全绿（+7）、make cross 三平台、node --check 过；二进制冒烟（CLI 多余参数 exit 2 零签发、TLS 实例两条 MCP 路径实测中文、R34 已验收面回归不回退）全过。
+
+## 三、验证汇总（2026-10-08，m1b-c2-fix2 后）
+
+- `go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` **218 用例全绿**（13 包：cmd/console 9、agent 14、collect 35、agentdisc 9、auth 10、config 31、headscale 12、mcpserver 11、meshview 7、panel 9、pki 13、registry 27、store 31；两轮修复轮共新增 16：R34 9——签发竞态交错 2、Windows ACL 判定 3、安全头包装 1、token flag 解析 1、MCP SDK 错误中文化 1、任务快照一致性 1；R35→fix2 7——ACE 分类/整链 5、MCP 错误路径 1、多余位置参数 1）；`make cross` 三平台通过；`node --check` 过 + 面板轮询 DOM 桩冒烟过。
+- 二进制级 E2E 16 项实过（REVIEW.md R32「验证记录」）+ 修复轮 E2E 冒烟（REVIEW.md R34/R36「验证记录」）：登录/改密撤销/重登、MCP 中文错误与六工具与 list_agent_tasks 契约、404/401 安全头实测、agent 注册心跳兼容；fix2 另实测空 POST/Last-Event-ID POST 中文、CLI 多余位置参数拒绝。
+- M1b-c 及更早已验收项无回退（既有用例全部保持通过；SPEC 点名用例原样绿）。
+
+---
+
 # DELIVERY — M1b-c 交付说明（亮色主题 + Agent 任务监测 / agent 中台）
 
 > 交付人：zcode · 2026-10-08

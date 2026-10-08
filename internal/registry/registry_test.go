@@ -30,7 +30,7 @@ func newTestHandlerWithTokens(t *testing.T, tokens ...config.RegistrationToken) 
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return New(st, slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), tokens), st
+	return New(st, slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), tokens, nil), st
 }
 
 func doReq(t *testing.T, h *Handler, path, bearer string, body any) *httptest.ResponseRecorder {
@@ -39,6 +39,9 @@ func doReq(t *testing.T, h *Handler, path, bearer string, body any) *httptest.Re
 	h.RegisterRoutes(mux)
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(b))
+	// 模拟回环来源：生产 agent 恒来自 tailnet/私网（默认允许网段）；
+	// httptest 默认 192.0.2.1 属 TEST-NET，会被来源收敛正确拒绝。
+	req.RemoteAddr = "127.0.0.1:40000"
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
@@ -53,6 +56,7 @@ func doRawReq(t *testing.T, h *Handler, path, bearer, body string) *httptest.Res
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:40000"
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
@@ -194,6 +198,7 @@ func TestRegisterBadBody(t *testing.T) {
 	h.RegisterRoutes(mux)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/agent/register", strings.NewReader("{not json"))
+	req.RemoteAddr = "127.0.0.1:40000"
 	req.Header.Set("Authorization", "Bearer "+regToken)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

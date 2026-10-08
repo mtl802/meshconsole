@@ -461,24 +461,39 @@ func (q *Query) Agents(ctx context.Context, nodeName string) ([]Agent, error) {
 // 失联或快照超 taskStaleAfter 未刷新的任务打 Stale 标记（R27-#3：离线/扫描
 // 失败节点的旧任务不冒充运行中）。
 func (q *Query) AgentTasks(ctx context.Context, nodeName string) ([]AgentTask, error) {
-	rows, err := q.st.ListAllAgentTasks(ctx)
+	tasks, _, err := q.AgentTasksSnapshot(ctx, nodeName)
+	return tasks, err
+}
+
+// AgentTasksSnapshot 为 AgentTasks 的完整形态（R31-#2 → R33-#7）：任务清单与
+// 节点截断标记（涉及节点的 tasks_truncated 并集，按 nodeName 过滤口径）在
+// store 单只读事务内一次取得——并发心跳不再出现「旧任务清单配新截断标记」。
+// 返回值 truncated 恒有意义（无涉及节点 = false）。
+func (q *Query) AgentTasksSnapshot(ctx context.Context, nodeName string) ([]AgentTask, bool, error) {
+	rows, nodes, err := q.st.ListAgentTaskSnapshot(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	names, err := q.st.NodeNameIDMap(ctx)
-	if err != nil {
-		return nil, err
-	}
-	nodes, err := q.st.ListNodes(ctx)
-	if err != nil {
-		return nil, err
-	}
+	names := make(map[int64]string, len(nodes))
 	statusByID := make(map[int64]string, len(nodes))
 	for i := range nodes {
+		names[nodes[i].ID] = nodes[i].Name
 		statusByID[nodes[i].ID] = nodes[i].Status
 	}
 	staleCutoff := time.Now().Add(-taskStaleAfter).Unix()
 	out := make([]AgentTask, 0, len(rows))
+	// 截断并集沿用原口径（R29-#3）：按「过滤后涉及节点」计，不依赖任务行
+	// ——被截断节点当前零任务时标记仍为 true（其清单语义不因空快照翻转）。
+	truncated := false
+	for i := range nodes {
+		if nodeName != "" && nodes[i].Name != nodeName {
+			continue
+		}
+		if nodes[i].TasksTruncated {
+			truncated = true
+			break
+		}
+	}
 	for _, r := range rows {
 		name, ok := names[r.NodeID]
 		if !ok || (nodeName != "" && name != nodeName) {
@@ -488,7 +503,7 @@ func (q *Query) AgentTasks(ctx context.Context, nodeName string) ([]AgentTask, e
 		t.Stale = statusByID[r.NodeID] != "online" || r.UpdatedAt < staleCutoff
 		out = append(out, t)
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // Status 汇总全网状态（get_mesh_status 输出）。

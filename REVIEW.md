@@ -508,3 +508,122 @@
 **收口理由**：① codex 判「修改后通过」，R29 全部阻塞清零，残余仅 2 条边界场景建议（fetch 挂起、并发读窗口），不影响主功能正确性；② 3 轮收敛护栏制度要求到此为止，避免建议级意见无限循环消耗修复预算；③ 174 用例全绿 + 三平台编译通过 + 主链路符合 SPEC，质量已达提交线。残余意见转入 M1b-c2/M1d 候选清单，随后续批次处理。
 
 **COMMIT_OK 授权**：本裁决 touch COMMIT_OK，worker 执行本地 git commit（无 push）。理由：多设备开发约定「未提交的本地代码等于丢失」，收口即锁定成果；commit 为本地操作、git 可回退，若伦哥对收口有异议可 git reset 回退。R27-R31 全程无 push，远端推送仍等伦哥指令。
+
+## R32 · zcode 交付轮 m1b-c2（2026-10-08 完成）
+
+**SPEC-M1b-c2 v4 定稿全条款实现完毕**（§0 DESIGN 同步、§1 账号体系、§2 公网 MCP、§3 中文化、§4 公网门槛与数据权限、§5 来源收敛、§6 SAN 校验、§7 listen/并发闸、§8 runbook 入 DELIVERY）。验证口径：`go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **202 用例全绿**（基线 174 + 本轮新增/改造；13 包全 ok）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过、`node --check` 面板 JS 过、二进制级 E2E 验收矩阵 16 项实过（见下）。未执行 git commit。
+
+### 实现说明（按 SPEC 条款）
+
+| 条款 | 落点 |
+|---|---|
+| §1 migration | `internal/store/store.go` migration **v6**（users/sessions/api_tokens；token_hash 主键/唯一索引）。**序号偏差声明：SPEC 原文「migration v5」与 R27-#4 已占用的 v5（nodes.tasks_truncated）冲突，按既有序号顺延为 v6，表结构以 SPEC 为准** |
+| §1 CLI | `cmd/console/usercmd.go`：`user add/passwd/disable/enable`（交互口令两遍确认，x/term ReadPassword，无明文参数路径）+ `token create/list/revoke`（明文仅显示一次）。CLI 先跑 migration 再操作（`store.Open` 内置）；stdio MCP 仍 `OpenReadOnly` 不迁移 |
+| §1 认证常开 | 认证无开关、所有网络形态生效：`internal/auth`（Manager）+ `internal/panel` 会话守卫——未登录一律 302 /login（含 /api/panel/*）；豁免显式：GET /login、POST /login（登录动作，SPEC 豁免清单的 login 资源含其动作面，受登录防护约束）、静态资源（/glass.css、/app.js）、GET /healthz |
+| §1 会话 | 256bit token（服务端只存 SHA-256）；Cookie `mc_session` Path=/、host-only 不设 Domain、HttpOnly、Secure、SameSite=Lax；滑动续期节流 ≤1 次/小时/会话；**绝对期限 30 天**（created_at 基点，续期不越过）；改密/disable 单事务撤销该用户全部 session+api_tokens（`store.ChangeUserPassword/SetUserEnabled`）；disable 最后一个启用用户拒绝（`ErrLastEnabledUser`） |
+| §1 登录防护 | per-IP 5 次失败/分 → 429（滑动窗，IP 条目 cap 4096，触顶淘汰最旧）；**全局 bcrypt 并发 ≤2**（闸满排队 ≤32 人、等待 ≤5s，超限 429）；未知用户名执行 dummy bcrypt（同成本时序填充，惰性生成一次） |
+| §2 MCP HTTP | **选型：官方 go-sdk v1.8.0（go.mod 锁定，本就为 M1b-b 依赖，本次无版本变更）**。`StreamableHTTPOptions{Stateless: true, JSONResponse: true}` 即 SPEC 指定的 JSON 同步响应模式（仅 POST、无 SSE 流、GET/DELETE 405），与 WriteTimeout 30s 无冲突——手写回退路径不需要。**兼容客户端声明：实现 MCP Streamable HTTP 传输（2025-06-18 及之后规范）的任意客户端**（HanaAgent MCP connector、Claude 等标准 MCP 客户端）；body 上限 1MB（SDK MaxRequestBodyBytes 强制）。Bearer api_token 哈希查表 + 应用层 constant-time 复核 + 用户启用态 + 到期校验（401 中文化、不泄露工具列表）。**MCP 独立 semaphore 4**、超出 429 不排队，与 overview 的 8、agent API 的 64 三闸独立 |
+| §3 中文化 | 面板 UI 全量（导航/仪表/空态/任务卡/终端卡/登录页/页脚，`index.html`/`login.html`/`app.js`；状态值翻译只在渲染层，API/DB 值保持英文机器契约）；用户可见 API 错误（registry 全部错误体、面板/登录/MCP 错误体，agent 仅按状态码分支不解析文本、已核实无兼容影响）；MCP description/error 本就中文（M1b-b），HTTP 层错误中文化。代码注释与结构化日志键保持英文 |
+| §4 公网门槛 | `cmd/console/main.go publicModeGate`：实际绑定地址（listener 解析结果）非 {127/8, ::1}（`net.IP.IsLoopback` 内建 IPv4-mapped 规范化）→ 公网模式，逐项检查（≥1 启用用户 / config 普通文件+0600+属主 `config.CheckConfigFileSecurity`（Windows 仅普通文件，ACL 等价约束如 requireKeyPerms 先例）/ Host 白名单非空），任一失败拒绝启动且错误指明原因与 remediation。**数据文件权限：`store.Open` data 目录 0700（MkdirAll 后显式 Chmod 收紧）、DB/WAL/SHM 0600（WAL/SHM 由 SQLite 沿用主库权限位，既有旧文件就地收紧）** |
+| §5 来源收敛 | `registry.sourceFilter`：RemoteAddr ∈ 允许网段放行、公网 403（中文化错误体）；缺省={127/8, ::1, 10/8, 172.16/12, 192.168/16, 100.64/10}（IPv4-mapped 先 To4 规范化）；`agent_allowed_cidrs` 覆写（nil=缺省；显式空=仅回环）；token 校验独立保留；不读任何转发头 |
+| §6 SAN | `pki.NormalizeSANs`：IP 字面量 → IP SAN（v4/v6）、合法 DNS → DNS SAN（小写去尾点）、URL/端口/CIDR/空值/非法字符**显式报错**（修复旧 ExtraIPs 静默跳过）、规范化去重保序；`Ensure` 在任何 PKI 写入（含 MkdirAll）之前统一校验；`Config.ExtraDNS/ExtraIPs` 移除（本就无调用方），替换为 `ExtraSANs []string`；追加/变更 SAN 自动判重签。部署值 `tls_extra_sans: ["1.13.158.180"]` 样例入配置注释 |
+| §7 listen/并发 | overview semaphore 8（`panel.limitConcurrent`）；MCP semaphore 4（上条）；listen 公网部署值 0.0.0.0:7700 入 runbook（回环缺省不变）；no-store/nosniff 全链（面板 guard、healthz、MCP——SDK 自写 `Cache-Control: no-cache, no-transform`，`noStoreWriter` 在 WriteHeader 拦截点覆盖为 no-store 保证字面口径） |
+| §8 runbook | DELIVERY.md M1b-c2 节（部署步骤 + 客户端更新顺序 + 验收矩阵 + 回滚） |
+
+### 裁决遵循与实施要点
+
+| # | 事项 | 口径 |
+|---|---|---|
+| 1 | go-sdk v1.8.0 能力核验 | SDK 该版 `StreamableHTTPOptions` 已含 `Stateless`（SEP-2567 sessionless 方向）与 `JSONResponse`（§2.1.5 JSON 模式）——SPEC 双路径（SDK 优先/手写回退）取 SDK 路径即得 JSON 同步响应模式，无 SSE、无会话表 |
+| 2 | 新依赖 | `golang.org/x/crypto v0.57.0`（bcrypt cost 10）+ `golang.org/x/term v0.46.0`（交互口令），x/net v0.59.0 等既有依赖未动 |
+| 3 | E2E 发现并修复 ① | `normalizeHostList` 原实现把裸 IPv6 条目 `::1` 误判非法（url.Parse 无法解析多冒号 authority）——改为 IP 字面量 ParseIP 直通（方括号先剥离、ip.String() 规范化），单测+样例配置双覆盖 |
+| 4 | E2E 发现并修复 ② | SDK 覆写 Cache-Control（见 §7 行）——`noStoreWriter` 拦截修复，成功路径断言进 http_test |
+| 5 | 验收「错密码 429」口径 | 前 5 次失败 401（统一文案「用户名或密码错误」，未知用户/错密码/禁用不区分防枚举），第 6 次 429；限流先于凭据校验（窗口内正确密码同样 429） |
+| 6 | stdio MCP 不变 | 仍 `OpenReadOnly`（mode=ro + query_only=1），不迁移、零写路径；六只读工具复用 |
+
+### 验证记录（m1b-c2）
+
+- `go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` **202 用例全绿**（cmd/console 6、agent 14、collect 35、agentdisc 9、config 23、headscale 12、mcpserver 9、meshview 6、panel 9、pki 13、registry 27、store 31、auth 8；13 包全 ok）。
+- `make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`make build` 版本 `m1b-c2+git_<hash>`。
+- `node --check` 面板 JS 过。
+- **二进制级 E2E**（本机 /tmp/mc-e2e，端口 17801，TLS + 真实 CA 链验证、未用 -k）：匿名 / 与 /api/panel/overview 302→/login 且无业务数据泄露；登录页中文；healthz ok；静态匿名 200；MCP 无 token 401 中文化不泄露工具名；错密码 ×5 → 401、第 6 次 **429**；登录成功 Set-Cookie（HttpOnly/Secure/Path=/）→ 面板中文（运行中的 agent 任务/受管服务/登出）→ overview 200 含真实节点与任务；登出后会话即失效；MCP 带 token initialize/tools/list（6 工具全中文 description）/tools/call list_agent_tasks 返回真实心跳数据；agent 注册（一次性 token 用后即废：二次注册 401）+ 心跳 + 跨节点 403「节点身份不匹配」；数据文件 data 0700 / DB/WAL/SHM 0600 实测；服务日志仅 WARN/INFO 结构化键英文、无凭据材料。
+- 公网形态门槛未在本机实跑公网绑定（沙箱无公网地址）——判定与检查逻辑由 `TestPublicModeGate`（0.0.0.0 addr × 无用户/0644 config/缺失 config/全过四态）钉住；上机验证列 DELIVERY 部署上机项。
+
+## R33 · codex 审查 m1b-c2 + 裁决：派修复轮（2026-10-08 18:20，值班员执行）
+
+**结论：不通过 → 派 m1b-c2-fix（本任务修复轮 1）。** codex 审查 m1b-c2（review-m1b-c2.out）判不通过：2 条阻塞 + 3 条新建议 + 2 条 R31 候选沿用。独立验证面全绿（202 用例、vet/gofmt、三平台、JS 语法），codex 全程未修改仓库文件。m1b-c2 为新交付任务首轮审查，修复轮计数 0→1，未触 3 轮护栏；两条阻塞均首次出现，未触「同条修两次不过」升级。
+
+### 裁决（Hana，值班员自主）
+
+| # | 级别 | 意见 | 裁决 | 口径 |
+|---|------|------|------|------|
+| 1 | 阻塞 | auth.go:231,262 + store/auth.go:224 会话签发竞态——登录读旧哈希后改密事务先完成撤销，登录仍插入有效会话，旧密码绕过撤销 | 采纳修复 | 签发事务内复核密码版本与启用态，不一致回滚；并发语义用测试钉死。安全类阻塞零容忍 |
+| 2 | 阻塞 | config.go:490 Windows 直接放行未查 ACL/属主，违反 SPEC §4；部署提醒不能替代启动门槛 | 采纳修复 | Windows 实装 ACL/属主检查，不可检查即按失败拒绝启动（公网形态）。§4 是公网门槛启动闸门，必须真实执行 |
+| 3 | 建议 | mcpserver/http.go:74 SDK 错误英文原样输出（unknown tool 等），§2/§3 中文化未完成 | 采纳修复 | 错误类型映射中文错误体，不泄露内部细节与工具清单 |
+| 4 | 建议 | main.go:319 + registry.go:166 安全头未覆盖 agent API 与 mux 默认错误响应，§7「全链」未满足 | 采纳修复 | 全局 ResponseWriter 包装覆盖错误路径，agent 兼容性不回退 |
+| 5 | 建议 | usercmd.go:208 忽略 flag 解析错误，-expires 缺值/拼错仍签发永久 token | 采纳修复 | 解析失败报错退出，不签发 |
+| 6 | 建议·R31 候选 | app.js:638,646,654 fetch 挂起不冻结、轮询叠加 | 采纳修复（核销候选） | R31 裁决口径原样执行：lastGoodAt 新鲜度检查 + AbortController 超时 + 轮询防重入。R31 已预告去向 M1b-c2 批次，本轮顺带核销，终止沿用噪声 |
+| 7 | 建议·R31 候选 | mcpserver.go:144,154 任务清单与截断标记分次读取，快照错配 | 采纳修复（核销候选） | 同一读事务取得，R31 口径。同 #6 一并核销 |
+
+**修复轮范围**：7 条全部 → 派 m1b-c2-fix（值班员 nohup pipeline-run.sh 直接派发，不占 NEXT-TASK 队列）。验证口径不变：vet/gofmt/test 全绿 + cross 三平台 + node --check，m1b-c2 已验收面（E2E 矩阵、SPEC 已核销条款）不回退。若修复后复审仍有建议级残余，按既有口径转候选或收口，阻塞级零容忍。
+
+## R34 · zcode 修复轮 m1b-c2-fix（2026-10-08 完成）
+
+**R33 裁决 7 条全部按口径修完**（2 阻塞 + 3 建议 + 2 条 R31 候选顺带核销）。修复后 `go vet ./...` 零输出、`gofmt -l` 无文件（1.26.0/1.26.8 两版工具链 gofmt 结论一致）、`go test -count=1 ./...` **211 用例全绿**（修复前基线 202 + 本轮新增 9：cmd/console 2、auth 2、config 3、mcpserver 1、meshview 1；13 包全 ok）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过（windows/amd64 即新 ACL 代码的编译验证）、`node --check` 面板 JS 过 + Node DOM 桩冒烟（防重入/超时 abort/冻结/恢复四段全断言，连跑 5 遍稳定）通过、二进制级 E2E 冒烟（登录→overview→改密撤销→重登、agent 注册/心跳、MCP 未知工具中文/六工具/list_agent_tasks、404 与 401 拒绝路径安全头实测携带）通过。未执行 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞：会话签发竞态绕过改密撤销。方案按裁决示例落 **password_version**：`internal/store/store.go:371` migration **v7**（`users.password_version INTEGER NOT NULL DEFAULT 1`，序号顺延声明与 v6 同口径）；`internal/store/auth.go:179` ChangeUserPassword 与 `:206` SetUserEnabled（仅禁用向）同事务递增版本；**`:246` CreateSession 重写为单条条件插入**——`INSERT INTO sessions … SELECT … FROM users WHERE id=? AND password_version=? AND enabled=1`，0 行受影响即 `ErrSessionIssuanceDenied`（`:30` 新增）：条件求值与会话插入同为一条语句原子完成，改密/禁用事务在「凭据校验后、签发前」提交必然使版本/启用态失配，旧凭据签不出活会话（单写连接下写事务天然串行，无 read-then-write 升级窗口）。`internal/auth/auth.go:274-283` Login 传入 `u.PasswordVersion` 并把该错误并入统一 401 文案（记 Warn 留痕）；`:97-99/:264-267` `afterValidate` 测试钩子（凭据校验后、签发前注入，生产恒 nil，一个 nil 判断开销）供交错单测确定性复现「事务间隙」。测试钉死并发语义：`auth_test.go:265` TestLoginRacePasswordChange（钩子里抢先改密 → 登录必须 ErrInvalidCredentials+空 token+零会话行，新密码照常登录拿活会话）、`:305` TestLoginRaceDisable（钩子里抢先禁用 → 同口径拒绝）；store 层 `TestChangePasswordRevokesAllCredentials`/`TestDisableRevokesAndLastEnabledProtected` 扩断言版本递增、旧版本拒签、禁用态持最新版本仍拒签（enabled 条件独立生效）、重新启用后恢复签发 |
+| 2 | 阻塞：Windows config 安全检查直接放行。`internal/config/config.go:484` CheckConfigFileSecurity 重构为「普通文件 + 平台钩子」；**`config_owner_windows.go:18` checkConfigPlatformSecurity 实装**（golang.org/x/sys/windows v0.48.0 转直接依赖，go.mod 更新）：`GetNamedSecurityInfo(OWNER|DACL)` 取安全描述符——属主须为当前进程用户或 BUILTIN\Administrators；DACL 中每条生效（非 INHERIT_ONLY）的 ACCESS_ALLOWED_ACE trustee 须 ∈ {当前用户, SYSTEM, Administrators}；**无法取得安全描述符/属主/DACL（含 NULL DACL=人人可访问）、读 ACE 失败一律按检查失败返回错误**，公网形态拒绝启动且错误带 `icacls … /inheritance:r` remediation。判定核心抽为平台无关纯函数 `config.go:500` aclVerdict（ownerSelfOK + allowTrustees + trusted 集合），单测 `config_acl_test.go` 三用例（放行形态×5、属主不合规、Everyone/Users/陌生 SID trustee 拒绝+remediation 关键词）在任意平台覆盖错误路径；macOS/Linux 口径不变（`config_owner_unix.go` 仅重组不动语义，0600/属主报错文案逐字保留）。Windows 真机核验列部署上机项（判定函数已测、薄封装交叉编译过） |
+| 3 | 建议：MCP HTTP SDK 错误中文化。SDK 未提供错误定制钩子（核查 v1.8.0 ServerOptions/StreamableHTTPOptions），在 HTTP 层拦响应：`internal/mcpserver/http.go:101` zhErrorWriter 缓冲 SDK 响应（cap 1MB，超限/流式 Flush 即放弃翻译原样透出），`:174` translateSDKBody 按 Content-Type 分派——application/json 解 JSON-RPC 信封，**仅替换 error.message，code/id/data 原样保留**（协议层兼容）；`:220` translateSDKErrorMessage 闭合集类型映射：`unknown tool`→「未知工具：请求的工具不存在（可用 tools/list 获取清单）」（不回显请求名、不泄露清单）、ParseError/InvalidRequest/MethodNotFound/InvalidParams 按码映射、unsupported protocol version/会话未初始化/重复请求 ID 按签名映射、未知错误统一「请求处理失败」；text/plain 覆盖 SDK `http.Error` 固定文案（Method Not Allowed/JSON RPC not handled/malformed payload/body exceeds/invalid Host 等 10 形态）。安全头链不变（noStoreWriter 仍在链上，落笔点后移语义不变）。测试 `http_test.go:174` TestMCPSDKErrorChinese：未知工具中文且无 SDK 原文/无工具名泄漏/code 保留 -32602、未知方法中文、非法帧中文、GET 405 状态与文案中文；二进制 E2E 实测 unknown tool 中文 |
+| 4 | 建议：安全头覆盖缺口。`cmd/console/main.go:326` root handler 以 `secureHeaderWriter`（`:459`）包装 mux 出口——WriteHeader 拦截点强制写入 `Cache-Control: no-store` + `X-Content-Type-Options: nosniff`（覆写语义，与既有各 handler 自设头一致），隐式 200（直接 Write）与 Flush 透传同覆盖；mux 默认 404/405、agent API 全部拒绝路径（401/403/413/503）一并命中，无遗漏路径；agent 仅按状态码分支不解析响应头（SPEC §3 已核实），兼容性不回退。测试 `main_m1bc2_test.go:105` TestSecureHeaderWriter（显式 403/隐式 200/mux 404/mux 405 四态断言）；二进制 E2E 实测 404 与 heartbeat 401 路径两响应头在场 |
+| 5 | 建议：usercmd 忽略 flag 解析错误。`cmd/console/usercmd.go:210` `token create` 的 `fs.Parse` 返回值接住——解析失败打印「未签发任何 token」并 exit 2（flag 包已回显具体解析错误）；`-expires` 缺值/未知 flag 不再滑向「无到期=长期有效」的签发。`-expires` 值本身的格式/过去时刻校验原本就在签发前报错退出（既有路径复核保持）。测试 `main_m1bc2_test.go:219` TestTokenCreateFlagParseError：缺值/未知 flag/尾随 flag 三形态 exit 2 且**库中零 token**（解析失败路径不得落任何凭据）+ 合法 -expires 对照正常签发 |
+| 6 | 建议·R31 候选核销：面板 fetch 挂起不冻结、轮询叠加。`internal/panel/web/app.js` tick 重写（`:644`），R31 裁决三件套全落：① **新鲜度独立校验**——每次 tick 先行校验 `Date.now()-lastGoodAt > FETCH_STALE_MS(90s)` 即 `renderStaleSnapshot()`，不依赖 catch（fetch 挂起/慢响应照冻）；`staleShown` 去重标记（`:631`）保证一轮失联只渲一次，避免「冻结行/crit 行」逐拍互斥闪烁，crit 文案由 catch 维持；② **fetch 超时**——`FETCH_TIMEOUT_MS=10s`（`:625`）AbortController 强制收敛，挂起请求至多占用一拍，`AbortError` 显示「请求超时」；③ **轮询防重入**——`tickInflight` 标记（`:628`）前序未返回不叠发（与超时配合不死锁）。Node DOM 桩冒烟四段断言（挂起窗口内不叠发→超时 abort→过线冻结 crit→恢复续轮询）连跑 5 遍稳定；`node --check` 过 |
+| 7 | 建议·R31 候选核销：list_agent_tasks 快照错配。store 层新增 `internal/store/store.go:1178` `ListAgentTaskSnapshot`——**单只读事务**（read 池 BeginTx，WAL 快照）一次取 `agent_tasks` 全表与 `nodes` 状态表（status/tasks_truncated 同批）；扫描器抽 `scanAgentTaskRowsFrom`/`scanNodeRecordsFrom`（`queryContext` 接口统一 *sql.DB/*sql.Tx）。meshview 层 `internal/meshview/meshview.go:472` 新增 `AgentTasksSnapshot(ctx, node) (tasks, truncated, error)`：名称/状态 join、stale 标记、截断并集（**按过滤后涉及节点计**，沿用 R29-#3 口径——被截断节点零任务时标记仍 true）全部出自同一快照；`AgentTasks` 变为其薄封装（overview 同源受益，零新 SQL）。`internal/mcpserver/mcpserver.go:147` handler 删除第二次 `q.Nodes` 读取改调快照方法。测试 `meshview_m1bc_test.go:110` TestAgentTasksSnapshotConsistency（全网/按节点/未知节点/零任务截断节点四态 + AgentTasks 包装回归）；既有 `TestCallListAgentTasks(Truncated)` HTTP/stdio 两侧语义原样绿 |
+
+**验证记录（m1b-c2-fix）**：`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` 全绿（**211 用例**：cmd/console 8、agent 14、collect 35、agentdisc 9、auth 10、config 26、headscale 12、mcpserver 10、meshview 7、panel 9、pki 13、registry 27、store 31）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` 与 DOM 桩冒烟通过。二进制级 E2E 冒烟（/tmp 临时实例，已清理）：表单登录 302 → overview 200；`/no/such/path` 404 与 heartbeat 无 token 401 均带 no-store/nosniff；MCP 无 token 401 中文、unknown tool 返回「未知工具」中文且 code=-32602 保留、tools/list 六工具齐备、list_agent_tasks 走新快照路径返回 `{"tasks":[],"tasks_truncated":false}` 契约形态；agent 注册（一次性 token）+ 心跳 200 兼容不回退；`user passwd` 后旧会话 302、旧 MCP token 401、新密码重登 200（改密撤销链 + 版本复核放行正常凭据）。对用户可见的行为变化：① 「改密/禁用的瞬间正在进行的登录」不再可能拿到活会话（此前存在竞态窗口）；② Windows 公网形态 config ACL/属主检查真实执行（此前仅普通文件校验即放行），取不到 ACL 即拒绝启动；③ MCP SDK 层英文错误（unknown tool 等）改为中文错误体（code 保留）；④ 全部 404/405/agent 拒绝路径响应携带 no-store/nosniff；⑤ `meshconsole token create` 参数拼错/缺值即退出码 2 且不签发；⑥ 面板 fetch 挂起 10s 后超时重试、超 90s 冻结、不再叠加轮询请求；⑦ migration v7 自动执行（users 增 password_version 列）。
+
+## R35 · codex 复审 m1b-c2-fix + 裁决（2026-10-08 19:24，值班员执行）
+
+**结论：不通过（3 条残余），全部采纳修复 → 派 m1b-c2-fix2。** codex 复审 m1b-c2-fix（review-m1b-c2-fix.out，47,823 tokens）判**不通过**：R33 七项核销 4 关 3 缺——阻塞 #1 会话竞态核销关闭（password_version 条件插入 + 交错测试确认），建议 #4 安全头、#6 轮询挂起、#7 快照错配均核销关闭；残余 3 条：阻塞 #2 Windows ACL 跳过非普通允许型 ACE（callback/object ACE 可携带不可信 trustee 仍过启动检查）、建议 #3 zhErrorWriter 未覆盖未匹配错误/空 POST/Last-Event-ID POST 路径、建议 #5 token create 未拒绝多余位置参数（`token create lunge extra -expires <未来>` 在 extra 停止解析仍签长期 token）。验证独立复核全绿（go test -count=1 全绿、vet、gofmt、JS 语法），全程未修改仓库文件。值班员逐条抽验源码后裁决如下。
+
+### 裁决（Hana，值班员自主）
+
+| # | 级别 | 意见 | 裁决 | 口径 |
+|---|------|------|------|------|
+| 1 | 阻塞 | config_owner_windows.go:56 跳过所有非普通允许型 ACE（callback/object 允许型 ACE 同样可授访问权），不可信 trustee 藏于此类 ACE 即绕过启动检查 | 采纳修复（第 2 次修复） | 安全类阻塞零容忍（R33 口径不变）：callback/object 允许型 ACE 的 trustee 须正确解析并纳入可信集判定；无法判定/解析失败的 ACE 类型一律按检查失败拒绝启动（公网门槛安全侧默认拒绝，不允许静默放行）。**返工计数：R33-#2 首修未关闭，本轮第 2 次修复，复审仍不过即触发「同条修两次不过」上限请示伦哥** |
+| 2 | 建议 | http.go:215 未匹配错误原样透出；空 POST 返回 `POST requires a non-empty body`、带 Last-Event-ID 的 POST 返回英文，SPEC §2/§3 未闭合 | 采纳修复 | 延续 R34-#3 闭合集映射口径：zhErrorWriter 覆盖面补齐——未匹配错误、空 POST、Last-Event-ID POST 三条路径全部中文化，JSON-RPC code/协议语义不变，不泄露内部细节 |
+| 3 | 建议 | usercmd.go:210 未检查 fs.NArg()：多余位置参数使解析提前停止，后续 -expires 被忽略仍签发长期 token | 采纳修复 | 解析后校验剩余位置参数（fs.NArg() == 期望值），多余即报错退出 2、零签发——与 R34-#5「解析失败路径不得落任何凭据」口径一致 |
+
+**返工计数**：#1 第 2 次修复（首修未关闭，未触上限——该条件指修两次仍不过）；#2/#3 均第 2 次修复（R34 首修部分关闭）。修复轮计数：m1b-c2-fix 第 1 轮完成、m1b-c2-fix2 第 2 轮，未触 3 轮收敛护栏（第 3 轮无论意见多少强制收口转候选）。
+
+**修复轮范围**：本表 3 条全修 → 派 m1b-c2-fix2（值班员 nohup pipeline-run.sh 直接派发，不占 NEXT-TASK 队列）。验证口径不变：vet/gofmt/test 全绿 + cross 三平台 + node --check，m1b-c2-fix 已验收面（R34 七项已核销部分、E2E 矩阵）不回退。COMMIT_OK 不授（复审未通过）。禁止 git commit。
+
+## R36 · zcode 修复轮 m1b-c2-fix2（2026-10-08 完成）
+
+**R35 裁决 3 条（1 阻塞 + 2 建议）全部按口径修完**。修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **218 用例全绿**（m1b-c2-fix 基线 211 + 本轮新增 7：config 5、mcpserver 1、cmd/console 1；13 包全 ok）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过（windows/amd64 即新 ACE 解析代码的编译验证）、`node --check` 面板 JS 过。二进制级冒烟：CLI `token create lunge extra -expires <未来>` 实测 exit 2 且零签发、合法形态照常签发；真实 TLS 实例上空 POST → 400「请求体不能为空」、带 Last-Event-ID 的 POST → 400 中文提示，SDK 原文均不在场；回归面 tools/list 六工具中文 description、unknown tool 中文且 code=-32602 保留、404 携带 no-store/nosniff 均不回退。未执行 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞（第 2 次修复）：Windows ACL 跳过非普通允许型 ACE。**「跳过」语义彻底清除**（R35-#1）：新增平台无关判定层 `internal/config/config_acl.go`——`classifyDACLACE`（`:61`）按 winnt.h 字节布局分类单条 DACL ACE：普通(0x00)/callback(0x09)/object(0x05)/callback-object(0x0B) 四类允许型全部解析 trustee（callback 型与普通型同布局仅 SID 后多回调数据；object 型按 Flags 位各 16 字节 GUID 推 SidStart 偏移），reject 型(0x01/0x06/0x0A/0x0C)归 `aceDenyIgnore`——**拒绝型只收权不授权、不构成「不可信账户获权」通道，故不参与放行判定（注释明示，判据仍是 aclVerdict 的「每条生效允许型 trustee ∈ 可信集」）**；INHERIT_ONLY（不作用于本对象）与类型无关跳过；未知类型（系统 SACL 类/保留/未来型）、尺寸撒谎（<8 / 越给定字节 / object 型缺 Flags 字段）、SID 区间越界（头越界 / SubAuthorityCount 谎报）一律 `aceUnparsableFail`——安全侧默认拒绝，无「看不懂就跳过」路径。`daclAllowTrustees`（`:117`）整链枚举，任一 ACE 无法判定即报错带下标。Windows 薄封装 `config_owner_windows.go:53` 起重写：GetAce 枚举 → 原始字节切片（AceSize 下限前置校验）→ daclAllowTrustees → SID.IsValid 校验后字符串化 → 既有 aclVerdict；无法判定条目的错误文案含「callback/object 等允许型 ACE 同样可授予访问权，按检查失败处理」+ icacls remediation。测试 `config_acl_test.go` 新增 5 用例（平台无关）：四类允许型 ×（0–2 GUID 形态 × 有/无回调数据）trustee 解析一致、**callback/object 允许型藏 Everyone 必被 aclVerdict 拒绝（阻塞场景纯函数层钉死）**、四类拒绝型归 ignore、INHERIT_ONLY 各型跳过、未知类型与五类解析失败全 fail、整链混排（可信普通+拒绝型+callback 允许+INHERIT_ONLY+callback-object）trustee 集正确且混入未知类型报错带下标；Windows 真机核验仍列部署上机项 |
+| 2 | 建议（第 2 次修复）：MCP 错误中文化覆盖缺口。`internal/mcpserver/http.go` `translateSDKBody`（`:176`）text/plain 闭合集补齐 + 收口（R35-#2）：新增空 POST `POST requires a non-empty body`→「请求体不能为空」、Last-Event-ID POST `can't send Last-Event-ID for POST request`→「POST 请求不支持 Last-Event-ID（该头仅用于 GET 事件流续传）」两条复审点名映射；**未匹配路由/方法及一切未收录文案不再原样透出**——text/plain 兜底统一「请求处理失败」（SDK 的 text/plain 仅出自 http.Error 错误路径，无成功体经此；与 JSON 路径 translateSDKErrorMessage 默认分支同口径），状态码由 zhErrorWriter 原样保留。三条路径测试 `http_test.go:230` TestMCPHTTPErrorPathsChinese：空 POST 与 Last-Event-ID POST 各断言（状态 400 不变、中文在场、SDK 原文不在场）+ 兜底通用中文断言 + 成功响应不被改写 |
+| 3 | 建议（第 2 次修复）：多余位置参数未拒绝。`cmd/console/usercmd.go`（R35-#3）：`token create`（`:206`，NArg 复核 `:227`）改在 stripConfigFlag 后的 rest 上取用户名与解析 flags，`fs.Parse` 成功后**复核 `fs.NArg()!=0` 即报「未签发任何 token」退出 2**——flag 包遇首个位置参数即停，`token create <用户名> extra -expires <未来>` 此前把 -expires 连同 extra 静默忽略后照签长期 token（R33-#5 只挡了显式解析失败这一半）；`user add/passwd/disable/enable`（`:80`）同样以 rest 复核「仅 <用户名> 一个位置参数」，多余即退出 2 且在打开库之前（零副作用、口令读取不触发）；`token list`（`:276`）不接受位置参数、`token revoke`（`:301`）仅 <id> 一个，多余均退出 2。测试 `main_m1bc2_test.go:261` TestExtraPositionalArgsRejected：`token create` 多余位置参数 × 有/无 -expires 两形态均 exit 2 且**库中零 token**、user add（断言口令读取不被触发）/user disable/token revoke/token list 四形态 exit 2、对照合法 `-expires` 签发正常且 expires_at 确实落库 |
+
+**验证记录（m1b-c2-fix2）**：`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` 全绿（**218 用例**：cmd/console 9、agent 14、collect 35、agentdisc 9、auth 10、config 31、headscale 12、mcpserver 11、meshview 7、panel 9、pki 13、registry 27、store 31）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` 过。二进制级冒烟（/tmp 临时实例，已清理）：`user add`（pty 交互）→ `token create lunge extra -expires 2027-06-30T23:59:59Z` exit 2 且 token list 为空 → 合法 `token create` 照常签发；TLS 实例（loopback + 真实 CA 链）空 POST → 400「请求体不能为空」、Last-Event-ID POST → 400「POST 请求不支持 Last-Event-ID…」，SDK 原文不在场；R34 已验收面回归不回退（tools/list 六工具中文、unknown tool 中文 + code -32602、404 带 no-store/nosniff）。对用户可见的行为变化：① Windows 公网形态 config 含 callback/object 允许型 ACE 时 trustee 照常纳入判定（此前跳过）；DACL 出现无法判定的 ACE 类型/损坏条目即拒绝启动（此前静默跳过）；② MCP 空 POST 与带 Last-Event-ID 的 POST 返回中文错误体（状态码不变），未收录英文错误文案不再透出；③ `token create`/`user`/`token list`/`token revoke` 收到多余位置参数即退出码 2，不产生任何变更。
+
+## R37 · codex 复审 m1b-c2-fix2 + 裁决：3 轮收敛收口（2026-10-08 20:09，值班员执行）
+
+**结论：3 轮收敛收口，实质通过（带 1 条候选残留）。** codex 复审 m1b-c2-fix2（review-m1b-c2-fix2.out）判**不通过**：R35 三项核销 2 关 1 残——阻塞 R35-#1（Windows ACL callback/object 允许型 ACE）**核销关闭**（classifyDACLACE 四类允许型全解析、不可判定即拒绝启动，纯函数测试钉死阻塞场景），建议 R35-#2（MCP 空 POST/Last-Event-ID POST 中文化）**核销关闭**；残余 1 条建议：R35-#3 的 usercmd `stripConfigFlag` **等号写法分支**把 `-config=...` 之后的全部参数静默丢弃（含 `-expires` 与多余位置参数），使 R36 新增的 NArg 校验被绕过——`token create lunge -config=/tmp/c.yaml extra -expires 2027-06-30T23:59:59Z` 被裁成 `create lunge`，仍签发长期 token。验证独立复核全绿（218 用例、vet/gofmt、三平台编译、JS 语法），codex 全程未修改仓库文件。
+
+**护栏触发**：m1b-c2 修复轮已累计 2 轮（m1b-c2-fix、m1b-c2-fix2），本次复审为第 3 轮决策点。按值班制度收敛护栏：**不派 fix3，残余意见全部转候选，收口锁定**。叠加因素：R35-#3 已是第 2 次修复（R34 首修部分关闭、R36 第 2 次修仍未闭合），触发「同条意见修两次不过」升级条件——升级动作并入本次 notify（如实告知伦哥该意见两修未闭合与收口理由），不另派修复轮猜测意图。
+
+### 残余意见裁决（转候选，不阻塞收口）
+
+| # | 意见 | 级别 | 裁决 | 候选口径 |
+|---|------|------|------|----------|
+| 1 | `usercmd.go` stripConfigFlag 等号写法（`-config=值`）分支丢弃该参数之后的全部 argv，`-expires` 被吞仍签长期 token、多余位置参数逃过 NArg 校验 | 建议 | 转候选 | stripConfigFlag 仅剥离 config 参数本身、保留其余后缀（等号后值不与其他参数合并丢弃），补等号写法测试（含 `-config=x extra -expires <未来>` 拒绝、`-config=x -expires <未来>` 正常签发两形态）。属 CLI 参数解析打磨：默认空格写法路径已正确校验（R36 测试过），触发需「等号写法 + 敏感参数在后」组合，非主链路缺陷 |
+
+**收口理由**：① R35 三项中唯一阻塞已彻底关闭（第 2 次修复通过），唯一残余为 CLI 边角建议，触发条件组合苛刻，不影响安全主链路（config ACL 检查、会话竞态、MCP 错误面均已闭合）与主功能正确性；② 3 轮收敛护栏制度要求到此为止，避免建议级意见无限循环消耗修复预算；③ 218 用例全绿 + 三平台编译 + 二进制冒烟（R36 记录）质量已达提交线，与 R31 收口时质量面同构。
+
+**COMMIT_OK 授权**：本裁决 touch COMMIT_OK，worker 执行本地 git commit（无 push）。理由同 R31 口径：多设备开发约定「未提交的本地代码等于丢失」，收口即锁定成果；commit 为本地操作、git 可回退，若伦哥对收口有异议可 git reset 回退。全程无 push，远端推送仍等伦哥指令。候选残留随后续批次（M1b-c3/M1d）处理。
+

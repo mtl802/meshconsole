@@ -43,7 +43,7 @@ func seed(t *testing.T) (*store.Store, string) {
 		},
 		&[]store.AgentRow{
 			{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"},
-		}, nil, false)
+		}, nil, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

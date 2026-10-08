@@ -185,6 +185,38 @@ Origin 头与请求体/连接限额。传输统一 HTTPS：**CA 与证书由首�
   **固定绝对路径的可执行文件**，防 PATH 替换；未映射的 service_id 拒绝
 - 审计记录凭据身份、request_id、授权级别、时间、结果
 
+> **实现注记（M1d，SPEC-M1d 已交付）**——本节协议的落地参数与偏差，详见 DELIVERY.md：
+> - 表：migration **v8**（SPEC 原文 v6，v6/v7 已被账号表占用按序顺延）；
+>   `submission_key` 全局唯一（SPEC 口径，未按本节 identity 绑定——单管理员形态无命名空间冲突面），
+>   幂等窗口 10 分钟 + `archived_key` 归档复用与本节一致；`command_id` 为 uuid v4 主键，永不复用。
+> - 状态机：`pending → claimed（租约 120s）→ running → succeeded|failed`；
+>   **unknown = sweep 产物**（lease×2 无回执，或 running 后 timeout×1.5 无回执，degraded 标记），
+>   unknown 不可再领取（本节"永不自动重发"落地）；租约未过期的 claimed/running 可重领
+>   （重发至终态）。
+>   **租约代次（migration v10，R41-B1 深修）**：commands.`lease_epoch` 首次领取置 1、
+>   过期重领自增——回执归属验证以 epoch 回显匹配为唯一权威令牌（代次严格单调，
+>   本节原 claimed_at 快照在「过期重领落在同一秒」时无法区分代次，epoch 封死该缺口）；
+>   旧代次迟到回执一律拒绝（drop "stale epoch" + console 计数审计，内容不触达新代次
+>   状态），当前代次迟到回执仍可把 unknown 修正为实际终态并保留 degraded 历史。
+>   agent 端对账文件按 `(command_id, lease_epoch)` 命名——旧代次的 drop/ACK/退役
+>   只触达该代次及更早的文件，结构上不可能误删新代次已写入的结果；`ack_ids`/`drop_ids`
+>   条目携带代次，agent 据此清理。
+> - ACK：回执落库置 `result_recorded`，心跳响应 `ack_ids`（含本拍刚落库项）；
+>   agent 收 ACK 才删本地对账文件（state 同目录 commands/，intent/result 两阶段，
+>   按 (command_id, epoch) 一文件），未确认持续重发；重启恢复：intent 无结果 →
+>   补 interrupted 回执 → console 置 unknown 对齐（不重执行）。
+> - 白名单：`internal/cmdkind` 共享包（console/agent 同码双重校验），7 个 v1 kind，
+>   argv 固定绝对路径 + 类型化参数槽（unit 字符集 + 受管集合判定，n 值域），
+>   `l2_extra_commands` 只能参数化已审核 kind；执行环境固定最小 env/固定 cwd/直接 exec。
+> - 双重复核三点：提交（cmdsvc：在线 + l2_allowed + caps 平台矩阵）→ 领取
+>   （claim 事务内重读 nodes.l2_allowed）→ 执行（agent `l2_enabled` 总开关 + 白名单再校验）。
+> - scope：api_tokens.scope（readonly/operator，migration v8 加列，旧 token 默认 readonly）；
+>   面板会话 = operator；stdio MCP = readonly（无凭据，submit 即拒）；HTTP MCP 对
+>   readonly 调 submit_command 返回真实 HTTP 403。
+> - 限额：每节点在途 ≤5（事务内计数，超出 429）；心跳下发 ≤3/拍；回执 64KB
+>   硬上限（agent 截断标注占用预算内）；commands 保留 90 天、离线节点 pending
+>   24h 归档（archived 为生命周期属性列，非独立状态）。
+
 **E. 任务日志链路**（v0.2 新增）
 - agent 本地流式落盘任务输出，分块上传（序号 + 字节偏移）到控制台，
   控制台确认后推进指针；断线时本地缓存（上限 20MB/任务）恢复后重传，去重幂等
@@ -342,6 +374,9 @@ Origin 头与请求体/连接限额。传输统一 HTTPS：**CA 与证书由首�
 
 **D. 与代码流水线的衔接**
 
+> 注：SPEC-M1d 所引「命令协议基线 = DESIGN §4.2-D」实为本文件 **§4.1-D「D. 操作通道」**
+> （本小节是流水线衔接，不含命令协议）；M1d 实现注记见 §4.1-D 末尾。
+
 - 助手可通过 MCP 完成「查有哪些 agent → 派 zcode 写码 → 派 codex 审查 → 取回结果」全流程，
   不再依赖"CLI 只在 Mac 本地"的隐含前提，Windows 机器装了 agent 同样可调度
 
@@ -382,12 +417,18 @@ probe_results(id, probe_id, ts, status, latency_ms, error)  -- 保留 7 天
 operations(id, node_id, action, operator_identity, scope_level, request_id,
            status, output, created_at)      -- 含凭据身份归因
 commands(id UNIQUE, node_id, type, payload, identity, idempotency_key, archived_key,
-         lease_owner, lease_until, state, result_ref, created_at, updated_at)
+         lease_owner, lease_until, lease_epoch, state, result_ref, created_at, updated_at)
          -- 可靠执行协议核心表；(identity, idempotency_key) 唯一索引（NULL 不参与），
          -- 幂等键过期时主键字段移入 archived_key 并置 NULL 释放
+         -- lease_epoch（migration v10）：租约代次令牌，首次领取=1、过期重领自增；
+         -- 回执归属验证按 epoch 匹配（R41-B1 深修，见 §4.1-D 实现注记）
 ai_agents(id, node_id, name, type, version, path, status, invokable, updated_at)
 agent_tasks(id, node_id, agent_name, task_input, cwd, status, log_path,
             exit_code, started_at, finished_at)
+agent_sessions(id, node_id, agent_name, session_file, started_at, last_activity,
+               topic, recent_action, updated_at)   -- SPEC-M1d §3.5 活跃会话快照；
+               -- 已知限制：topic/recent_action 恒为空串（各 CLI 会话文件为嵌套
+               -- JSONL，内容解析留 M1e 按真实样本实现；面板空态显示文件名+mtime）
 task_events(id, task_id, event, ts, detail)  -- 任务状态历史
 alerts(id, rule, object_ref, state(firing/resolved), fired_at, resolved_at,
        notified_at, suppressed)

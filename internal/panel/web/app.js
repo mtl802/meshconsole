@@ -129,7 +129,6 @@ function fmtBytes(n) {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return (i === 0 ? v : v.toFixed(1)) + ' ' + u[i];
 }
-function fmtPct(v) { return v == null ? '—' : v.toFixed(1); }
 
 /* ---------- 数字 tween（与 CSS --ease 完全同一条曲线） ---------- */
 function tweenNum(el, to, fmt) {
@@ -238,14 +237,15 @@ function syncList(container, items, keyFn, build, update) {
   if (!items.length && container._empty) container.appendChild(container._empty);
 }
 
-/* ---------- 仪表条（SPEC-M1b-c §2.3 顶栏：在线终端/运行任务/服务异常/tailnet） ---------- */
+/* ---------- 仪表条（顶栏：在线终端/运行任务/服务异常/tailnet） ---------- */
 function renderReadout(ov) {
   // 异常服务数由 overview 直接输出（R19-#4）：300s 宽限/stale 簿记态等口径
   // 全部在 meshview service 层统一，前端只消费名单长度，不做业务计算。
   const issues = (ov.service_issues || []).length;
   const online = ov.nodes.filter((n) => n.node.status === 'online').length;
-  // 运行任务仪表只计未过期快照（R27-#3）：stale 快照已停走标注，不冒充运行中。
-  const tasks = (ov.running_tasks || []).filter((t) => !t.stale).length;
+  // 运行任务仪表只计未过期快照（R27-#3），且不计常驻 daemon（SPEC-M1d §3.5：
+  // background=true 的进程活着 ≠ 在干活，数据保留入库但不算「运行任务」）。
+  const tasks = (ov.running_tasks || []).filter((t) => !t.stale && !t.background).length;
   const tailnetUp = ov.tailnet ? ov.tailnet.online : 0;
 
   const gOn = $('g-online'), gTk = $('g-tasks'), gIss = $('g-issues'), gTn = $('g-tailnet');
@@ -261,18 +261,11 @@ function renderReadout(ov) {
   gTn.classList.toggle('is-zero', tailnetUp === 0);
 }
 
-/* ---------- 运行中的 agent 任务（核心区大卡） ---------- */
-// 活动计时本地走动的行集合：每秒重算 textContent（数据更新非动画，
-// reduced-motion 下照常走，只是不做 tween/呼吸）。
-const liveRows = new Set();
-setInterval(() => {
-  for (const row of liveRows) {
-    if (!row.isConnected) { liveRows.delete(row); continue; }
-    if (row._tick) row._tick();
-  }
-}, 1000);
-
-function buildTaskCard() {
+/* ---------- agent 会话活跃（核心区大卡，SPEC-M1d §3.5） ----------
+ * 每卡：终端 / agent / 会话主题（轻解析首条用户消息）/ 当前动作（末条消息）/ 持续时长。
+ * 会话是 15s 快照（非本地秒表）：持续时长按渲染时刻计算，不做每秒走动——
+ * 拉取失败冻结期不冒充实时。主题/动作解析不出显示空（不编造占位文案）。 */
+function buildSessionCard() {
   const card = el('div', 'task-card glass-inset glass-inset-hover');
   const aura = el('span', 'aura');
   aura.setAttribute('aria-hidden', 'true');
@@ -282,83 +275,68 @@ function buildTaskCard() {
   const dot = el('span', 'dot dot--ok breathing--live');
   const node = el('span', 'task-node');
   const agent = el('span', 'task-agent');
-  const cpu = el('span', 'task-cpu');
-  const flag = el('span', 'task-flag');
-  flag.style.display = 'none';
+  const dur = el('span', 'task-cpu');
   top.appendChild(dot);
   top.appendChild(node);
   top.appendChild(agent);
-  top.appendChild(cpu);
-  top.appendChild(flag);
+  top.appendChild(dur);
   card.appendChild(top);
 
-  const cmd = el('div', 'task-cmd');
-  card.appendChild(cmd);
+  const topic = el('div', 'task-cmd');
+  card.appendChild(topic);
 
-  const erow = el('div', 'task-elapsed-row');
-  const elapsed = el('span', 'task-elapsed');
-  const since = el('span', 'task-since');
-  erow.appendChild(elapsed);
-  erow.appendChild(since);
-  card.appendChild(erow);
+  const note = el('div', 'task-note');
+  card.appendChild(note);
+
+  const since = el('div', 'task-since');
+  card.appendChild(since);
 
   card._dot = dot;
   card._node = node;
   card._agent = agent;
-  card._cpu = cpu;
-  card._flag = flag;
-  card._cmd = cmd;
-  card._elapsed = elapsed;
+  card._dur = dur;
+  card._topic = topic;
+  card._note = note;
   card._since = since;
-  // 活动计时：_base 为最近一次上报的 elapsed_s，_anchor 为收到该值的本地时刻；
-  // 每秒 tick = base + (now - anchor)，15s 轮询刷新锚点消除累积漂移。
-  card._base = 0;
-  card._anchor = Date.now();
-  card._tick = () => {
-    card._elapsed.textContent = fmtDur(card._base + (Date.now() - card._anchor) / 1000);
-  };
   return card;
 }
 
-function updateTaskCard(card, t, now, truncNodes) {
-  card._node.textContent = t.node;
-  card._agent.textContent = t.agent_name;
-  card._agent.title = t.node + ' / ' + t.agent_name + ' · pid ' + t.pid;
-  card._cpu.textContent = 'cpu ' + fmtPct(t.cpu_pct) + '%';
-  card._cpu.title = 'mem ' + fmtPct(t.mem_pct) + '%';
-  const cmdText = t.cmd || '（无命令行）';
-  card._cmd.textContent = cmdText;
-  card._cmd.title = cmdText;
-
-  // 快照诚实性标注（R27-#3/#4）：stale（节点失联/快照过期）优先于截断标注，
-  // 二者皆无则不占位。stale 时计时冻结在快照值、移出每秒走动集合、呼吸点停
-  // 止并转 warn——过期快照不是「正在运行」，不冒充活性。
-  const stale = !!t.stale;
-  if (stale) {
-    card._flag.textContent = '快照过期';
-    card._flag.title = '节点失联或任务快照未刷新 —— 计时已冻结，并非正在运行';
-  } else if (truncNodes && truncNodes.has(t.node)) {
-    card._flag.textContent = '清单截断';
-    card._flag.title = '该节点任务清单触顶单拍上限 —— 本清单不完整';
+function updateSessionCard(card, s, now) {
+  card._node.textContent = s.node;
+  card._agent.textContent = s.agent_name;
+  card._agent.title = s.node + ' / ' + s.agent_name + ' · ' + s.session_file;
+  // 持续时长：有开始时刻（文件创建时刻）才算——未知显示 —，不拿最近活动冒充。
+  if (s.started_at) {
+    card._dur.textContent = fmtDur(Math.max(0, now - s.started_at));
+    card._dur.title = '开始于 ' + new Date(s.started_at * 1000).toLocaleString();
   } else {
-    card._flag.textContent = '';
-    card._flag.title = '';
+    card._dur.textContent = '—';
+    card._dur.title = '持续时长未知（平台不支持读取会话创建时刻）';
   }
-  card._flag.style.display = card._flag.textContent ? '' : 'none';
-  card._dot.className = stale ? 'dot dot--warn' : 'dot dot--ok breathing--live';
-
-  card._base = t.elapsed_s || 0;
-  card._anchor = Date.now();
-  if (stale) {
-    card._elapsed.textContent = fmtDur(card._base);
-    liveRows.delete(card);
+  // 主题/当前动作：内容解析降级（R41-B2）——topic 空（当前恒空）显示会话
+  // 文件名 + mtime（普通空态：主题行走文件名样式、注记行弱化文案，非错误态）；
+  // M1e 恢复内容解析后自动回到主题/动作展示。
+  if (s.topic) {
+    card._topic.textContent = s.topic;
+    card._topic.title = s.topic;
+    card._note.textContent = s.recent_action || '';
+    card._note.style.display = s.recent_action ? '' : 'none';
+    card._note.title = s.recent_action || '';
   } else {
-    card._tick();
-    liveRows.add(card);
+    const name = (s.session_file || '').split('/').pop() || s.session_file || '';
+    const mtime = s.last_activity ? new Date(s.last_activity * 1000).toLocaleString() : '';
+    card._topic.textContent = name + (mtime ? ' · ' + mtime : '');
+    card._topic.title = (s.session_file || '') + (mtime ? '\n修改于 ' + mtime : '');
+    card._note.textContent = '内容暂不可见';
+    card._note.style.display = '';
+    card._note.title = '会话内容解析暂未支持该格式，仅展示会话文件与最近活动时间';
   }
-  card._since.textContent = t.started_at
-    ? '启动于 ' + new Date(t.started_at * 1000).toLocaleTimeString()
-    : '启动时刻未知';
+  card._since.textContent = s.last_activity
+    ? '最近活动 ' + relTime(s.last_activity, now) + '前'
+    : '最近活动未知';
+  card._since.title = s.last_activity
+    ? '最近活动于 ' + new Date(s.last_activity * 1000).toLocaleString()
+    : '';
 }
 
 /* ---------- 终端卡（每终端一张：状态/角色/sparkline/disk/agent 清单） ---------- */
@@ -496,7 +474,9 @@ function buildServiceRow() {
   const name = el('span', 'row-name');
   const sub = el('span', 'row-sub hide-sm');
   const chip = el('span', 'type-chip');
-  const st = el('span');
+  const st = el('span', 'row-status');
+  st.style.whiteSpace = 'nowrap';
+  st.style.justifySelf = 'end';
   const detail = el('span', 'detail-line');
   row.appendChild(dot);
   row.appendChild(name);
@@ -552,21 +532,17 @@ function render(ov) {
   const now = ov.generated_at;
   renderReadout(ov);
 
-  // 核心区：跨终端聚合任务卡流（节点名稳定序；前端只渲染，业务口径在服务端）。
-  const tasks = (ov.running_tasks || []).slice().sort((a, b) =>
+  // 核心区：agent 会话活跃（SPEC-M1d §3.5；节点名稳定序，前端只渲染）。
+  const sessions = (ov.agent_sessions || []).slice().sort((a, b) =>
     a.node === b.node
-      ? (a.agent_name === b.agent_name ? a.pid - b.pid : a.agent_name.localeCompare(b.agent_name))
+      ? (a.agent_name === b.agent_name
+          ? a.session_file.localeCompare(b.session_file)
+          : a.agent_name.localeCompare(b.agent_name))
       : a.node.localeCompare(b.node));
-  // 清单截断标注（R27-#4）：按节点名取 tasks_truncated，命中节点的任务卡与
-  // meta 行标注「list truncated」（清单不完整可见）。
-  const truncNodes = new Set((ov.nodes || []).filter((n) => n.node.tasks_truncated).map((n) => n.node.name));
-  syncList($('tasks-grid'), tasks, (t) => t.node + '/' + t.pid + '/' + t.agent_name,
-    buildTaskCard, (row, t) => updateTaskCard(row, t, now, truncNodes));
-  const staleCount = tasks.filter((t) => t.stale).length;
-  $('tasks-meta').textContent = tasks.length
-    ? (tasks.length - staleCount) + ' 运行中'
-      + (staleCount ? ' · ' + staleCount + ' 过期' : '')
-      + (truncNodes.size ? ' · 清单截断' : '')
+  syncList($('sessions-grid'), sessions, (s) => s.node + '/' + s.session_file,
+    buildSessionCard, (row, s) => updateSessionCard(row, s, now));
+  $('sessions-meta').textContent = sessions.length
+    ? sessions.length + ' 个活跃会话'
     : '全部安静';
 
   // 终端区：每终端一张卡；agent 清单按节点过滤自带 last_activity。
@@ -630,10 +606,9 @@ let tickInflight = false;
 // 重写新鲜度行（crit 文案由 catch 维持，避免「冻结行/crit 行」逐拍互斥闪烁）。
 let staleShown = false;
 
-// renderStaleSnapshot 把上一次成功 overview 以「全部任务 stale」的形态重渲：
-// 冻结完全复用 render/updateTaskCard 既有语义（计时移出 liveRows 停走、呼吸
-// 点停转、snapshot stale 标注、运行仪表与 meta 只计非 stale），不另起炉灶；
-// 拉取恢复后下一拍正常 render 即自动解冻。
+// renderStaleSnapshot 把上一次成功 overview 以「运行任务全部 stale」的形态重渲：
+// 运行仪表冻结复用 render 既有语义（只计非 stale、非 daemon），会话卡按快照
+// 原样保留（非秒表，无冒充实时问题）；新鲜度行走 crit（由 tick 的过线分支负责）。
 function renderStaleSnapshot() {
   if (!lastGoodOv) return;
   render(Object.assign({}, lastGoodOv, {
@@ -680,3 +655,189 @@ async function tick() {
 
 tick();
 setInterval(tick, POLL_MS);
+
+/* ============================================================
+ * M1d 任务下发（SPEC-M1d §4）：白名单 kind 表单 + 命令对账流
+ * 服务端为唯一授权面（cmdsvc：在线/l2 白名单/caps/参数槽/配额/幂等），
+ * 前端只做可用性引导；命令状态/结果一律 textContent 渲染（结果文本视为
+ * 不可信数据，DESIGN §7-8 —— 与既有视图同一转义口径）。
+ * ============================================================ */
+
+// 命令状态 → 中文（API 值保持英文机器契约，翻译只在渲染层；unknown 特指
+// 「无回执降级」而非服务语义里的 unknown，故单独映射）。
+const CMD_STATUS_ZH = {
+  pending: '待领取', claimed: '已下发', running: '执行中',
+  succeeded: '成功', failed: '失败', unknown: '无回执',
+};
+function cmdStatusKind(s) {
+  switch (s) {
+    case 'succeeded': return 'ok';
+    case 'failed': return 'crit';
+    case 'unknown': return 'warn';
+    case 'running': return 'ok';
+    default: return 'dim';
+  }
+}
+
+// kind 元数据（/api/panel/command_meta）：驱动表单槽位显隐与输入约束。
+let cmdMeta = null;
+
+async function loadCmdMeta() {
+  try {
+    const res = await fetch('/api/panel/command_meta', { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    cmdMeta = await res.json();
+    renderCmdForm();
+  } catch (e) {
+    $('cmd-msg').textContent = '命令元数据加载失败：' + e.message;
+  }
+}
+
+function renderCmdForm() {
+  if (!cmdMeta) return;
+  // 节点下拉：l2_allowed 且在线优先，其余禁选（云节点/离线在服务端也会拒绝，
+  // 前端只是少一次必败提交）。
+  const nodeSel = $('cmd-node');
+  const prev = nodeSel.value;
+  nodeSel.textContent = '';
+  const nodes = (cmdMeta.nodes || []).slice().sort((a, b) =>
+    (b.l2_allowed && b.online ? 0 : 1) - (a.l2_allowed && a.online ? 0 : 1) ||
+    a.name.localeCompare(b.name));
+  for (const n of nodes) {
+    const opt = document.createElement('option');
+    opt.value = n.name;
+    opt.textContent = n.name + (n.l2_allowed ? '' : '（未开放下发）') + (n.online ? '' : '（离线）');
+    opt.disabled = !n.l2_allowed || !n.online;
+    nodeSel.appendChild(opt);
+  }
+  if ([...nodeSel.options].some((o) => o.value === prev)) nodeSel.value = prev;
+
+  const kindSel = $('cmd-kind');
+  if (!kindSel.options.length) {
+    for (const k of cmdMeta.kinds || []) {
+      const opt = document.createElement('option');
+      opt.value = k.name;
+      opt.textContent = k.name;
+      kindSel.appendChild(opt);
+    }
+    kindSel.addEventListener('change', renderCmdSlots);
+  }
+  renderCmdSlots();
+}
+
+function renderCmdSlots() {
+  const kind = ($('cmd-kind').value || '');
+  const meta = (cmdMeta && cmdMeta.kinds || []).find((k) => k.name === kind);
+  const hasUnit = meta && (meta.slots || []).some((s) => s.type === 'unit');
+  const nSlot = meta && (meta.slots || []).find((s) => s.type === 'int');
+  $('cmd-unit-row').style.display = hasUnit ? '' : 'none';
+  $('cmd-n-row').style.display = nSlot ? '' : 'none';
+  const nInput = $('cmd-n');
+  if (nSlot) {
+    nInput.min = nSlot.min; nInput.max = nSlot.max;
+    nInput.placeholder = nSlot.min + '-' + nSlot.max;
+  }
+  $('cmd-kind').title = meta ? meta.argv_hint : '';
+}
+
+async function submitCmd(ev) {
+  ev.preventDefault();
+  const btn = $('cmd-submit'), msg = $('cmd-msg');
+  const kind = $('cmd-kind').value;
+  const body = new URLSearchParams();
+  body.set('node', $('cmd-node').value);
+  body.set('kind', kind);
+  const kindMeta = (cmdMeta && cmdMeta.kinds || []).find((k) => k.name === kind);
+  if (kindMeta && (kindMeta.slots || []).some((s) => s.type === 'unit')) {
+    const unit = $('cmd-unit').value.trim();
+    if (unit) body.set('unit', unit);
+  }
+  if (kindMeta && (kindMeta.slots || []).some((s) => s.type === 'int')) {
+    if ($('cmd-n').value) body.set('n', $('cmd-n').value);
+  }
+  if ($('cmd-timeout').value) body.set('timeout_s', $('cmd-timeout').value);
+  btn.disabled = true;
+  msg.textContent = '提交中…';
+  msg.className = 'cmd-msg';
+  try {
+    const res = await fetch('/api/panel/commands', { method: 'POST', body });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 403 && !data.error) {
+      // http.Error 文本响应兜底
+    }
+    if (!res.ok) {
+      const text = typeof data.error === 'string' ? data.error : await res.text();
+      msg.textContent = '提交被拒：' + (text || ('HTTP ' + res.status));
+      msg.className = 'cmd-msg cmd-msg-bad';
+      return;
+    }
+    msg.textContent = '已提交 command_id=' + data.command_id + (data.idempotent ? '（幂等命中原命令）' : '');
+    msg.className = 'cmd-msg cmd-msg-ok';
+    pollCommands();
+  } catch (e) {
+    msg.textContent = '提交失败：' + e.message;
+    msg.className = 'cmd-msg cmd-msg-bad';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function buildCmdRow() {
+  const row = el('div', 'row row-cmd glass-inset');
+  const dot = el('span');
+  const name = el('span', 'row-name');
+  const sub = el('span', 'row-sub hide-sm');
+  const chip = el('span', 'type-chip');
+  const st = el('span', 'row-status');
+  st.style.whiteSpace = 'nowrap';
+  st.style.justifySelf = 'end';
+  const detail = el('span', 'detail-line');
+  row.appendChild(dot);
+  row.appendChild(name);
+  row.appendChild(sub);
+  row.appendChild(chip);
+  row.appendChild(st);
+  row.appendChild(detail);
+  row._dot = dot; row._name = name; row._sub = sub; row._chip = chip; row._st = st; row._detail = detail;
+  return row;
+}
+function updateCmdRow(row, c, now) {
+  const kind = cmdStatusKind(c.status);
+  setDot(row._dot, kind, c.status === 'running');
+  row._name.textContent = c.node + ' · ' + c.kind;
+  row._name.title = 'command_id ' + c.command_id + ' · 提交者 ' + (c.created_by || '—');
+  const argsText = c.args && Object.keys(c.args).length ? JSON.stringify(c.args) : '';
+  row._sub.textContent = argsText;
+  row._chip.textContent = relTime(c.created_at, now) + '前';
+  const zh = CMD_STATUS_ZH[c.status] || c.status;
+  setDotText(row._st, kind, zh + (c.degraded && c.status !== 'unknown' ? '·降级' : ''));
+  const preview = c.result_preview || c.result_text || '';
+  row._detail.textContent = preview;
+  row._detail.title = preview;
+  row._detail.style.display = preview ? '' : 'none';
+}
+
+async function pollCommands() {
+  try {
+    const res = await fetch('/api/panel/commands?limit=20', { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const cmds = data.commands || [];
+    syncList($('cmd-list'), cmds, (c) => c.command_id, buildCmdRow,
+      (row, c) => updateCmdRow(row, c, Math.floor(Date.now() / 1000)));
+    $('commands-meta').textContent = cmds.length
+      ? cmds.filter((c) => c.status === 'pending' || c.status === 'claimed' || c.status === 'running').length + ' 在途 / ' + cmds.length + ' 条'
+      : '0 条';
+  } catch (e) {
+    $('commands-meta').textContent = '加载失败';
+  }
+}
+
+$('cmd-form').addEventListener('submit', submitCmd);
+$('cmd-timeout').addEventListener('input', () => {
+  const v = Number($('cmd-timeout').value);
+  $('cmd-timeout').title = v > 300 ? '上限 300s' : '';
+});
+loadCmdMeta();
+pollCommands();
+setInterval(pollCommands, POLL_MS);

@@ -7,6 +7,7 @@ package meshview
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"sort"
 	"strings"
 	"time"
@@ -31,6 +32,83 @@ const metricsWindow = 24 * time.Hour
 
 // sparkPoints 面板 sparkline 采样点数上限（取窗口内最近样本）。
 const sparkPoints = 48
+
+// Command 为一条下发命令视图（SPEC-M1d §4 面板/MCP 查询共用；MCP 侧另有
+// 完整形态视图，此处 ResultPreview 为 256 字节预览防列表被长输出撑爆）。
+type Command struct {
+	CommandID     string          `json:"command_id"`
+	Node          string          `json:"node"`
+	Kind          string          `json:"kind"`
+	Args          json.RawMessage `json:"args"`
+	Status        string          `json:"status"`
+	Degraded      bool            `json:"degraded"`
+	TimeoutS      int64           `json:"timeout_s"`
+	ResultText    string          `json:"result_text,omitempty"`
+	ResultPreview string          `json:"result_preview,omitempty"`
+	ExitCode      *int64          `json:"exit_code,omitempty"`
+	CreatedBy     string          `json:"created_by,omitempty"`
+	Scope         string          `json:"scope,omitempty"`
+	ClaimedAt     *int64          `json:"claimed_at,omitempty"`
+	FinishedAt    *int64          `json:"finished_at,omitempty"`
+	Archived      bool            `json:"archived"`
+	CreatedAt     int64           `json:"created_at"`
+	UpdatedAt     int64           `json:"updated_at"`
+}
+
+// commandView 组装单条命令视图；full=true 时携带全文结果（单条查询用）。
+func commandView(r store.CommandRecord, full bool) Command {
+	v := Command{
+		CommandID: r.CommandID, Node: r.NodeName, Kind: r.Kind,
+		Args: json.RawMessage(r.ArgsJSON), Status: r.Status, Degraded: r.Degraded,
+		TimeoutS: r.TimeoutS, CreatedBy: r.CreatedBy, Scope: r.Scope,
+		Archived: r.Archived, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
+	if r.ExitCode.Valid {
+		c := r.ExitCode.Int64
+		v.ExitCode = &c
+	}
+	if r.ClaimedAt.Valid {
+		t := r.ClaimedAt.Int64
+		v.ClaimedAt = &t
+	}
+	if r.FinishedAt.Valid {
+		t := r.FinishedAt.Int64
+		v.FinishedAt = &t
+	}
+	if full {
+		v.ResultText = r.ResultText
+	} else {
+		v.ResultPreview = r.ResultText
+		if len(v.ResultPreview) > 256 {
+			v.ResultPreview = v.ResultPreview[:256] + "…"
+		}
+	}
+	return v
+}
+
+// Commands 列出命令（node/status 过滤可空；limit 由调用方约束）。full=false 时
+// 结果只带预览。
+func (q *Query) Commands(ctx context.Context, node, status string, limit int, full bool) ([]Command, error) {
+	rows, err := q.st.ListCommands(ctx, node, status, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Command, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, commandView(r, full))
+	}
+	return out, nil
+}
+
+// Command 单条命令视图（含全文结果）；不存在返回 nil。
+func (q *Query) Command(ctx context.Context, commandID string) (*Command, error) {
+	r, err := q.st.GetCommand(ctx, commandID)
+	if err != nil || r == nil {
+		return nil, err
+	}
+	v := commandView(*r, true)
+	return &v, nil
+}
 
 // Query 为只读视图查询入口。
 type Query struct {
@@ -57,8 +135,11 @@ type Node struct {
 	LastSuccess  *int64 `json:"last_success,omitempty"`
 	CreatedAt    int64  `json:"created_at"`
 	// TasksTruncated 为该节点最近一次显式任务快照的截断标记（R27-#4）：true =
-	// 其 agent_tasks 清单是不完整子集（单拍触顶 64 条），消费方标注「清单不完整」。
+	// 其 agent_tasks 清单是不完整子集（单拍触顶 64 条上限），消费方标注「清单不完整」。
 	TasksTruncated bool `json:"tasks_truncated,omitempty"`
+	// L2Allowed 为任务下发白名单标记（SPEC-M1d §1，migration v8）：true = 可向
+	// 该节点下发白名单命令（云节点恒 false）。
+	L2Allowed bool `json:"l2_allowed,omitempty"`
 }
 
 // Service 为受管服务行视图。
@@ -104,6 +185,9 @@ type AgentTask struct {
 	StartedAt *int64   `json:"started_at,omitempty"`
 	UpdatedAt int64    `json:"updated_at"`
 	Stale     bool     `json:"stale"`
+	// Background 为 daemon 过滤标记（SPEC-M1d §3.5：elapsed > 1h 的常驻进程）
+	// ——面板任务区不显示，数据保留（MCP 消费方自行取舍）。
+	Background bool `json:"background"`
 }
 
 // TailnetNode 为 tailnet_nodes 行视图（Headscale 只读镜像）。
@@ -199,13 +283,16 @@ type MeshStatus struct {
 // 未过 300s 宽限），由 service 层算好输出（R19-#4：前端只消费名单，不做业务
 // 计算）。RunningTasks 为全网当前 agent 任务快照（跨终端聚合，前端只渲染）。
 type Overview struct {
-	GeneratedAt   int64           `json:"generated_at"`
-	Freshness     *int64          `json:"freshness,omitempty"`
-	Nodes         []NodeCard      `json:"nodes"`
-	Services      []Service       `json:"services"`
-	ServiceIssues []ServiceIssue  `json:"service_issues"`
-	Agents        []Agent         `json:"agents"`
-	RunningTasks  []AgentTask     `json:"running_tasks"`
+	GeneratedAt   int64          `json:"generated_at"`
+	Freshness     *int64         `json:"freshness,omitempty"`
+	Nodes         []NodeCard     `json:"nodes"`
+	Services      []Service      `json:"services"`
+	ServiceIssues []ServiceIssue `json:"service_issues"`
+	Agents        []Agent        `json:"agents"`
+	RunningTasks  []AgentTask    `json:"running_tasks"`
+	// AgentSessions 为全网活跃会话快照（SPEC-M1d §3.5：任务区「agent 会话
+	// 活跃」卡的数据源；background 任务已由采集端标记，前端过滤显示）。
+	AgentSessions []AgentSession  `json:"agent_sessions"`
 	Tailnet       *TailnetSummary `json:"tailnet,omitempty"`
 }
 
@@ -216,7 +303,7 @@ func nodeView(n *store.NodeRecord) Node {
 		ID:   n.ID,
 		Name: n.Name, Role: n.Role, OS: n.OS, Arch: n.Arch, Status: n.Status,
 		AgentVersion: n.AgentVersion, TailnetIP: n.TailnetIP, PublicIP: n.PublicIP,
-		CreatedAt: n.CreatedAt, TasksTruncated: n.TasksTruncated,
+		CreatedAt: n.CreatedAt, TasksTruncated: n.TasksTruncated, L2Allowed: n.L2Allowed,
 	}
 	if n.LastSeen.Valid {
 		v := n.LastSeen.Int64
@@ -244,7 +331,7 @@ func agentView(nodeName string, r store.AgentRecord) Agent {
 // taskView 把 agent_tasks 行转为视图（附带节点名，跨终端卡流直接可渲染）。
 func taskView(nodeName string, r store.AgentTaskRecord) AgentTask {
 	t := AgentTask{Node: nodeName, PID: r.PID, AgentName: r.AgentName, Cmd: r.Cmd,
-		ElapsedS: r.ElapsedS, UpdatedAt: r.UpdatedAt}
+		ElapsedS: r.ElapsedS, UpdatedAt: r.UpdatedAt, Background: r.Background}
 	if r.CPUPct.Valid {
 		v := r.CPUPct.Float64
 		t.CPUPct = &v
@@ -258,6 +345,36 @@ func taskView(nodeName string, r store.AgentTaskRecord) AgentTask {
 		t.StartedAt = &v
 	}
 	return t
+}
+
+// AgentSession 为一个活跃 agent 会话视图（SPEC-M1d §3.5，agent_sessions 快照，
+// 按 heartbeat 拍全量替换）。Topic/RecentAction 自 R41-B2 降级起恒为空串
+// （会话内容解析留 M1e 按真实样本实现；面板空态显示会话文件名 + mtime）；
+// 持续时长由消费方按 now-StartedAt 计算。
+type AgentSession struct {
+	Node         string `json:"node"`
+	AgentName    string `json:"agent_name"`
+	SessionFile  string `json:"session_file"`
+	StartedAt    *int64 `json:"started_at,omitempty"`
+	LastActivity *int64 `json:"last_activity,omitempty"`
+	Topic        string `json:"topic,omitempty"`
+	RecentAction string `json:"recent_action,omitempty"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+// sessionView 把 agent_sessions 行转为视图（附带节点名）。
+func sessionView(nodeName string, r store.AgentSessionRecord) AgentSession {
+	s := AgentSession{Node: nodeName, AgentName: r.AgentName, SessionFile: r.SessionFile,
+		Topic: r.Topic, RecentAction: r.RecentAction, UpdatedAt: r.UpdatedAt}
+	if r.StartedAt.Valid {
+		v := r.StartedAt.Int64
+		s.StartedAt = &v
+	}
+	if r.LastActivity.Valid {
+		v := r.LastActivity.Int64
+		s.LastActivity = &v
+	}
+	return s
 }
 
 func tailnetView(r store.TailnetNodeRecord) TailnetNode {
@@ -506,6 +623,29 @@ func (q *Query) AgentTasksSnapshot(ctx context.Context, nodeName string) ([]Agen
 	return out, truncated, nil
 }
 
+// AgentSessions 列出当前活跃 agent 会话快照；nodeName 为空返回全网（SPEC-M1d
+// §3.5，MCP list_active_sessions 与面板 overview 同源）。快照按心跳拍全量
+// 替换，行存在即「30min 活跃窗口内」的会话。
+func (q *Query) AgentSessions(ctx context.Context, nodeName string) ([]AgentSession, error) {
+	rows, nodes, err := q.st.ListAgentSessionSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[int64]string, len(nodes))
+	for i := range nodes {
+		names[nodes[i].ID] = nodes[i].Name
+	}
+	out := make([]AgentSession, 0, len(rows))
+	for _, r := range rows {
+		name, ok := names[r.NodeID]
+		if !ok || (nodeName != "" && name != nodeName) {
+			continue
+		}
+		out = append(out, sessionView(name, r))
+	}
+	return out, nil
+}
+
 // Status 汇总全网状态（get_mesh_status 输出）。
 func (q *Query) Status(ctx context.Context) (*MeshStatus, error) {
 	nodes, err := q.st.ListNodes(ctx)
@@ -633,6 +773,10 @@ func (q *Query) Overview(ctx context.Context) (*Overview, error) {
 	}
 	// M1b-c：全网运行任务快照一次取齐（复用 AgentTasks，不新写 SQL）。
 	if out.RunningTasks, err = q.AgentTasks(ctx, ""); err != nil {
+		return nil, err
+	}
+	// M1d §3.5：活跃会话快照一次取齐（任务区会话卡数据源）。
+	if out.AgentSessions, err = q.AgentSessions(ctx, ""); err != nil {
 		return nil, err
 	}
 	if out.Tailnet, err = q.tailnet(ctx); err != nil {

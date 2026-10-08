@@ -66,7 +66,7 @@ func TestChangePasswordRevokesAllCredentials(t *testing.T) {
 	if err := st.CreateSession(ctx, "sess-hash-1", u.ID, now, now+3600, u.PasswordVersion); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CreateAPIToken(ctx, "tok-hash-1", u.ID, "hana", nil); err != nil {
+	if _, err := st.CreateAPIToken(ctx, "tok-hash-1", u.ID, "hana", nil, "readonly"); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.ChangeUserPassword(ctx, u.ID, "new-hash"); err != nil {
@@ -200,12 +200,12 @@ func TestAPITokenLifecycleAndAuth(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	u := mustCreateUser(t, st, "lunge")
-	id1, err := st.CreateAPIToken(ctx, "hash-a", u.ID, "hana mac", nil)
+	id1, err := st.CreateAPIToken(ctx, "hash-a", u.ID, "hana mac", nil, "readonly")
 	if err != nil || id1 == 0 {
 		t.Fatalf("create token: %v", err)
 	}
 	exp := time.Now().Add(-time.Hour).Unix()
-	if _, err := st.CreateAPIToken(ctx, "hash-b", u.ID, "expired", &exp); err != nil {
+	if _, err := st.CreateAPIToken(ctx, "hash-b", u.ID, "expired", &exp, "readonly"); err != nil {
 		t.Fatal(err)
 	}
 	// 认证命中带用户启用态与到期字段。

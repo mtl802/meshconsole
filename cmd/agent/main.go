@@ -143,6 +143,8 @@ func cmdRun(args []string) int {
 		log.Error("load state", "err", err)
 		return 1
 	}
+	// state 文件路径注入（M1d：命令对账目录 commands/ 取其同目录，SPEC-M1d §2）。
+	st.SetStateFile(path)
 	consoleURL := cfg.ConsoleURL
 	if consoleURL == "" {
 		consoleURL = st.ConsoleURL
@@ -167,12 +169,20 @@ func cmdRun(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 命令执行 worker（M1d，SPEC-M1d §2）：独立 goroutine，心跳循环只交付不等待。
+	// 构造失败（对账目录不可建等）不阻断 agent 主流程：命令通道禁用并 WARN 留痕。
+	worker, err := agent.NewCommandWorker(ctx, cfg, st, log)
+	if err != nil {
+		log.Warn("command worker disabled", "err", err)
+	}
+
 	scanCfg := cfg.ScanCfg()
 	runner := &agent.Runner{
 		Cfg:     cfg,
 		State:   st,
 		Version: version,
 		Log:     log,
+		Worker:  worker,
 		Collector: collect.NewCollector(cfg.DiskMount,
 			time.Duration(cfg.CollectIntervalS)*time.Second),
 		// 服务状态查询（配置未声明时 CheckAll 不执行、心跳不带 services 字段）；

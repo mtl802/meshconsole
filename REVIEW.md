@@ -627,3 +627,245 @@
 
 **COMMIT_OK 授权**：本裁决 touch COMMIT_OK，worker 执行本地 git commit（无 push）。理由同 R31 口径：多设备开发约定「未提交的本地代码等于丢失」，收口即锁定成果；commit 为本地操作、git 可回退，若伦哥对收口有异议可 git reset 回退。全程无 push，远端推送仍等伦哥指令。候选残留随后续批次（M1b-c3/M1d）处理。
 
+
+## R38 · M1d 开发自测（zcode，2026-10-08，待 codex 复审）
+
+**SPEC-M1d §7 验收清单逐条自测**。实现后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **254 用例全绿**（m1b-c2-fix2 基线 218 + 本批新增 36：cmdkind 6、store 命令层 10、cmdsvc 6、agent 执行器/对账/worker 8、registry 心跳协议 4、mcpserver scope 2）、15 包全 ok；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过（Windows 平台进程组语义按 SPEC §6 退化为单进程 Kill，executor_unix.go/executor_windows.go 拆分，`Setpgid`/`syscall.Kill` 不再进 Windows 编译单元）；二进制级 E2E 冒烟（/tmp 临时实例，console+agent 真实 TLS 链路，已清理）见 DELIVERY.md §M1d。未执行 git commit（按任务书）。
+
+### 验收清单对照
+
+| SPEC §7 项 | 结果 | 证据 |
+|---|---|---|
+| 状态机全迁移含异常路径（lease 过期重发 / unknown 修正 / 迟到回执 / 双实例 claim 竞态） | ✅ 单测 | `store/command_test.go`：TestLeaseExpiryResend（租约外重领 → claimed_at 前移 → 旧租约回执 drop、新租约回执收）；TestUnknownSweepAndLateCorrection（lease×2 与 running 后 timeout×1.5 两触发分支、unknown 不可领取、迟到回执凭 claimed_at 匹配修正终态且 degraded 保留、不匹配拒绝维持 unknown）；TestCommandStateTransitions（租约内重复领取为空 = 双实例竞态防护）；领取原子性 = ClaimNodeCommands 单条 UPDATE…IN(SELECT…LIMIT)…RETURNING 写锁内完成，测试 TestHeartbeatCommandProtocol 断言响应写出前已置 claimed |
+| 幂等键重复提交 | ✅ 单测 + E2E | TestSubmissionIdempotency + TestSubmitIdempotentWindow：同键同参窗口内返回原 command_id（idempotent=true）、同键异参 ErrKeyConflict（HTTP 409）、窗口过期 ArchiveSubmissionKey 归档（archived_key 只收提交键、submission_key 置 NULL、command_id 原样保留）后键可复用；E2E 实测两次同键提交返回同 id 且第二次 idempotent=true |
+| 白名单注入向量全拒（单横线注入/路径遍历/超长/非法 unit） | ✅ 单测 | `cmdkind_test.go` TestValidateArgsInjectionVectors 24 向量（`-h`/`--no-pager`、`../../etc/passwd`、绝对路径、`;`/`|`/反引号/`$()`/空白/129 字符超长/缺槽/多余键/n 越界与字符串数字与浮点）；TestRegistryFixedPaths 钉住模板首元素受信绝对路径 |
+| caps 不匹配拒绝 | ✅ 单测 + E2E | TestCapsOK 平台矩阵（ps/df 接受 linux 或 mac 双组合、docker_ps 单独 linux-docker、windows 全拒）；E2E：mac 节点提交 systemctl_status → 「目标节点不支持该命令类型（caps 协商不匹配）」；agent 能力自检按平台探测（/usr/bin/systemctl、/bin/launchctl、docker_bin LookPath），l2_enabled=false 上报空 caps 从源头阻断 |
+| ACK 前 agent 重启恢复重发 | ✅ 单测 | TestWorkerRestartRecovery：同 state 目录重建 worker——result 俱全者保留重发（直至 ACK）、intent 无结果者补 interrupted 回执（不重执行，console 置 unknown 对齐，TestInterruptedReceiptAlignsUnknown 验证 unknown+degraded+可 ACK）；E2E 复现：kill agent 后 console 重发、新实例执行成功 |
+| 真机：面板发 ps_snapshot → claimed → 结果中文面板展示；cloud-nanjing 拒绝提示；readonly token 调 submit → 403 | ✅ E2E（本机模拟） | 见 DELIVERY.md §M1d：面板会话提交 ps_snapshot（输出 >64KB）→ claimed → succeeded（result 65516B 含截断标注，退出码 0，ACK 后 agent 本地对账删空）；l2 白名单外节点 → 「该节点未开放任务下发（l2 白名单仅限 mac-mini/windows，云节点禁止）」（首次 E2E 误配即实获该提示，单测 TestSubmitGates/TestClaimL2Gate 钉死）；readonly token → **真实 HTTP 403**（SDK 工具错误是 JSON-RPC 200 帧，scope 拦截在 HTTP 中间件前置完成，TestMCPSubmitScope403 钉死） |
+| 混沌场景（kill agent 半路 / 杀 console / 丢心跳各一轮，最终状态可对账） | ✅ 部分（单测+E2E） | kill agent 半路：E2E 实际发生（agent 随 shell 退出被杀）→ console lease 过期重发 → 重启后执行成功对账；杀 console：console 重启后命令行/租约/回执全部从 DB 恢复（E2E 中实际重启 console 3 次无状态丢失）；丢心跳→unknown：SweepUnknown 单测覆盖（lease×2 / timeout×1.5 两分支），E2E 未等 240s 实窗（列真机项） |
+
+### 自测发现并修复的问题（值得留档）
+
+1. **64KB 回执预算穿透（E2E 发现，阻塞级）**：`ps aux` 真实输出 >64KB，agent 采集截断到 64KB 后又追加「已截断/超时」标注 → 回执总长超 console 64KB 硬上限 → RecordCommandResults 判 oversize 拒收 → agent 按 drop 删本地副本 → **命令永远停在 claimed**。修复：`executor.go` finalizeResult 预算感知截断（标注计入 64KB 预算，超预算先压正文保留标注）+ 单测 TestExecutorOutputCapBudget 钉死「最终文本 ≤ ResultHardCap」；console 侧 drop 原因细分（oversize/no attribution/lease mismatch/state，AUDIT 日志可辨）。
+2. **注册后 l2 白名单不同步（E2E 发现）**：SyncL2Allowed 原只在 console 启动执行，先启 console 后注册的节点 l2_allowed 恒 0、提交必拒。修复：registry.Handler 携带 config 白名单，注册成功后立即同步（启动同步保留为兜底）。
+3. **ListCommands 扫描列错位**：RETURNING 专用 scanCommandPlain 被误用于 join 查询（21 列 vs 20 目标）→ Scan 报错。修复并全量核查 scanCommand/scanCommandPlain 调用点。
+4. **MCP 输出 schema 校验拒绝 json.RawMessage**：SDK 按输出结构生成 outputSchema，RawMessage 被推断为 array 与 object 实值冲突 → 工具调用报「validating tool output」。修复：MCP 输出结构 args 改 map[string]any（argsObj 解码）；meshview/panel JSON 端点不受影响。
+
+### 与 SPEC 的偏差（如实声明）
+
+- **migration 序号**：SPEC §1 称「migration v6」，v6/v7 已被 M1b-c2 账号表与 R33-#1 占用，按既有序号顺延为 **v8**（表结构以 SPEC 为准；store.go 注释与 DESIGN 注记均已注明）。
+- **「DESIGN §4.2-D」引用**：命令协议基线的实际章节是 DESIGN **§4.1-D「D. 操作通道」**（§4.2-D 为代码流水线衔接小节）；实现注记落在 §4.1-D 末尾并在 §4.2-D 加指引。
+- **submission_key 全局唯一**（未按 DESIGN 的 (identity, key) 复合唯一）：SPEC §1 明文「唯一索引」为准；单管理员 + 带外签发 token 形态下无跨身份冲突面，10 分钟窗口 + archived_key 归档语义与 DESIGN 一致。
+- **agent 重启 intent 无结果**：console 侧以 SweepUnknown 兜底达成 unknown 对齐；agent 主动补发 interrupted 回执（DESIGN §4.1-D 崩溃恢复对账的加强实现），console 收到后置 unknown+degraded 并 ACK。
+- **Windows 平台**：无 kind 实装（SPEC §6 非目标），caps 预留 `windows`；进程组杀树退化为单进程 Kill（Job Object 属 M3b），编译面三平台通过。
+
+## R39 · codex 复审 m1d + 裁决：派修复轮（2026-10-08 22:20，值班员执行）
+
+**结论：不通过 → 派 m1d-fix（本任务修复轮 1）。** codex 复审 m1d（review-m1d.out）判不通过：4 条阻塞 + 2 条建议；R38 三项核销确认关闭（注册后 l2 白名单同步、ListCommands 查询扫描分离、MCP args 对象输出）。codex 环境无 go 未复跑测试（只读审查常态），验证以修复轮 zcode 全绿记录为准，codex 全程未修改仓库文件。m1d 为新交付任务首轮审查，修复轮计数 0→1，未触 3 轮护栏；4 条阻塞均首次出现，未触「同条修两次不过」升级。
+
+### 裁决（Hana，值班员自主）
+
+| # | 级别 | 意见 | 裁决 | 口径 |
+|---|------|------|------|------|
+| 1 | 阻塞 | cmdkind.go:203 / agent/worker.go:230 整数槽被规范化为字符串，agent 再校验只接受数字，合法 journalctl_tail、mac_log_show 被拒执行 | 采纳修复 | 校验与序列化规范化闭环一致：整数槽在 JSON 往返后按「数字或数字字符串」归一校验，单测钉住真实链路（console 下发 → 序列化 → agent 反序列化 → 校验通过） |
+| 2 | 阻塞 | store/command.go:336 / agent/worker.go:157 120s 租约重领会更新 claimed_at，原 worker 按 command_id 跳过新领取；执行超租约后旧回执被 drop，随后可能重执行，破坏去重与结果对账 | 采纳修复 | 回执归属与执行权对齐租约代次（claimed_at 快照/代次令牌）：worker 只为其持有的租约代次上报与对账；重领后旧代次静默退役（不重执行、不误报），单测复现「超租约执行 + 重领」场景 |
+| 3 | 阻塞 | executor.go:143,148 R38 64KB 预算修复未完全关闭：压正文后再追加截断标注、非法 UTF-8 替换扩容，最终结果仍可超上限再次触发回执丢弃 | 采纳修复 | finalizeResult 以「最后一步硬保证 ≤ ResultHardCap」收口：标注计入预算、任何扩容操作（UTF-8 替换等）后复核，超限即再压正文保标注；单测构造「压正文后追加标注」与「UTF-8 替换扩容」两形态 |
+| 4 | 阻塞 | SPEC §3.5 未实现：缺会话采集、agent_sessions 表/协议、daemon 过滤、面板会话卡与 list_active_sessions | 采纳修复 | §3.5 是伦哥 20:35 点名需求（「能看到当前 agent 会话在干嘛」），M1d 承诺范围；R38 偏差声明未提及该裁剪，属规格缺口而非可选裁剪——按 SPEC 原文整套补齐（migration 序号顺延） |
+| 5 | 建议 | usercmd.go:364 -config= 等号写法吞掉全部后缀（R37 候选残留，-scope operator 后置被静默忽略） | 采纳修复（核销 R37 候选） | R37 已预告该候选去向 M1d 批次，本轮顺带核销、终止沿用噪声：stripConfigFlag 仅剥离 config 参数本身、保留其余后缀，补等号写法测试（`-config=x extra -expires <未来>` 拒绝、`-config=x -expires <未来>` 正常签发） |
+| 6 | 建议 | cmdsvc.go:204 仅同键异参触发窗口归档，同键同参超 10 分钟仍永久返回旧命令，不符声明窗口复用语义 | 采纳修复 | 幂等命中前统一过窗口检查（同参/异参同口径），超窗 ArchiveSubmissionKey 归档后键可复用；单测补「同键同参超窗 → 归档 → 可重新提交」形态 |
+
+**修复轮范围**：6 条全部 → 派 m1d-fix（值班员 nohup pipeline-run.sh 直接派发，不占 NEXT-TASK 队列）。验证口径不变：vet/gofmt/test 全绿 + cross 三平台 + node --check，R38 已验收面（SPEC §7 已核销条款、254 用例基线）不回退。若修复后复审仍有建议级残余，按既有口径转候选或收口，阻塞级零容忍。
+
+## R40 · codex 复审 m1d-fix + 裁决：派修复轮 2（2026-10-08 22:56，值班员执行）
+
+**结论：不通过 → 派 m1d-fix2（本任务修复轮 1→2）。** codex 复审修复轮 1（review-m1d-fix.out）判不通过：6 条中仅 #1 关闭（cmdkind.go:221 整数往返校验，证据确认），3 阻塞 + 2 建议未关闭。值班员抽查核实 codex 证据：mcpserver.go:145 仍为 list_agent_tasks（§3.5 五件全未落）、usercmd.go 等号分支现状与其描述吻合；修复轮 1 属部分完成（zcode 大范围任务截断嫌疑，验证全绿但审查面未闭合）。修复轮计数 1→2，未触 3 轮护栏；各条均首次「修后不过」，未触「同条修两次不过」升级。codex 全程未修改仓库文件；verify-m1d-fix 全绿（vet/test/cross 三平台/node --check）真实有效，但不等价于审查关闭。
+
+### 裁决（Hana，值班员自主）
+
+5 条未关闭项沿用 R39 既有裁决口径继续修，无新增分歧。修复 prompt 附 codex 逐条代码证据（worker.go:157 / executor.go:146-148 / agenttasks.go:71 / store.go:399 / mcpserver.go:145 / usercmd.go:364 / command.go:214 / cmdsvc.go:192），要求 zcode 逐条对照引用行自查后再报完成。另并审 1 条新意见：worker_test.go:127 非法字节被 ToValidUTF8 合并替换致回归测试掩蔽（改交替输入构造真扩容），并入 #3 处理；worker_test.go:146 超长标注用例同步按硬上限口径复核。
+
+若 fix2 复审仍有残余：建议级按既有口径转候选；若再有关键阻塞未关，即触「同条意见修两次不过」升级线，notify 伦哥裁决去向，不再自动派第 3 轮。
+
+## R41 · codex 复审 m1d-fix2 + 裁决：触发升级线，notify 伦哥（2026-10-08 23:40，值班员执行）
+
+**结论：不通过（2 阻塞第 2 次修复未关）→ 命中 R40 预设升级线，notify 伦哥裁决去向，不自动派 m1d-fix3。** codex 复审（review-m1d-fix2.out，78,877 tokens）判不通过，R40 六项 3 关 3 未关：关闭 = R39-#1 整数槽往返（维持）、R39-#3 64KB 上限（UTF-8 先修正、标注入预算、字符边界截断，测试改交替非法字节）、R39-#5 -config= 剥离（usercmd.go:359 只剥 config 项保留后缀）。
+
+### 未关阻塞（均第 2 次修复未过，值班员抽验源码吻合）
+
+| # | 源自 | 现状证据 | 抽验 |
+|---|------|----------|------|
+| B1 | R39-#2 租约代次对账 | worker.go:387-410 Drop 仅查 `Phase != PhaseResult` 不查代次；runner 同拍先 Deliver（已换入新代次）后 Drop，若新代次已快速产出结果（PhaseResult），旧回执的 Drop 会误删新结果并撤销其标记 → 丢结果、重执行 | 吻合：Drop 内无 claimed_at/代次比对，仅注释里描述了 in-flight 标记侧的防护 |
+| B2 | R39-#4 §3.5 会话内容提取 | sessions.go:245/252 只识别顶层 role/type/text；Codex `response_item.payload.content[].text` 嵌套格式解析不出 → 主题/动作恒空；sessions_test.go:49 用人工扁平格式未覆盖目标格式 | 吻合：:234 注释自述「其余格式一概不认识 → (空, false)」 |
+
+### 新增建议 ×3（全部转候选，不阻塞升级）
+
+1. cmdsvc.go:197 / store/command.go:299：窗口归档只按 key 更新未限定旧 command_id，并发提交可把另一请求刚建的新命令键归档 → 窗口内重复创建；
+2. meshview.go:640 / panel app.js:531：会话读取不检查节点离线/快照新鲜度/30 分钟窗口，agent 停机后旧会话持续显示「活跃」；
+3. sessions.go:146/180：遍历未限定普通文件，FIFO 进入解析且 os.Open 可无限等待、ctx 无法中断 → 卡住采集与心跳。
+
+### 裁决（Hana，值班员按 R40 预设口径执行，深夜 23:40）
+
+R40 原文：「若再有关键阻塞未关，即触『同条意见修两次不过』升级线，notify 伦哥裁决去向，不再自动派第 3 轮。」本轮 B1/B2 双双命中，按预设执行：
+
+1. **不派 m1d-fix3**：两条阻塞各修两轮未关，继续同路子派修属盲耗；去向由伦哥定。
+2. **3 条新增建议全部转候选**（归 M1d/M1b-c 后续批次）。
+3. **touch ADJUDICATED（无 COMMIT_OK）**：worker 回 idle，不执行 commit——m1d 未达提交线，锁定等伦哥裁决。
+4. **深夜（>23:00）notify 只留言不推送**。
+
+**伦哥可选去向**（值班员整理供参考，不代猜）：
+- **A. 深修**：派 m1d-fix3 换方案——B1 以代次令牌贯穿 Deliver/Drop/saveResultIfCurrent 全链（drop 前校验被删回执代次 == 当前持有代次）；B2 按 Codex/Claude/其他三家 JSONL 实样写解析器并以真实样本做测试。fix3 复审即触 3 轮护栏，无论结果强制收口。
+- **B. 裁剪收口**：B2 降级为「会话在列、主题/动作显示空」（现态即如此，非错误态），B1 继续修或接受既有对账语义并记录已知限制，M1d 以「主通道 + 已关闭 4 项」提交。
+- **C. 现状收口**：全部残余（2 阻塞 + 3 建议）转候选清单，m1d 现状 commit 锁定，阻塞项转 M1d-c 批次（风险：B1 属可靠性缺口，真机混沌场景下可能重执行）。
+
+codex 全程未修改仓库文件；verify-m1d-fix2 全绿记录真实有效（不等价于审查关闭，口径同 R40）。
+
+## R41 · 修复轮 2 复审裁决（2026-10-08 23:57，伦哥定案）
+
+复审不通过（2 阻塞第 2 次未闭合 + 3 新建议）。伦哥裁决：**按 Hana 推荐执行**——
+- **①租约代次对账：深修（fix3，换方案）**：代次令牌贯穿全链——console 端 commands 表加 lease_epoch，
+  回执校验 epoch 匹配；agent 端结果持久化绑定 epoch，清理只触达 ≤当前代次的条目，
+  新代次结果不可被旧清理误删；重发同 epoch 幂等，epoch 递增即旧结果作废。
+- **②§3.5 会话内容解析：降级收口**——保留会话在列（文件/mtime/大小），topic/recent_action
+  置空（UI 空态不报错）；Codex 嵌套 JSONL 解析记为已知限制，留 M1e 按真实样本实现。
+- 3 条新建议转候选。**fix3 为第 3 轮（触护栏）：复审通过即 commit，不通过即现状收口、残余转候选。**
+
+## R40' · zcode 修复轮 2 执行记录（m1d-fix2 会话留档，2026-10-09 00:1x 补记）
+
+> 定位说明：本节为 m1d-fix2 会话（22:57 派发）的执行留档。值班员流水线在本会话仍在执行时
+> （23:28 verify / 23:32 codex 抓树 / 23:40 R41 裁决 / 23:58 派 fix3）按超时推进了流程——
+> R41 复审的对象是本会话 23:3x 的中间树。本会话发现 R41 裁决与 fix3 进程（23:58 启动）后，
+> 已停止一切代码修改（epoch 深修由 fix3 按 R41 口径执行），仅补本留档，避免第三次双写互踩。
+
+### ⚠️ 并发处置记录（运维事故，如实留档）
+
+1. **fix-1 孤儿进程**：m1d-fix（22:22 派发）在 R40 裁决（22:56）与本会话派发（22:57）后仍未
+   终止，持续编辑同一工作树（meshview.go 23:14、mcpserver.go 23:15、registry_m1d_test.go 23:18
+   均其产物）——R40 codex 22:44 快照审到的「未关闭项」部分实为 fix-1 在审查后才落盘的半成品。
+   本会话 23:17 证实其活跃写盘后终止该孤儿进程（其全部已落盘产物保留并作为继续基线）；值班员
+   侧应修流水线：派发新轮前先终止旧轮进程，避免双 agent 同树互踩。
+2. **fix-1 中断残留四项（本会话收尾）**：① runner.go 仍用旧 4 值 TaskScan 签名（编译断裂）——
+   按 TaskScanResult 接线完成并顺带把 agent_sessions 三态接入心跳体；② registry 测试助手
+   beat() 硬编码 Node=n1 覆盖多节点用例——改为留空才默认；③ 全量替换用例复用一次性注册
+   token 注册第二节点必 401——加 mustRegisterWithToken 双 token 形态；④ mcpserver http_test
+   工具数 9 未随 list_active_sessions 更新——改 10。
+3. **index.html 命令表单区缺失（本会话重建）**：app.js（M1d 起）引用 cmd-form/cmd-node/
+   cmd-kind/cmd-unit/cmd-n/cmd-timeout/cmd-submit/cmd-msg/cmd-list/commands-meta 等元素，
+   index.html 中不存在（git HEAD 亦无——M1d 从未 commit 无法考古；21:53 bin/meshconsole
+   嵌入版亦无，说明表单 HTML 在交付期即缺失，app.js 尾部对 null 元素 addEventListener 会使
+   命令区整体失效）。本会话按 app.js 引用接口重建该区（任务下发表单 + 命令对账清单），
+   glass.css 的 .cmd-* 系样式完好未动。
+
+### R40 五条修复（文件:行号 · 怎么修 · 自查结论）
+
+| # | 修复 | 自查结论 |
+|---|------|----------|
+| 1 | 租约代次（R39-#2）：worker.go:166 Deliver 按 claimed_at 代次去重/退役（fix-1 半成品基础上逐行核对全链，补齐三处实现级缺口）——**a** run():303「代次复核 + 取消柄注册」同一临界区（原两段分离，retire 插入则旧进程杀不掉、新旧并行执行）；**b** run():319 收尾摘除取消柄改为仅当本代仍持有（原无条件 delete 会误删新代次刚注册的柄）；**c** worker.go:387 Drop 代次安全化（原无条件删文件+unmark：runner 同拍先 Deliver 后 Drop，旧回执的 drop 会抹掉新代次执行权→新回执被误弃→整轮重发重执行）。单测：TestWorkerDropDoesNotPoisonNewGeneration + 既有 TestWorkerLeaseGenerationRetire / TestWorkerSupersededGenerationDiscard；console 侧 TestLeaseExpiryResend 钉重发+旧回执 drop | **部分关闭**：主链路闭合，但 R41-B1 残余角落成立——Drop 只有 id 无代次，在场 PhaseResult 若已是新代次结果（同拍快速产出），旧回执 drop 无法区分归属仍可能误删（本会话守卫只护 unmark 侧）。**已并入 R41-①由 fix3 以 lease_epoch 持久化绑定彻底解决** |
+| 2 | 64KB 硬上限（R39-#3）：executor.go:134 finalizeResult 现行实现已是「suffix 先并预算、UTF-8 替换先于预算复核、出口构造保证 ≤cap」，逐行推演无超限路径；worker_test 掩蔽已是 a\xff 交替形态（fix-1 22:53 落地，codex 22:44 快照未见）。本会话补 codex 点名精确形态：TestFinalizeResultBudgetBothForms ⑥（正文恰 65536B+超时标注 already=false → 恰 cap、超时说明在场）⑦（already=true 不得二次追加标注顶破 cap） | **关闭**（R41 复审同判关闭） |
+| 3 | SPEC §3.5 五件（R39-#4）：a) 采集 sessions.go（30min 窗口/首末行轻解析/120 字/坏行跳过/分批 readdir 预算）；b) migration v9 agent_sessions 表 + HeartbeatFull 全量替换 + registry 三态解析（registry.go:442/787）+ agent 侧 runner.go 心跳接线；c) daemon 过滤 agenttasks.go Background → store 列 → 面板仪表过滤；d) 面板会话卡（index.html + app.js buildSessionCard/updateSessionCard，五要素 + 「全部安静」空态，task-note CSS 防 CJK 竖排）+ 静态资源 v=13；e) MCP list_active_sessions（mcpserver.go:168，保留 list_agent_tasks）。单测：轻解析容错/30min 边界/daemon 过滤/心跳三态/按节点全量替换 | **主体闭合**；R41-B2（Codex 嵌套 JSONL 解析不出→主题/动作恒空）按伦哥裁决降级收口（现行「解析不出显示空」即该语义），fix3 落实面板空态分支与已知限制标注 |
+| 4 | -config= 等号写法（R39-#5）：全链核验闭合——main.go:114 configFlag 等号取值、usercmd.go:356 configFlagPos 返回 (i,i) 只剥本身、:221 fs.Parse 与 :234 NArg 复核在剥离结果上。两形态测试 TestStripConfigFlagEqualsForm；二进制级双形态复验（E2E 沙箱：token create lunge -config=… -scope operator -expires <未来> 正常签发、到期 2027-07-01 落库；-config=… extra -expires → exit 2 零签发） | **关闭**（R41 复审同判关闭）。**反证备案**：codex R40 证据「usercmd.go:364 等号分支仍仅返回前缀」对照 22:44 快照——该分支 22:45 已改（文件 mtime 为证），复审快照早于落盘 |
+| 5 | 同参幂等键超窗（R39-#6）：cmdsvc.go:195 幂等命中统一过窗口（同参超窗 ArchiveSubmissionKey 归档→重试新建）；TestSubmitSameKeyBeyondWindowReuse（超窗→归档→键可复用得新命令 + 窗口内仍幂等命中对照 + archived_key 只收键/command_id 保留） | **关闭**（fix-1 22:47 落地，本会话复核确认；R41 复审未列未关） |
+
+### 本会话验证矩阵（23:5x–00:0x 全量）
+
+- `go vet ./...` 零输出；`gofmt -l` 无文件（修复 3 个未格式化文件）；`go test -count=1 ./...`
+  **15 包全绿、272 用例**；`make cross` 三平台通过，`strings bin/* | grep m1d+git_ad94e44d`
+  双二进制注入核验；`node --check app.js` 通过。
+- **二进制级 E2E 冒烟**（/tmp/mc-e2e-fix2 沙箱，真实 bin/meshconsole-darwin-arm64 + TLS）：
+  注册→心跳（agent_sessions + background 任务）→ 落库全量替换 → /api/panel/overview 会话
+  数据路径 ✓（topic/recent_action/started_at 齐全）→ MCP stdio list_active_sessions 返回
+  真数据 ✓ → 面板登录后系统 WebKit 真实渲染截图。
+- **视觉门（390px + 1400px 两档独立验收）**：WKWebView 渲染截图自检——会话卡五要素齐全、
+  CJK 全横排无竖排、长文本单行省略、表单/仪表无溢出破版（visual-judge 子代理因 provider
+  故障不可用，按同一验收标准人工判定；截图留存 /tmp/mc-e2e-fix2/panel-{1400,390}.png）。
+
+### 移交 fix3 的衔接信息
+
+1. worker.go 现行代次逻辑以 claimed_at 为令牌——fix3 换 lease_epoch 时 started map、
+   CommandRecord 持久化字段、delivery 协议字段需同步换轨；Drop 歧义角落（R41-B1）按任务书
+   d 条「结果持久化文件名绑定 epoch」消解，单测可从 TestWorkerDropDoesNotPoisonNewGeneration
+   扩展「旧清理 vs 新写入交错时序」。
+2. 会话解析降级（R41-②）：sessions.go 现行「解析不出显示空」已符合空态语义；按任务书需
+   topic 空 → 面板卡显示会话文件名 + mtime（app.js updateSessionCard 补该分支即可）。
+3. R41 三条新建议（归档并发/会话新鲜度显示/遍历 FIFO）已裁决转候选，**不在 fix3 范围，勿顺手改**。
+
+## R42 · m1d-fix3 修复轮（2026-10-09，护栏轮：复审通过即收口，本批闭合全部阻塞）
+
+**范围 = 伦哥 R41 终裁两项**：①租约代次对账深修（B1，代次令牌贯穿全链）；②§3.5 会话
+内容解析降级收口（B2）。R41 其余已关闭项（R39-#1 整数槽往返、R39-#3 64KB 预算、
+R39-#5 -config= 剥离）相关逻辑未触碰，无回退面。3 条新增建议维持 R41 裁决转候选，
+本批不处理（其中「FIFO 进入解析可无限等待」一条随 B2 降级自然消解：会话采集不再读
+文件内容，仅 stat）。
+
+### ①R41-B1 租约代次令牌贯穿全链（深修）
+
+**原 bug**：agent 对账文件以 command_id 为唯一 key，租约过期重发后旧代次的 Drop 按
+id 装载文件——装载到的已是新代次刚写入的结果文件，误删后回执丢失 → console 判
+failed(unknown) → 可能重执行。
+
+| # | 修复 | 证据（文件:行号） |
+|---|------|------|
+| a | commands 表加 `lease_epoch INTEGER NOT NULL DEFAULT 0`（migration v10，v6-v9 已占用顺延） | internal/store/store.go:460-471 |
+| b | 领取原子置 claimed + claimed_at 的同条 UPDATE 内 `lease_epoch = lease_epoch + 1`（列默认 0 → 首次领取=1、重领自增，同 command_id）；RETURNING/扫描列同步加列（与 commandColumns 列序一致） | internal/store/command.go:348、136-148、161-186 |
+| c | 回执校验：`command_results` 携带 `lease_epoch`（入站值域校验 0..2^20），`RecordCommandResults` 以 `epochMatch = row.LeaseEpoch > 0 && row.LeaseEpoch == r.LeaseEpoch` 为唯一权威令牌——旧代次迟到回执 Drop `"stale epoch"`（内容忽略、状态不动）；registry 侧 Handler 原子计数器 + AUDIT 日志带 `stale_receipts_total`（忽略并计数的 degraded 审计）；幂等命中/终态/unknown 修正各分支仅在当前代次放行，`ResultOutcome` 带回执代次 | internal/registry/commands.go:47-58、150-155、441-452、206-219；internal/registry/registry.go:73-75；internal/store/command.go:441-492 |
+| c' | `ack_ids`/`drop_ids` 协议条目对象化 `{command_id, lease_epoch}`（agent 据此只清理对应代次）；ACK 名单取自库值 `result_recorded + lease_epoch`，与回执路径同拍命中同命令时按命令合并取最大代次（避免同拍重复条目/epoch=0 伪条目）；**drop 条目携带被拒回执自陈的代次**（ResultOutcome.Drop 路径回填 `r.LeaseEpoch`）——自查中抓出的连锁缺口：drop 不带代次则 agent 找不到清理目标文件、旧回执会被无限重发/无限 drop | internal/registry/commands.go:69-77、182-249（drop 条目 212-216）；internal/store/command.go:385-391、420-424；internal/registry/registry.go:548-558 |
+| d | agent 对账文件按 `(command_id, lease_epoch)` 一文件（`<id>.e<epoch>.json`）；SaveIntent/SaveResult/Load/Delete 定点到 (id, epoch)；`DeleteUpTo(id, maxEpoch)` 目录扫描实现（ACK 后只清 ≤确认代次，畸形大 epoch 不空转）；`PurgeLegacy` 启动清除无代次旧版残留（正则按 `.e<数字>.json` 结尾形态判定，临时文件不受影响） | internal/agent/cmdstore.go:39-56、76-95、98、151-208 |
+| d' | worker 全链代次化：started 映射存 epoch；Deliver 同代去重/代次倒退防御忽略/前移退役；retire 定点删旧代次文件；saveResultIfCurrent/run 临界区复核 epoch；restoreInterrupted 按记录 epoch 恢复；Ack/DeleteUpTo + 代次守卫摘标记；Drop 定点删 (id, epoch)（在途 intent 不删、仅同代摘标记） | internal/agent/worker.go:190-231、233-256、283-308、310-345、356-380、402-421、422-452 |
+| d'' | 心跳协议 agent 侧镜像：delivery/commandResultIn 携带 `lease_epoch`，heartbeatResponse ack/drop 条目对象化（console↔agent 同仓库同版部署，无跨版本兼容面） | internal/agent/worker.go:64-82；internal/agent/client.go:249-258 |
+
+### ②R41-B2 §3.5 会话内容解析降级（伦哥定案 ②）
+
+| # | 修复 | 证据（文件:行号） |
+|---|------|------|
+| 1 | topic/recent_action 字段保留、恒为空串：删除全部内容解析（真实样本核实：本机 zcode rollout 即 model_io 嵌套结构，原扁平 `type/role+text` 解析在真实文件上同样恒空——降级为全量置空是诚实口径，无双轨）；会话仍按 mtime 30min 窗口在列，started_at/last_activity 照常 | internal/agent/collect/sessions.go:6-14、83-93 |
+| 2 | 面板会话卡：topic 空 → 显示会话文件名 + mtime（`toLocaleString`，title 带全路径），注记行「内容暂不可见」走既有 task-note 弱化样式（非错误/异常态）；M1e 恢复解析后 s.topic 非空自动回到主题/动作展示；静态资源 bump `app.js?v=13→14` | internal/panel/web/app.js:313-334；internal/panel/web/index.html:156 |
+| 3 | MCP list_active_sessions 工具描述如实标注「topic/recent_action 暂不可用（恒空串）」；meshview 视图与 DESIGN §5 agent_sessions 行同口径注记 | internal/mcpserver/mcpserver.go:167-170；internal/meshview/meshview.go:350-355；DESIGN.md §5 |
+
+### 单测（R41 任务 e 口径：真实时序模拟，非先后调用）
+
+| 场景 | 用例（文件:行号） |
+|------|------|
+| Drop 与新代次执行真实并发交错：gen1 回执在册 → Deliver gen2（真实子进程执行中）→ 并发 goroutine 连发 50 次旧代次 drop → gen2 回执必须完好产出、盘上仅 gen2 一条、gen1 文件清除、执行权保持 | internal/agent/worker_test.go:538-596 TestWorkerDropStaleEpochKeepsNewResult |
+| 新代次结果先写盘、旧代次 drop 后到：两代文件并存视图下定点删除只触达 (id,1)；在途 intent 不可被 drop 误删；同代 drop 照常清场（对照） | internal/agent/worker_test.go:598-665 TestWorkerDropAfterNewResultWritten |
+| epoch 迟到回执：console 重领 epoch 1→2 后旧代次回执 drop 且拒因 "stale epoch"、状态不动；未领取行（epoch 0）任何代次声明回执均拒；已记录后同代重复幂等 ACK 不覆盖、异代次拒绝 | internal/store/command_test.go:112-156 TestLeaseExpiryResend、404-452 TestStaleEpochReceiptRules；internal/registry/commands_test.go:183-232（drop 条目 + staleReceipts 计数器断言） |
+| 重发幂等：同代次重发在真实执行中并发 ×20 不重执行/不取消/恰好一份回执；结果落盘后再重发同样去重 | internal/agent/worker_test.go:740-789 TestWorkerSameEpochResendIdempotent；internal/registry/commands_test.go:115-131（重复回执幂等 ACK） |
+| ACK 后清理：确认 gen2 → gen1 残留与 gen2 出清、gen3 在途 intent 与执行权不可触达；确认 gen3 → 全清 + 摘标记；存储层代次文件隔离与 PurgeLegacy | internal/agent/worker_test.go:667-738 TestWorkerAckCleansThroughEpoch、243-291 TestCommandStoreEpochIsolation；internal/store/command_test.go:99-102（ackable 条目带代次） |
+| 首次领取 epoch=1、重领自增（store + registry 端到端） | internal/store/command_test.go:69-72、127-135；internal/registry/commands_test.go:82-85 |
+| 双端线上契约：心跳响应协议形态（commands/ack_ids/drop_ids 条目内 lease_epoch）被 agent 解析结构逐字段还原——镜像 tag 漂移会让代次令牌静默丢失 | internal/agent/wire_test.go:8-37 TestHeartbeatRespAgentWireCompat；internal/registry/commands_test.go:205-212（drop 条目回显被拒回执代次） |
+
+### 自查与如实声明
+
+- `go vet` + `gofmt -l`（0 项）+ `go test -count=1 ./...` 全绿 + `make cross` 三平台 +
+  `node --check app.js`；cross 产物 `strings | grep` 验证版本注入（自查命令逐项跑完）。
+- **协议变更同批生效**：ack_ids/drop_ids 由字符串数组改为对象数组、回执必带
+  lease_epoch——console 与 agent 同仓库同版部署，无滚动升级兼容层；旧版 agent 若先于
+  console 升级，其回执（epoch=0）会被按 stale epoch 拒收直至 agent 同步升级（E2E
+  部署形态为整机同步替换，不构成交付面）。
+- **部署上机项**：真机混沌回归（kill agent 半路 + 租约过期重发 + 双实例并发心跳）
+  本轮未重跑 E2E——同型时序已由 TestWorkerDropStaleEpochKeepsNewResult 等单测钉死，
+  真机项沿用 DELIVERY §M1d 清单。
+- fix3 为第 3 轮（触护栏）：按伦哥裁决，复审通过即 commit 收口；不通过则现状收口、
+  残余转候选。
+
+## fix3 复审裁决（2026-10-09 22:42，第 3 轮收敛收口）
+
+codex 复审结论：**修改后通过**（review-m1d-fix3.out）。R41 两条原阻塞核销：B1 旧代次
+Drop 误删新结果（清理按 `(id, epoch)` 定位，回执校验当前代次）、B2 会话内容解析
+（按伦哥降级裁决收口，面板空态与已知限制标注落地）；R41-FIFO 阻塞采集通过。新意见
+均建议/可选级，无阻塞。
+
+按伦哥 fix3 定案（第 3 轮触收敛护栏，复审通过即 commit 收口）：codex 无「不通过」且
+原阻塞全部闭合，裁决 **commit 收口**。残余意见全部转 M1b-c 候选：
+
+| # | 级别 | 意见 | 位置 |
+|---|------|------|------|
+| C1 | 建议 | 幂等键归档竞态：ArchiveSubmissionKey 只限定 key，并发可误归档刚创建的新命令键，应同时限定旧 command_id | internal/store/command.go:307 |
+| C2 | 建议 | 离线会话仍显示活跃：AgentSessions 未检查节点状态、快照新鲜度及 30min 活动窗口 | internal/meshview/meshview.go:640 |
+| C3 | 建议 | 运行报告缺代次：旧实例仅凭 ID 可把新代次标为 running 污染超时起点，运行报告应携带并校验 epoch | internal/agent/worker.go:474；internal/store/command.go:512 |
+| C4 | 建议 | 重启恢复可能降代：多代文件并存逐项覆盖 started，字典序 e10 先于 e9，应按 ID 取最大 epoch | internal/agent/worker.go:167 |
+| C5 | 建议 | SPEC 授权边界不一致：get/list 无 operator 检查但 SPEC 列入 operator 工具，需统一实现或修订规格 | internal/mcpserver/commands.go:183；SPEC-M1d.md:54 |
+| C6 | 可选 | 并发回归测试证据偏弱：Deliver 已删旧文件后 50 次 Drop 多为空射，建议受控交错确认旧文件在 Drop 开始时仍存在 | internal/agent/worker_test.go:560 |
+
+执行：touch ADJUDICATED + COMMIT_OK → worker commit 收口，回 idle。
+验证边界如实记录：codex 环境无 Go 未复跑 test/vet/cross；zcode 自查已全绿（go vet /
+gofmt / go test -count=1 ./... / make cross / node --check）。真机混沌与视觉验收沿用
+DELIVERY §M1d 清单。

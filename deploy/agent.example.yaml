@@ -55,6 +55,19 @@ disk_mount: "/"
 #     type: docker
 #     target: nextcloud
 
+# ---- 任务下发执行开关（M1d，SPEC-M1d §1）----
+# **默认 false（安全缺省）**：即使 console 误下发，本机 agent 也拒绝执行并以
+# failed 回执如实上报。双重复核的 agent 侧：mac-mini / windows 节点置 true，
+# 云节点（cloud-nanjing 等）必须保持 false。开启后 agent 心跳上报能力清单
+# （caps），console 按 kind 平台矩阵校验后才下发。
+# l2_enabled: true
+#
+# 命令执行环境（固定，不可配）：最小 env（PATH 白名单目录 + SYSTEMD_PAGER=cat
+# 禁 pager）、固定工作目录（state 同目录）、固定 argv 直接 exec 不经 shell、
+# timeout（默认 30s 上限 300s）+ 进程组 kill、stdout/stderr 合并采集 64KB 硬上限、
+# 本地并发 ≤2。执行结果持久化于 state 同目录 commands/，console ACK 后才删除
+# （未确认持续重发，防丢回执）。
+
 # ---- AI agent 发现（DESIGN §4.2-A，低频 5 分钟扫描随心跳上报）----
 # known:       覆盖内置已知 CLI 清单（默认 zcode/codex/claude/gemini/aider）；
 #              未配置该键 → 用默认；显式给出（含空列表）→ 整体替换。

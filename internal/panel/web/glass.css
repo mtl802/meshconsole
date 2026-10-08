@@ -331,7 +331,7 @@ body {
 
 @media (max-width: 980px) {
   .masthead { grid-template-columns: 1fr; align-items: start; }
-  .readout { justify-self: start; }
+  .readout { justify-self: stretch; width: 100%; }
   .col-12, .col-7, .col-5 { grid-column: span 12; }
 }
 
@@ -376,7 +376,7 @@ body {
   gap: 14px;
 }
 .task-card {
-  position: relative; overflow: hidden;
+  position: relative; overflow: hidden; min-width: 0;
   padding: 16px 18px 14px;
   display: flex; flex-direction: column; gap: 9px;
   min-width: 0;
@@ -405,6 +405,12 @@ body {
   color: var(--app-text-soft);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 会话卡「当前动作」（SPEC-M1d §3.5）：主题行（task-cmd）下的次级一行——
+   CJK 长句必须单行省略（窄列逐字竖排教训），字号略小于主题、色更淡。 */
+.task-note {
+  font-size: 0.74rem; color: var(--app-text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .task-elapsed-row { display: flex; align-items: baseline; gap: 12px; margin-top: 2px; }
 .task-elapsed {
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
@@ -430,6 +436,15 @@ body {
   gap: 14px;
 }
 @media (max-width: 980px) { .node-grid { grid-template-columns: 1fr; } }
+@media (max-width: 480px) {
+  .disk-meter { grid-template-columns: auto 1fr; gap: 4px 8px; }
+  .disk-val { justify-self: start; font-size: 0.62rem; }
+  .spark-row { grid-template-columns: 1fr; gap: 8px; }
+  .spark-val { font-size: 0.9rem; }
+  .readout { padding: 8px 2px; }
+  .gauge { padding: 4px 2px; }
+  .gauge .label { font-size: 0.56rem; letter-spacing: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+}
 .node-card {
   position: relative; overflow: hidden;
   padding: 16px 18px 14px;
@@ -461,14 +476,14 @@ body {
 .disk-meter { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
 .disk-meter .label { margin: 0; }
 .disk-val { font-family: var(--font-mono); font-size: 0.7rem; font-variant-numeric: tabular-nums; color: var(--app-text-soft); justify-self: end; }
-.disk-track { height: 4px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--app-elev) 80%, transparent); }
+.disk-track { height: 7px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--app-text) 12%, transparent); }
 [data-theme="light"] .disk-track { background: color-mix(in srgb, var(--app-text) 8%, transparent); }
 .disk-track > i {
   display: block; height: 100%; border-radius: 999px;
-  background: linear-gradient(90deg, rgb(var(--primary) / 0.9), rgb(var(--primary) / 0.55));
+  background: linear-gradient(90deg, rgb(var(--primary)), rgb(var(--primary) / 0.7));
   transition: width .6s var(--ease);
 }
-.disk-track.warn > i { background: linear-gradient(90deg, rgb(var(--accent) / 0.95), rgb(var(--accent) / 0.6)); }
+.disk-track.warn > i { background: linear-gradient(90deg, rgb(var(--accent)), rgb(var(--accent) / 0.7)); }
 /* 终端卡 agent 清单：名字 + last_activity（会话目录 stat 辅证） */
 .node-agents { display: flex; flex-direction: column; gap: 6px; }
 .node-agents .label { margin-bottom: 2px; }
@@ -489,13 +504,22 @@ body {
   font-family: var(--font-mono);
   font-size: 0.8rem;
 }
+.row .row-status { white-space: nowrap; font-size: 0.74rem; justify-self: end; }
 .row .row-name { font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .row-sub { font-size: 0.68rem; color: var(--app-text-faint); letter-spacing: 0.04em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-services { grid-template-columns: 14px 1.2fr 1fr auto; }
+.row-services { grid-template-columns: 14px 1.2fr 1fr auto auto; }
 .row-tailnet  { grid-template-columns: 14px 1.1fr 1fr auto; }
 @media (max-width: 720px) {
-  .row-services, .row-tailnet { grid-template-columns: 14px 1fr auto; }
+  .row-services { grid-template-columns: 14px 1fr auto auto; }
+  .row-tailnet { grid-template-columns: 14px 1fr auto; }
+  .row > .dot-text { grid-column: 4; }
   .row .hide-sm { display: none; }
+  .task-grid { grid-template-columns: 1fr; }
+  .readout { grid-template-columns: repeat(2, 1fr); padding: 10px 6px; }
+  .gauge { padding: 6px 4px; }
+  .gauge + .gauge { border-left: none; }
+  .gauge:nth-child(even) { border-left: 1px solid var(--app-border); }
+  .gauge:nth-child(n+3) { border-top: 1px solid var(--app-border); }
 }
 .type-chip {
   font-size: 0.6rem; letter-spacing: 0.16em; text-transform: uppercase;
@@ -505,9 +529,9 @@ body {
   justify-self: end;
 }
 .detail-line {
-  grid-column: 2 / -1;
+  grid-column: 1 / -1;
   font-size: 0.66rem; color: var(--app-text-faint); letter-spacing: 0.03em;
-  white-space: normal;
+  white-space: normal; word-break: break-all;
 }
 
 /* ---- 状态点：色点 + 文字双通道（不依赖颜色单通道） ---- */
@@ -522,6 +546,7 @@ body {
 .dot--crit { background: rgb(var(--alarm)); box-shadow: 0 0 8px rgb(var(--alarm) / 0.45); }
 .dot--dim  { background: var(--app-text-faint); }
 .dot-text { font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.row > .dot-text { white-space: nowrap; justify-self: end; grid-column: 5; grid-row: 1; }
 .status-cell { display: inline-flex; align-items: center; gap: 8px; }
 /* offline / 异常：呼吸红点（可注意的视觉处理）；运行中任务：呼吸绿点 */
 .breathing { animation: breathe 2.4s var(--ease) infinite; }
@@ -594,3 +619,51 @@ body {
 }
 .logout-btn:hover { color: rgb(var(--alarm)); border-color: rgb(var(--alarm) / .45); box-shadow: 0 8px 20px -12px rgb(var(--alarm) / .5); }
 .logout-btn:active { transform: scale(.97); }
+
+/* ============================================================================
+ * M1d 任务下发（SPEC-M1d §4）：表单 + 命令对账行
+ * ========================================================================== */
+.cmd-form {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: end;
+  margin-bottom: 14px; padding: 12px; border-radius: var(--radius, 14px);
+}
+.cmd-field {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 0.68rem; color: var(--app-text-faint); letter-spacing: 0.04em;
+}
+.cmd-field select, .cmd-field input {
+  font: inherit; font-size: 0.8rem; color: var(--app-text);
+  background: var(--glass-inset-bg, rgba(0,0,0,.04));
+  border: 1px solid var(--glass-border, rgba(0,0,0,.08));
+  border-radius: 10px; padding: 6px 10px; min-width: 120px;
+}
+.cmd-field input[type="number"] { min-width: 84px; }
+.cmd-submit {
+  font: inherit; font-size: 0.8rem; font-weight: 600; cursor: pointer;
+  color: #fff; background: rgb(var(--primary));
+  border: none; border-radius: 10px; padding: 8px 18px;
+}
+.cmd-submit:disabled { opacity: .5; cursor: wait; }
+.cmd-msg { font-size: 0.72rem; color: var(--app-text-faint); max-width: 40%; }
+.cmd-msg-ok { color: var(--ok-text, #0a7d55); }
+.cmd-msg-bad { color: var(--crit-text, #b3261e); }
+.row-cmd .detail-line {
+  grid-column: 1 / -1; font-size: 0.68rem; color: var(--app-text-faint);
+  font-family: var(--mono, monospace); white-space: pre-wrap; word-break: break-all;
+  max-height: 4.5em; overflow: hidden;
+}
+
+/* ---- 手机窄屏收口（v9）：顶栏 label、spark 行单列防溢出 ---- */
+@media (max-width: 480px) {
+  .readout { padding: 8px 2px; }
+  .gauge { padding: 4px 2px; }
+  .gauge .label { font-size: 0.56rem; letter-spacing: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .spark-row { grid-template-columns: 1fr; gap: 8px; }
+  .spark-val { font-size: 0.9rem; }
+}
+
+@media (max-width: 480px) {
+  .spark-row { grid-template-columns: 1fr !important; }
+  .node-card * { min-width: 0; }
+  .node-card .spark-block svg { height: 36px; }
+}

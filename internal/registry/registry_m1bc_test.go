@@ -23,6 +23,9 @@ type beatBody struct {
 	AgentTasks *json.RawMessage `json:"agent_tasks,omitempty"`
 	// R27-#4：任务清单截断标记（真值随显式 agent_tasks 数组一同上报）。
 	AgentTasksTruncated *bool `json:"agent_tasks_truncated,omitempty"`
+	// M1d §3.5：活跃会话快照（三态同上）。
+	AgentSessions          *json.RawMessage `json:"agent_sessions,omitempty"`
+	AgentSessionsTruncated *bool            `json:"agent_sessions_truncated,omitempty"`
 }
 
 func raw(s string) *json.RawMessage {
@@ -60,10 +63,13 @@ func metricsOK() map[string]any {
 	return map[string]any{"cpu_pct": 1.0, "mem_used": 1, "mem_total": 4, "uptime_s": 5}
 }
 
-// beat 发一条 metrics 合法的心跳，返回响应码。
+// beat 发一条 metrics 合法的心跳，返回响应码。Node 留空默认 n1（多节点测试
+// 先行设置 body.Node，不得覆盖）。
 func beat(t *testing.T, h *Handler, tok string, body beatBody) int {
 	t.Helper()
-	body.Node = "n1"
+	if body.Node == "" {
+		body.Node = "n1"
+	}
 	body.AgentVersion = "v"
 	if body.Metrics == nil {
 		body.Metrics = metricsOK()

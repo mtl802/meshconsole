@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light">
 <meta name="robots" content="noindex">
 <title>MeshConsole — 登录</title>
-<link rel="stylesheet" href="/glass.css">
+<link rel="stylesheet" href="/glass.css?v=12">
 <style>
   /* 登录页局部样式：复用 glass token，仅卡片与表单布局在此定义 */
   .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
@@ -23,11 +23,11 @@
   .login-field input{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:12px;
     border:1px solid var(--stroke-glass, rgba(11,60,47,.16));background:rgba(255,255,255,.75);
     font:inherit;font-size:14px;color:var(--ink, #0b3c2f);outline:none;transition:border-color .2s, box-shadow .2s}
-  .login-field input:focus{border-color:var(--primary, rgb(4 120 87));box-shadow:0 0 0 3px rgb(4 120 87 / .15)}
+  .login-field input:focus{border-color:rgb(var(--primary, 4 120 87));box-shadow:0 0 0 3px rgb(var(--primary, 4 120 87) / .15)}
   .login-btn{width:100%;margin-top:10px;padding:12px;border:0;border-radius:12px;cursor:pointer;
-    background:var(--primary, rgb(4 120 87));color:#fff;font:inherit;font-size:14px;font-weight:650;
+    background:rgb(var(--primary, 4 120 87));color:#fff;font:inherit;font-size:14px;font-weight:650;
     transition:transform .2s var(--ease, ease), box-shadow .2s}
-  .login-btn:hover{box-shadow:0 10px 24px -10px rgb(4 120 87 / .55)}
+  .login-btn:hover{box-shadow:0 10px 24px -10px rgb(var(--primary, 4 120 87) / .55)}
   .login-btn:active{transform:scale(.98)}
   .login-err{margin:0 0 16px;padding:10px 12px;border-radius:10px;font-size:13px;
     background:rgb(196 74 58 / .12);color:#a03a2c;border:1px solid rgb(196 74 58 / .3)}

@@ -95,6 +95,25 @@ pki_dir: "./pki"
 # 用户（Windows 为 ACL 等价约束）；③panel_allowed_hosts 合法（加载期校验）。
 # 数据文件权限强制 data 目录 0700、DB/WAL/SHM 0600。
 
+# ---- 任务下发（M1d，SPEC-M1d §1/§3）----
+# L2 下发白名单（伦哥 gate）：**仅 mac-mini / windows 可下发，云节点禁止**。
+# 名单为空/未配置 = 全部节点禁止下发（安全缺省）。提交与 agent 领取双重复核
+# 均以本名单同步的 nodes.l2_allowed 列为准。
+# l2_allowed_nodes: ["mac-mini", "windows"]
+#
+# 已审核 kind 的参数化实例扩展（可选）：允许提交不受「受管服务集合」限制的
+# 具名 unit 等参数实例——**不能引入新可执行路径**（kind 决定二进制），字符集/
+# 值域校验照常，非法条目拒绝启动。
+# l2_extra_commands:
+#   - kind: journalctl_tail
+#     args: {"unit": "nginx", "n": 200}
+#
+# 协议基线（DESIGN §4.1-D）：提交幂等键（同键同参 10 分钟窗口返回原命令，
+# 同键异参 409，窗口过期键归档可复用）；领取原子（心跳响应写入前已置 claimed
+# + claimed_at，lease 120s 过期重发）；回执 ACK（agent 收到才删本地，未确认
+# 持续重发）；lease×2 或 timeout×1.5 无回执 → unknown（非 failed），迟到回执
+# 修正并保留 degraded 历史。commands 表保留 90 天（每小时清理）。
+
 # ---- 资源限额 ----
 
 # 连接总数上限（DESIGN §7-4/§7-9，LimitListener）：超出的并发连接在内核

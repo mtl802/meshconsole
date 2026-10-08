@@ -236,10 +236,33 @@ func Register(ctx context.Context, client *http.Client, consoleURL, regToken, na
 	}, nil
 }
 
+// heartbeatCmdExtras 为 M1d 命令协议的心跳扩展字段（SPEC-M1d §2）：caps 能力
+// 协商、command_results 回执（未 ACK 持续重发）、command_running 执行中报告、
+// command_unacked 本地未确认结果清单（console 据 result_recorded 回 ack_ids）。
+type heartbeatCmdExtras struct {
+	caps    []string
+	results []*CommandRecord
+	running []string
+	unacked []string
+}
+
+// heartbeatResponse 为心跳响应的 agent 侧解析形态：Commands 为领取的待执行
+// 命令（console 已置 claimed + claimed_at + lease_epoch）；AckIDs/DropIDs 为
+// 已落库回执确认 / 无归属回执丢弃指示（条目携带租约代次——收到才删对应代次
+// 及更早的本地对账文件，R41-B1）。
+type heartbeatResponse struct {
+	Status   string      `json:"status"`
+	Commands []delivery  `json:"commands"`
+	AckIDs   []ackEntry  `json:"ack_ids"`
+	DropIDs  []dropEntry `json:"drop_ids"`
+}
+
 // reportOnce 采集并上报一次心跳。请求绑定调用方 ctx，取消/退出时立即中断（审查 R1-#10）。
 // M1b-a 扩展：心跳体按需携带 services（配置声明了服务清单即每次上报，
 // 含显式空列表以驱动 console 侧 stale）与 agents（首轮扫描完成后上报）。
-func reportOnce(ctx context.Context, client *http.Client, consoleURL, nodeToken, name, version string, c *collect.Collector, extra *heartbeatExtras) error {
+// M1d 扩展：携带 caps/command_results/command_running/command_unacked，并解析
+// 响应中的 commands/ack_ids/drop_ids（旧形态丢弃响应体，M1d 起命令通道依赖它）。
+func reportOnce(ctx context.Context, client *http.Client, consoleURL, nodeToken, name, version string, c *collect.Collector, extra *heartbeatExtras, cmd *heartbeatCmdExtras) (*heartbeatResponse, error) {
 	snap := c.Collect()
 	body := map[string]any{
 		"node":           name,
@@ -250,31 +273,54 @@ func reportOnce(ctx context.Context, client *http.Client, consoleURL, nodeToken,
 	if extra != nil {
 		extra.apply(ctx, snap, body)
 	}
+	if cmd != nil {
+		if len(cmd.caps) > 0 {
+			body["caps"] = cmd.caps
+		}
+		if len(cmd.results) > 0 {
+			body["command_results"] = cmd.results
+		}
+		if len(cmd.running) > 0 {
+			body["command_running"] = cmd.running
+		}
+		if len(cmd.unacked) > 0 {
+			body["command_unacked"] = cmd.unacked
+		}
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("encode heartbeat: %w", err)
+		return nil, fmt.Errorf("encode heartbeat: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, consoleURL+"/api/agent/heartbeat", bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+nodeToken)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("heartbeat request: %w", err)
+		return nil, fmt.Errorf("heartbeat request: %w", err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	// M1d：响应体承载命令通道（commands/ack_ids/drop_ids），读取上限从 4KB
+	// 放宽到 256KB（≤3 条命令 + ACK 清单，远低于该值）。
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return nil
+		out := &heartbeatResponse{}
+		if len(respBody) > 0 {
+			if err := json.Unmarshal(respBody, out); err != nil {
+				// 响应体畸形不使心跳失败（指标通道已成功）：返回空命令集。
+				return &heartbeatResponse{Status: "ok"}, nil
+			}
+		}
+		return out, nil
 	case resp.StatusCode == http.StatusUnauthorized:
 		// 节点 token 失效/被吊销：不自动重注册，持续退避并显式报错，等待人工处置。
-		return fmt.Errorf("heartbeat rejected: HTTP 401 (node token invalid or revoked)")
+		return nil, fmt.Errorf("heartbeat rejected: HTTP 401 (node token invalid or revoked)")
 	case resp.StatusCode == http.StatusForbidden:
-		return fmt.Errorf("heartbeat rejected: HTTP 403 (node identity mismatch)")
+		return nil, fmt.Errorf("heartbeat rejected: HTTP 403 (node identity mismatch)")
 	default:
-		return fmt.Errorf("heartbeat rejected: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("heartbeat rejected: HTTP %d", resp.StatusCode)
 	}
 }

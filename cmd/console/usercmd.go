@@ -8,7 +8,7 @@
 //	meshconsole user passwd <用户名>                     改密（撤销该用户全部会话与 token）
 //	meshconsole user disable <用户名>                    禁用（最后一个启用用户拒绝；撤销会话与 token）
 //	meshconsole user enable <用户名>                     启用
-//	meshconsole token create <用户名> [-desc 文本] [-expires RFC3339]   签发 API token（明文只显示一次）
+//	meshconsole token create <用户名> [-desc 文本] [-expires RFC3339] [-scope readonly|operator]  签发 API token（明文只显示一次）
 //	meshconsole token list                              列出全部 API token
 //	meshconsole token revoke <id>                       吊销指定 API token
 package main
@@ -34,8 +34,8 @@ const userUsage = `用法:
   meshconsole user passwd <用户名>                 修改口令（撤销该用户全部会话与 API token）
   meshconsole user disable <用户名>                禁用用户（最后一个启用用户拒绝；撤销全部会话与 API token）
   meshconsole user enable <用户名>                 启用用户
-  meshconsole token create <用户名> [-desc 文本] [-expires RFC3339]
-                                                   签发 MCP API token（明文仅显示一次，请立即保存）
+  meshconsole token create <用户名> [-desc 文本] [-expires RFC3339] [-scope readonly|operator]
+                                                   签发 MCP API token（明文仅显示一次，请立即保存；scope 缺省 readonly）
   meshconsole token list                           列出全部 API token（不含明文）
   meshconsole token revoke <id>                    按 id 吊销 API token
 `
@@ -209,16 +209,23 @@ func cmdToken(args []string, cfgPath string) int {
 		// rest：[create, <用户名>, flags...]。
 		rest := stripConfigFlag(args)
 		if len(rest) < 2 {
-			fmt.Fprint(os.Stderr, "用法: meshconsole token create <用户名> [-desc 文本] [-expires RFC3339]\n")
+			fmt.Fprint(os.Stderr, "用法: meshconsole token create <用户名> [-desc 文本] [-expires RFC3339] [-scope readonly|operator]\n")
 			return 2
 		}
 		fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 		desc := fs.String("desc", "", "token 用途说明（如：HanaAgent Mac）")
 		expires := fs.String("expires", "", "到期时刻 RFC3339（如 2026-12-31T23:59:59Z；缺省长期有效）")
+		scope := fs.String("scope", "readonly", "token 权限：readonly（只读查询）| operator（+ submit_command 等写工具，SPEC-M1d §4；缺省 readonly）")
 		// 解析失败必须报错退出（R33-#5）：-expires 缺值/拼错若被忽略，
 		// 会把「本应有期」的 token 签成长期有效。
 		if err := fs.Parse(rest[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "错误：参数解析失败，未签发任何 token（-expires 需要形如 2026-12-31T23:59:59Z 的值；-desc 需要文本值）")
+			fmt.Fprintln(os.Stderr, "错误：参数解析失败，未签发任何 token（-expires 需要形如 2026-12-31T23:59:59Z 的值；-desc 需要文本值；-scope 取 readonly|operator）")
+			return 2
+		}
+		switch *scope {
+		case "readonly", "operator":
+		default:
+			fmt.Fprintf(os.Stderr, "错误：-scope 须为 readonly|operator，收到 %q；未签发任何 token\n", *scope)
 			return 2
 		}
 		// R35-#3：解析成功后复核剩余位置参数——flag 包遇首个位置参数即停，
@@ -261,12 +268,12 @@ func cmdToken(args []string, cfgPath string) int {
 			fmt.Fprintf(os.Stderr, "错误：生成 token 失败：%v\n", err)
 			return 1
 		}
-		id, err := st.CreateAPIToken(ctx, apiTokenHash(plain), u.ID, *desc, expAt)
+		id, err := st.CreateAPIToken(ctx, apiTokenHash(plain), u.ID, *desc, expAt, *scope)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "错误：写入 token 失败：%v\n", err)
 			return 1
 		}
-		fmt.Printf("API token #%d 已签发给用户 %q（明文仅显示一次，请立即保存）：\n\n  %s\n\n", id, username, plain)
+		fmt.Printf("API token #%d 已签发给用户 %q（scope=%s，明文仅显示一次，请立即保存）：\n\n  %s\n\n", id, username, *scope, plain)
 		if expAt != nil {
 			fmt.Printf("到期时刻：%s\n", time.Unix(*expAt, 0).Format(time.RFC3339))
 		} else {
@@ -289,13 +296,13 @@ func cmdToken(args []string, cfgPath string) int {
 			fmt.Println("当前没有任何 API token。")
 			return 0
 		}
-		fmt.Printf("%-6s %-16s %-24s %-20s %s\n", "ID", "用户", "说明", "创建时刻", "到期时刻")
+		fmt.Printf("%-6s %-16s %-10s %-24s %-20s %s\n", "ID", "用户", "SCOPE", "说明", "创建时刻", "到期时刻")
 		for _, r := range rows {
 			exp := "长期"
 			if r.ExpiresAt.Valid {
 				exp = time.Unix(r.ExpiresAt.Int64, 0).Format(time.RFC3339)
 			}
-			fmt.Printf("%-6d %-16s %-24s %-20s %s\n", r.ID, r.Username, truncateDesc(r.Description, 24),
+			fmt.Printf("%-6d %-16s %-10s %-24s %-20s %s\n", r.ID, r.Username, r.Scope, truncateDesc(r.Description, 24),
 				time.Unix(r.CreatedAt, 0).Format("2006-01-02 15:04"), exp)
 		}
 	case "revoke":
@@ -332,7 +339,12 @@ func cmdToken(args []string, cfgPath string) int {
 	return 0
 }
 
-// configFlagPos 返回 args 中 -config/--config 项（含值）的下标区间；无则 (-1,-1)。
+// configFlagPos 返回 args 中 -config/--config 项的下标与其值的下标：分离值形态
+// （-config 值）值在 i+1；**等号形态（-config=值）值内嵌于该项本身，返回 (i, i)**
+// ——stripConfigFlag 据此只剥离该项本身、保留其后全部参数（R37 候选/R39-#5：
+// 旧写法对等号形态返回 (i,-1)，把 -config= 之后的 -expires、-scope 与多余位置
+// 参数一并静默丢弃，NArg 复核与 flag 解析全被绕过）。值缺失（末尾孤 -config）
+// 返回 (i,-1)：其后已无参数可保留。无 -config 返回 (-1,-1)。
 func configFlagPos(args []string) (int, int) {
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -342,7 +354,7 @@ func configFlagPos(args []string) (int, int) {
 			}
 			return i, -1
 		case strings.HasPrefix(args[i], "-config="), strings.HasPrefix(args[i], "--config="):
-			return i, -1
+			return i, i
 		}
 	}
 	return -1, -1

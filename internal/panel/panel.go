@@ -34,7 +34,11 @@ import (
 	"time"
 
 	"github.com/mtl802/meshconsole/internal/auth"
+	"github.com/mtl802/meshconsole/internal/cmdkind"
+	"github.com/mtl802/meshconsole/internal/cmdsvc"
+	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/meshview"
+	"github.com/mtl802/meshconsole/internal/store"
 )
 
 //go:embed all:web
@@ -55,6 +59,9 @@ const overviewConcurrent = 8
 // maxLoginBody 为登录表单体上限（用户名/口令字段远小于该值，超限即拒绝）。
 const maxLoginBody = 4 << 10
 
+// maxCommandFormBody 为命令提交表单体上限（几个短字段，超限即拒绝）。
+const maxCommandFormBody = 8 << 10
+
 // loginPageData 为登录页模板数据（Error 文案来自包内常量，无用户可控内容，
 // 仍经 html/template 转义兜底）。
 type loginPageData struct {
@@ -64,6 +71,8 @@ type loginPageData struct {
 // Panel 为面板处理器集合。
 type Panel struct {
 	q     *meshview.Query
+	st    *store.Store
+	cfg   *config.Console
 	log   *slog.Logger
 	web   fs.FS
 	auth  *auth.Manager
@@ -72,7 +81,8 @@ type Panel struct {
 
 // New 构造面板处理器。allowedHosts 为 Host/Origin 白名单（裸主机名/IP，调用方
 // 须传 config.AllowedHosts() 规范化产物；nil 时回退缺省回环名单，便于测试）。
-func New(q *meshview.Query, log *slog.Logger, am *auth.Manager, allowedHosts []string) *Panel {
+// st + cfg 承载 M1d 命令提交（面板单管理员 = operator，SPEC-M1d §1/§4）。
+func New(q *meshview.Query, st *store.Store, cfg *config.Console, log *slog.Logger, am *auth.Manager, allowedHosts []string) *Panel {
 	sub, err := fs.Sub(embedded, "web")
 	if err != nil {
 		// embed 布局编译期确定，不可能失败；防御性兜底。
@@ -81,7 +91,7 @@ func New(q *meshview.Query, log *slog.Logger, am *auth.Manager, allowedHosts []s
 	if allowedHosts == nil {
 		allowedHosts = []string{"localhost", "127.0.0.1", "::1"}
 	}
-	return &Panel{q: q, log: log, web: sub, auth: am, hosts: allowedHosts}
+	return &Panel{q: q, st: st, cfg: cfg, log: log, web: sub, auth: am, hosts: allowedHosts}
 }
 
 // RegisterRoutes 把面板路由挂到 mux。
@@ -99,6 +109,16 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	sem := make(chan struct{}, overviewConcurrent)
 	mux.Handle("GET /api/panel/overview",
 		p.guard(p.requireSession(limitConcurrent(sem, http.HandlerFunc(p.handleOverview)))))
+	// M1d 命令通道（SPEC-M1d §4）：查询/元数据（GET）与提交（POST，面板单管理员
+	// = operator）。同一会话守卫 + Host/Origin 校验（guard）覆盖；POST 同源表单
+	// 由会话 Cookie SameSite=Lax 覆盖 CSRF 面（SPEC §4）。
+	semCmd := make(chan struct{}, overviewConcurrent)
+	mux.Handle("GET /api/panel/command_meta",
+		p.guard(p.requireSession(limitConcurrent(semCmd, http.HandlerFunc(p.handleCommandMeta)))))
+	mux.Handle("GET /api/panel/commands",
+		p.guard(p.requireSession(limitConcurrent(semCmd, http.HandlerFunc(p.handleCommandList)))))
+	mux.Handle("POST /api/panel/commands",
+		p.guard(p.requireSession(limitConcurrent(semCmd, http.HandlerFunc(p.handleCommandSubmit)))))
 }
 
 // limitConcurrent 用信号量限制在处理请求数，超限 503（SPEC §7 overview 配额 8）。
@@ -327,4 +347,182 @@ func (p *Panel) handleOverview(w http.ResponseWriter, r *http.Request) {
 	if err := enc.Encode(ov); err != nil {
 		p.log.Error("panel overview encode", "err", err)
 	}
+}
+
+// ---- M1d 命令通道（SPEC-M1d §4：面板提交与查询，单管理员 = operator）----
+
+// commandMetaOut 为 command_meta 输出：kind 白名单（含参数槽定义，驱动表单）+
+// 节点下发资格（l2_allowed/在线），前端只渲染不做业务计算。
+type commandMetaOut struct {
+	Kinds []commandKindMeta `json:"kinds"`
+	Nodes []commandNodeMeta `json:"nodes"`
+}
+
+type commandKindMeta struct {
+	Name      string            `json:"name"`
+	Platforms []string          `json:"platforms"`
+	Slots     []commandSlotMeta `json:"slots"`
+	ArgvHint  string            `json:"argv_hint"`
+	Required  []string          `json:"required_caps"` // 展示用（OR 组合拍平）
+}
+
+type commandSlotMeta struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"` // unit | int
+	Min     int64  `json:"min,omitempty"`
+	Max     int64  `json:"max,omitempty"`
+	Managed bool   `json:"managed"` // unit 槽须在受管服务集合内（或 l2_extra 扩展）
+}
+
+type commandNodeMeta struct {
+	Name      string `json:"name"`
+	Online    bool   `json:"online"`
+	L2Allowed bool   `json:"l2_allowed"`
+	OS        string `json:"os"`
+}
+
+func (p *Panel) handleCommandMeta(w http.ResponseWriter, r *http.Request) {
+	out := commandMetaOut{Kinds: []commandKindMeta{}, Nodes: []commandNodeMeta{}}
+	for _, name := range cmdkind.Names() {
+		k := cmdkind.Lookup(name)
+		km := commandKindMeta{Name: name, Platforms: k.Platforms, Slots: []commandSlotMeta{}}
+		for _, s := range k.Slots {
+			sm := commandSlotMeta{Name: s.Name, Managed: s.Managed}
+			switch s.Kind {
+			case cmdkind.SlotUnit:
+				sm.Type = "unit"
+			default:
+				sm.Type = "int"
+				sm.Min, sm.Max = s.Min, s.Max
+			}
+			km.Slots = append(km.Slots, sm)
+		}
+		km.ArgvHint = strings.Join(k.Template, " ")
+		seen := map[string]bool{}
+		for _, combo := range k.RequiredCaps {
+			for _, c := range combo {
+				if !seen[c] {
+					seen[c] = true
+					km.Required = append(km.Required, c)
+				}
+			}
+		}
+		out.Kinds = append(out.Kinds, km)
+	}
+	nodes, err := p.q.Nodes(r.Context())
+	if err == nil {
+		for _, n := range nodes {
+			out.Nodes = append(out.Nodes, commandNodeMeta{
+				Name: n.Name, Online: n.Status == "online", L2Allowed: n.L2Allowed, OS: n.OS,
+			})
+		}
+	}
+	writePanelJSON(w, out)
+}
+
+func (p *Panel) handleCommandList(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	cmds, err := p.q.Commands(r.Context(), r.URL.Query().Get("node"), r.URL.Query().Get("status"), limit, false)
+	if err != nil {
+		p.log.Error("panel command list", "err", err)
+		http.Error(w, "内部错误", http.StatusInternalServerError)
+		return
+	}
+	writePanelJSON(w, map[string]any{"commands": cmds})
+}
+
+// handleCommandSubmit 处理命令提交表单（SPEC-M1d §7 验收：面板向 mac-mini 发
+// ps_snapshot）。面板会话即单管理员 = operator（SPEC §1）；授权在服务端
+// cmdsvc.Submit 统一执行（节点在线/l2 白名单/caps/kind 参数槽/配额/幂等）。
+// 成功 200 返回 command_id；失败按错误类型映射 400/403/404/409/429（中文提示）。
+func (p *Panel) handleCommandSubmit(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCommandFormBody)
+	if err := r.ParseForm(); err != nil || len(r.PostForm) > 16 {
+		http.Error(w, "请求无效", http.StatusBadRequest)
+		return
+	}
+	node := strings.TrimSpace(r.PostFormValue("node"))
+	kind := strings.TrimSpace(r.PostFormValue("kind"))
+	unit := strings.TrimSpace(r.PostFormValue("unit"))
+	n := strings.TrimSpace(r.PostFormValue("n"))
+	timeoutStr := strings.TrimSpace(r.PostFormValue("timeout_s"))
+	if node == "" || kind == "" {
+		http.Error(w, "请求无效：缺少 node 或 kind", http.StatusBadRequest)
+		return
+	}
+	args := map[string]any{}
+	if unit != "" {
+		args["unit"] = unit
+	}
+	if n != "" {
+		nn, err := strconv.ParseInt(n, 10, 64)
+		if err != nil {
+			http.Error(w, "请求无效：n 须为整数", http.StatusBadRequest)
+			return
+		}
+		args["n"] = nn
+	}
+	argsJSON, _ := json.Marshal(args)
+	var timeoutS int64
+	if timeoutStr != "" {
+		v, err := strconv.ParseInt(timeoutStr, 10, 64)
+		if err != nil {
+			http.Error(w, "请求无效：timeout_s 须为整数", http.StatusBadRequest)
+			return
+		}
+		timeoutS = v
+	}
+	// 提交者归因：会话用户名；面板单管理员按 operator 记 scope（审计不可改写）。
+	username := ""
+	if sess, err := p.auth.CheckSession(r.Context(), sessionToken(r)); err == nil && sess != nil {
+		username = sess.Username
+	}
+	res, err := cmdsvc.Submit(r.Context(), p.st, p.cfg, &cmdsvc.SubmitRequest{
+		NodeName: node, Kind: kind, ArgsJSON: string(argsJSON),
+		TimeoutS: timeoutS, CreatedBy: username, Scope: store.ScopeOperator,
+	})
+	if err != nil {
+		p.log.Warn("panel command submit rejected", "user", username, "node", node,
+			"kind", kind, "reason", err.Error())
+		switch {
+		case errors.Is(err, cmdsvc.ErrNodeNotFound):
+			http.Error(w, "节点不存在", http.StatusNotFound)
+		case errors.Is(err, cmdsvc.ErrNodeOffline):
+			http.Error(w, "节点不在线，无法下发", http.StatusConflict)
+		case errors.Is(err, cmdsvc.ErrNodeNotAllowed):
+			http.Error(w, "该节点未开放任务下发（l2 白名单仅限 mac-mini/windows，云节点禁止）", http.StatusForbidden)
+		case errors.Is(err, cmdsvc.ErrCapsUnsupported):
+			http.Error(w, "目标节点不支持该命令类型（caps 协商不匹配）", http.StatusBadRequest)
+		case errors.Is(err, cmdsvc.ErrBadKind), errors.Is(err, cmdsvc.ErrBadArgs),
+			errors.Is(err, cmdsvc.ErrBadTimeout), errors.Is(err, cmdsvc.ErrBadSubmissionKey):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, store.ErrKeyConflict):
+			http.Error(w, "submission_key 已被不同参数使用（幂等窗口内）", http.StatusConflict)
+		case errors.Is(err, store.ErrQuotaExceeded):
+			http.Error(w, "该节点在途命令已达配额（5），请等待完成后再提交", http.StatusTooManyRequests)
+		default:
+			http.Error(w, "内部错误", http.StatusInternalServerError)
+		}
+		return
+	}
+	p.log.Info("AUDIT command submitted",
+		"audit", "command", "command_id", res.Command.CommandID, "node", node,
+		"kind", kind, "args", string(argsJSON), "created_by", username,
+		"scope", store.ScopeOperator, "idempotent", res.Idempotent)
+	writePanelJSON(w, map[string]any{
+		"command_id": res.Command.CommandID,
+		"status":     res.Command.Status,
+		"idempotent": res.Idempotent,
+	})
+}
+
+// writePanelJSON 统一 JSON 输出（no-store/nosniff 由 guard 已设）。
+func writePanelJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }

@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -48,10 +49,13 @@ const (
 	maxServices      = 64      // 心跳 services 数组条目上限（M1 规模富余）
 	maxAgents        = 64      // 心跳 agents 数组条目上限
 	maxAgentTasks    = 64      // 心跳 agent_tasks 数组条目上限（SPEC-M1b-c §2.2）
+	maxAgentSessions = 64      // 心跳 agent_sessions 数组条目上限（与 agent_tasks 对齐）
 	maxSvcDetail     = 512     // 服务/agent detail 长度上限
 	maxAgentVersion  = 128     // agent 版本串长度上限
 	maxAgentPath     = 512     // agent 路径长度上限
 	maxTaskCmd       = 200     // 任务 cmd 截断长度（SPEC-M1b-c §2.1：200 字符）
+	maxSessionText   = 120     // 会话主题/当前动作截断长度（SPEC-M1d §3.5：120 字）
+	maxSessionFile   = 512     // 会话文件路径长度上限（与 agent 路径同口径）
 )
 
 // Handler 为 agent API 的 HTTP 处理器集合。
@@ -60,8 +64,15 @@ type Handler struct {
 	log *slog.Logger
 	// regTokens 为配置注入的一次性注册 token（哈希 + 到期 + 预期节点绑定）。
 	regTokens []regTokenEntry
-	// srcCIDRs 为来源收敛网段（SPEC-M1b-c2 §5；加载期已校验，非 nil）。
+	// srcCIDRs 为来源收敛网段（config 加载期已校验，非 nil）。
 	srcCIDRs []*net.IPNet
+	// l2Allowed 为配置声明的下发白名单（SPEC-M1d §1）：节点注册成功后同步进
+	// nodes.l2_allowed——补齐「先启 console 后注册节点」的窗口（启动时已同步
+	// 一次，见 cmd/console main）。
+	l2Allowed []string
+	// staleReceipts 为旧代次迟到回执的累计计数（R41-B1：忽略并计数的 degraded
+	// 审计；随 AUDIT 日志输出累计值，进程生命周期内单调）。
+	staleReceipts atomic.Int64
 }
 
 type regTokenEntry struct {
@@ -74,8 +85,9 @@ type regTokenEntry struct {
 
 // New 构造 Handler。allowedCIDRs 为来源收敛网段（config 加载期解析产物）；
 // 传 nil 时取缺省私网清单（测试便利，生产路径由 config 统一产出）。
-func New(st *store.Store, log *slog.Logger, registrationTokens []config.RegistrationToken, allowedCIDRs []*net.IPNet) *Handler {
-	h := &Handler{st: st, log: log, srcCIDRs: allowedCIDRs}
+// l2AllowedNodes 为下发白名单（config 声明；注册成功后随 SyncL2Allowed 入库）。
+func New(st *store.Store, log *slog.Logger, registrationTokens []config.RegistrationToken, allowedCIDRs []*net.IPNet, l2AllowedNodes []string) *Handler {
+	h := &Handler{st: st, log: log, srcCIDRs: allowedCIDRs, l2Allowed: l2AllowedNodes}
 	if h.srcCIDRs == nil {
 		h.srcCIDRs = defaultSourceCIDRs()
 	}
@@ -386,6 +398,11 @@ func (h *Handler) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Info("node registered", "node_id", node.ID, "name", node.Name, "role", node.Role,
 		"os", node.OS, "arch", node.Arch)
+	// L2 白名单同步（SPEC-M1d §1）：新注册节点立即按 config 声明落
+	// l2_allowed 列，不等下次重启（同步失败仅记日志——启动路径已兜底全量同步）。
+	if err := h.st.SyncL2Allowed(r.Context(), h.l2Allowed); err != nil {
+		h.log.Error("sync l2_allowed after register", "err", err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(registerResp{
 		Status: "ok", NodeID: node.ID, NodeName: node.Name, NodeToken: nodeToken,
@@ -424,6 +441,24 @@ type heartbeatReq struct {
 	// 「清单不完整」。仅与显式 agent_tasks 数组一同生效（随快照落库）；字段
 	// 缺席 = false；数组缺席时该字段忽略（无快照即无标记变更）。
 	AgentTasksTruncated *bool `json:"agent_tasks_truncated"`
+	// AgentSessions 为活跃会话快照（SPEC-M1d §3.5），三态同 agent_tasks：缺席
+	// 不覆盖；显式 `[]` = 全部安静（清空该节点会话）；显式 null 400。
+	AgentSessions json.RawMessage `json:"agent_sessions"`
+	// AgentSessionsTruncated 标记会话清单触顶截断（清单是子集）：仅记 AUDIT
+	// 日志（SPEC §3.5 未设面板标注位，不落库）。
+	AgentSessionsTruncated *bool `json:"agent_sessions_truncated"`
+	// ---- M1d 任务下发协议（SPEC-M1d §2/§5）----
+	// Caps 为能力协商清单（如 ["linux-systemd","linux-docker"]），随心跳覆盖
+	// nodes.caps；下发时按 kind 平台矩阵校验。缺席 = 旧版 agent，保留旧值。
+	Caps []string `json:"caps"`
+	// CommandResults 为执行完成的命令回执（未 ACK 持续重发；console 逐条归属
+	// 验证后落库）。三态同 services：缺席不处理、显式 null 400、显式数组处理。
+	CommandResults json.RawMessage `json:"command_results"`
+	// CommandRunning 为本地正在执行的命令 id 清单（claimed → running 报告）。
+	CommandRunning json.RawMessage `json:"command_running"`
+	// CommandUnacked 为 agent 本地仍持有未删结果的命令 id 清单——console 据
+	// result_recorded 回 ack_ids（agent 收到 ACK 才删本地持久化结果）。
+	CommandUnacked json.RawMessage `json:"command_unacked"`
 }
 
 // errNullField 为可选数组字段收到显式 null 的协议违规。
@@ -479,6 +514,22 @@ type agentTaskIn struct {
 	MemPct    *float64 `json:"mem_pct"`
 	// StartedAt 为 unix 秒（etime 反推）；nil = 未知（Windows 兜底，入库 NULL）。
 	StartedAt *int64 `json:"started_at"`
+	// Background 为 daemon 过滤标记（SPEC-M1d §3.5：elapsed > 1h 的常驻进程，
+	// 面板任务区不显示、数据保留）。
+	Background bool `json:"background"`
+}
+
+// agentSessionIn 为心跳上报的单条活跃会话快照（SPEC-M1d §3.5）。
+type agentSessionIn struct {
+	AgentName   string `json:"agent_name"`
+	SessionFile string `json:"session_file"`
+	// StartedAt 为会话开始（文件创建时刻）；nil = 平台不支持（入库 NULL）。
+	StartedAt *int64 `json:"started_at"`
+	// LastActivity 为会话文件最近 mtime（活跃判定依据，恒有值）。
+	LastActivity *int64 `json:"last_activity"`
+	// Topic / RecentAction 为轻解析的主题与当前动作（各 ≤120 字；可为空）。
+	Topic        string `json:"topic"`
+	RecentAction string `json:"recent_action"`
 }
 
 // metricsIn 与 agent 上报结构对应；指针承载 null 语义——采集失败的字段为 nil，禁止填 0。
@@ -494,9 +545,16 @@ type metricsIn struct {
 	Load1     *float64 `json:"load1"`
 }
 
+// heartbeatResp 扩展（M1d）：Commands 为本次领取的待执行命令（≤3/次，响应
+// 写入前已原子置 claimed + claimed_at + lease_epoch）；AckIDs 为已落库回执的
+// 确认（条目携带回执代次，agent 收到才删对应代次及更早的本地副本）；DropIDs
+// 为无归属/畸形/旧代次回执的丢弃指示（不再重发）。
 type heartbeatResp struct {
-	Status     string `json:"status"`
-	ServerTime int64  `json:"server_time"`
+	Status     string       `json:"status"`
+	ServerTime int64        `json:"server_time"`
+	Commands   []commandOut `json:"commands"`
+	AckIDs     []ackEntry   `json:"ack_ids"`
+	DropIDs    []dropEntry  `json:"drop_ids"`
 }
 
 // metricsAllEmpty 九个指标字段全为 null——采集层一个值都没给出（R3-空指标）。
@@ -702,15 +760,73 @@ func validateAgentTasks(in []agentTaskIn) ([]store.AgentTaskRow, error) {
 			return nil, fmt.Errorf("agent_tasks[%d]: bad started_at", i)
 		}
 		row := store.AgentTaskRow{
-			PID:       t.PID,
-			AgentName: name,
-			Cmd:       sanitizeErrStr(t.Cmd, maxTaskCmd),
-			ElapsedS:  t.ElapsedS,
-			CPUPct:    t.CPUPct,
-			MemPct:    t.MemPct,
+			PID:        t.PID,
+			AgentName:  name,
+			Cmd:        sanitizeErrStr(t.Cmd, maxTaskCmd),
+			ElapsedS:   t.ElapsedS,
+			CPUPct:     t.CPUPct,
+			MemPct:     t.MemPct,
+			Background: t.Background,
 		}
 		if t.StartedAt != nil {
 			row.StartedAt = sql.NullInt64{Int64: *t.StartedAt, Valid: true}
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// sessionRowsOrNil 把 agent_sessions 三态映射为 store 层指针语义（同 taskRowsOrNil）：
+// 缺席 → nil（不替换）；显式数组（含空数组 = 全部安静）→ 非 nil 指针（全量替换）。
+func sessionRowsOrNil(present bool, rows []store.AgentSessionRow) *[]store.AgentSessionRow {
+	if !present {
+		return nil
+	}
+	return &rows
+}
+
+// validateAgentSessions 校验心跳 agent_sessions 数组（SPEC-M1d §3.5）：条目上限、
+// agent_name 必填、last_activity 必带（活跃判定依据）、时间值域（不得晚于当前
+// 时刻+1 天，时钟漂移容忍）、主题/动作/路径限长净化。同 session_file 去重——
+// 同一会话文件重复上报是采集端 bug，全量替换语义下会变成重复卡片。
+func validateAgentSessions(in []agentSessionIn) ([]store.AgentSessionRow, error) {
+	if len(in) > maxAgentSessions {
+		return nil, fmt.Errorf("too many agent_sessions (%d > %d)", len(in), maxAgentSessions)
+	}
+	seen := map[string]bool{}
+	out := make([]store.AgentSessionRow, 0, len(in))
+	for i, s := range in {
+		name := sanitizeErrStr(s.AgentName, 128)
+		if name == "" {
+			return nil, fmt.Errorf("agent_sessions[%d]: empty agent_name", i)
+		}
+		file := sanitizeErrStr(s.SessionFile, maxSessionFile)
+		if file == "" {
+			return nil, fmt.Errorf("agent_sessions[%d]: empty session_file", i)
+		}
+		if seen[file] {
+			return nil, fmt.Errorf("agent_sessions[%d]: duplicate session_file %q", i, file)
+		}
+		seen[file] = true
+		if s.LastActivity == nil {
+			return nil, fmt.Errorf("agent_sessions[%d]: missing last_activity", i)
+		}
+		if *s.LastActivity < 0 || *s.LastActivity > time.Now().Unix()+86400 {
+			return nil, fmt.Errorf("agent_sessions[%d]: bad last_activity", i)
+		}
+		if s.StartedAt != nil && (*s.StartedAt < 0 || *s.StartedAt > time.Now().Unix()+86400) {
+			return nil, fmt.Errorf("agent_sessions[%d]: bad started_at", i)
+		}
+		row := store.AgentSessionRow{
+			AgentName:   name,
+			SessionFile: file,
+			// 主题/动作限长净化（客户端可控文本，不外泄控制字符）。
+			Topic:        sanitizeErrStr(s.Topic, maxSessionText),
+			RecentAction: sanitizeErrStr(s.RecentAction, maxSessionText),
+			LastActivity: sql.NullInt64{Int64: *s.LastActivity, Valid: true},
+		}
+		if s.StartedAt != nil {
+			row.StartedAt = sql.NullInt64{Int64: *s.StartedAt, Valid: true}
 		}
 		out = append(out, row)
 	}
@@ -870,14 +986,73 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		taskRows = rows
 	}
+	// M1d：agent_sessions 三态（SPEC-M1d §3.5，同 agent_tasks 口径）——缺席不
+	// 覆盖；显式 null 400；显式数组（含 [] = 全部安静）按节点全量替换。
+	ssPresent, ssIn, err := optionalArray[agentSessionIn](req.AgentSessions)
+	if err != nil {
+		h.log.Warn("heartbeat agent_sessions field malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "请求无效")
+		return
+	}
+	var sessionRows []store.AgentSessionRow
+	if ssPresent {
+		rows, verr := validateAgentSessions(ssIn)
+		if verr != nil {
+			h.log.Warn("heartbeat agent_sessions invalid", "node", node.Name, "reason", verr.Error())
+			httpError(w, http.StatusBadRequest, "请求无效")
+			return
+		}
+		sessionRows = rows
+	}
+
+	// M1d 协议字段校验（SPEC-M1d §2/§5）：caps / 回执 / 运行报告 / 未确认清单。
+	// 全部先于任何写库——值域违规与 metrics 校验同语义，整条 400。
+	var capsPtr *string
+	if req.Caps != nil {
+		caps, cerr := validateCaps(req.Caps)
+		if cerr != nil {
+			h.log.Warn("heartbeat caps malformed", "node", node.Name, "reason", cerr.Error())
+			httpError(w, http.StatusBadRequest, "请求无效")
+			return
+		}
+		if b, jerr := json.Marshal(caps); jerr == nil {
+			s := string(b)
+			capsPtr = &s
+		}
+	}
+	results, err := parseCommandResults(req.CommandResults)
+	if err != nil {
+		h.log.Warn("heartbeat command_results malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "请求无效")
+		return
+	}
+	running, err := parseCommandIDs(req.CommandRunning)
+	if err != nil {
+		h.log.Warn("heartbeat command_running malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "请求无效")
+		return
+	}
+	unacked, err := parseCommandIDs(req.CommandUnacked)
+	if err != nil {
+		h.log.Warn("heartbeat command_unacked malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "请求无效")
+		return
+	}
 
 	// 单事务完成本次心跳全部写入（R11-F）：metrics 与 services/agents/agent_tasks
 	// 全量替换同一事务，任一失败整体回滚，不落半轮数据。截断标记（R27-#4）仅
 	// 随显式任务快照生效：HeartbeatFull 在 tasks 非 nil 时才写 nodes.tasks_truncated。
+	// caps 随本拍覆盖（SPEC-M1d §5 能力协商）。
 	tasksTruncated := req.AgentTasksTruncated != nil && *req.AgentTasksTruncated
+	if sessTrunc := req.AgentSessionsTruncated != nil && *req.AgentSessionsTruncated; sessTrunc && ssPresent {
+		// 会话清单触顶截断：清单是子集，AUDIT 留痕（SPEC §3.5 未设面板标注位）。
+		h.log.Warn("AUDIT agent sessions truncated", "audit", "heartbeat",
+			"node", node.Name, "reported", len(sessionRows))
+	}
 	stOK, err := h.st.HeartbeatFull(r.Context(), row, sanitizeErrStr(req.AgentVersion, 64),
 		svcRowsOrNil(svcPresent, svcRows), agentRowsOrNil(agPresent, agentRows),
-		taskRowsOrNil(tkPresent, taskRows), tasksTruncated)
+		taskRowsOrNil(tkPresent, taskRows), tasksTruncated,
+		sessionRowsOrNil(ssPresent, sessionRows), capsPtr)
 	if err != nil {
 		h.log.Error("store heartbeat", "node", node.Name, "err", err)
 		httpError(w, http.StatusInternalServerError, "内部错误")
@@ -899,8 +1074,24 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("heartbeat with collect errors", "node", node.Name,
 			"count", len(collectErrors), "keys", keys)
 	}
+	// M1d 命令协议（回执入库 → 运行报告 → ACK 名单 → 领取下发）：在心跳主写入
+	// 成功后执行，内部错误不使心跳失败（独立通道，下拍重试）。领取的原子性：
+	// ClaimNodeCommands 提交（claimed + claimed_at 落库）先于本响应写出。
+	cmds, ackIDs, dropIDs := h.handleHeartbeatCommands(r.Context(), node, results, running, unacked, time.Now().Unix())
+	if cmds == nil {
+		cmds = []commandOut{} // 空清单序列化为 []（SPEC §2 响应形态），不输出 null
+	}
+	if ackIDs == nil {
+		ackIDs = []ackEntry{}
+	}
+	if dropIDs == nil {
+		dropIDs = []dropEntry{}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(heartbeatResp{Status: "ok", ServerTime: time.Now().Unix()})
+	_ = json.NewEncoder(w).Encode(heartbeatResp{
+		Status: "ok", ServerTime: time.Now().Unix(),
+		Commands: cmds, AckIDs: ackIDs, DropIDs: dropIDs,
+	})
 }
 
 // badRequest 统一处理请求体类错误：超限 413，其余 400；响应不带细节。

@@ -23,18 +23,18 @@ func TestAgentTasksFullReplace(t *testing.T) {
 			CPUPct: fptr(12.5), MemPct: fptr(1.5), StartedAt: sqlNull(time.Now().Unix() - 60)},
 		{PID: 102, AgentName: "codex", Cmd: "codex review"},
 	}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id1, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &first, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id1, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &first, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat: ok=%v err=%v", ok, err)
 	}
 	// 节点 2 有自己的任务，随后验证隔离性。
 	secondNode := []AgentTaskRow{{PID: 201, AgentName: "claude", Cmd: "claude --resume"}}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id2, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &secondNode, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id2, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &secondNode, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat n2: ok=%v err=%v", ok, err)
 	}
 
 	// 第二次上报：进程 101 消失（只换新集合，无历史行）、102 换 pid。
 	next := []AgentTaskRow{{PID: 103, AgentName: "zcode", Cmd: "zcode chat", ElapsedS: 5}}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id1, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &next, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id1, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &next, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat 2: ok=%v err=%v", ok, err)
 	}
 	rows, err := st.ListAgentTasks(ctx, id1)
@@ -52,7 +52,7 @@ func TestAgentTasksFullReplace(t *testing.T) {
 
 	// 空数组 = 清空该节点任务（进程全消失的合法表达）。
 	empty := []AgentTaskRow{}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id1, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &empty, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id1, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &empty, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat empty: ok=%v err=%v", ok, err)
 	}
 	rows, _ = st.ListAgentTasks(ctx, id1)
@@ -61,7 +61,7 @@ func TestAgentTasksFullReplace(t *testing.T) {
 	}
 
 	// 缺席（nil）= 无变化：节点 2 任务仍在。
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id2, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, nil, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id2, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, nil, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat absent: ok=%v err=%v", ok, err)
 	}
 	rows2, _ = st.ListAgentTasks(ctx, id2)
@@ -77,7 +77,7 @@ func TestAgentTasksNullDimensions(t *testing.T) {
 	st := openTestStore(t)
 	id := seedNode(t, ctx, st, "cloud-1")
 	tasks := []AgentTaskRow{{PID: 7, AgentName: "codex"}}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &tasks, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &tasks, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat: ok=%v err=%v", ok, err)
 	}
 	rows, err := st.ListAgentTasks(ctx, id)
@@ -111,7 +111,7 @@ func TestAgentsLastActivityRoundTrip(t *testing.T) {
 	act, files := int64(1_800_000_000), int64(412)
 	ags := []AgentRow{{Name: "zcode", Type: "cli", Status: "active",
 		LastActivity: &act, SessionFiles: &files}}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, &ags, nil, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, &ags, nil, false, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat: ok=%v err=%v", ok, err)
 	}
 	recs, err := st.ListAgents(ctx, id)
@@ -126,7 +126,7 @@ func TestAgentsLastActivityRoundTrip(t *testing.T) {
 	}
 	// 下一拍 agent 侧没拿到活跃度（nil）→ 覆盖为 NULL（不沿用旧值）。
 	ags2 := []AgentRow{{Name: "zcode", Type: "cli", Status: "active"}}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, &ags2, nil, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, &ags2, nil, false, nil, nil); err != nil || !ok {
 		t.Fatal(err)
 	}
 	recs, _ = st.ListAgents(ctx, id)
@@ -218,7 +218,7 @@ func TestHeartbeatTasksTruncatedFlag(t *testing.T) {
 	}
 
 	tasks := []AgentTaskRow{{PID: 1, AgentName: "zcode"}}
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &tasks, true); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &tasks, true, nil, nil); err != nil || !ok {
 		t.Fatalf("heartbeat truncated: ok=%v err=%v", ok, err)
 	}
 	if n, err := st.GetNodeByName(ctx, "cloud-1"); err != nil || !n.TasksTruncated {
@@ -226,7 +226,7 @@ func TestHeartbeatTasksTruncatedFlag(t *testing.T) {
 	}
 
 	// 快照缺席：标记不改动（仍描述上一次快照）。
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, nil, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, nil, false, nil, nil); err != nil || !ok {
 		t.Fatal(err)
 	}
 	if n, err := st.GetNodeByName(ctx, "cloud-1"); err != nil || !n.TasksTruncated {
@@ -234,7 +234,7 @@ func TestHeartbeatTasksTruncatedFlag(t *testing.T) {
 	}
 
 	// 未截断的显式快照：标记复位。
-	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &tasks, false); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, &MetricsRow{NodeID: id, TS: time.Now().Unix(), CPUPct: fptr(1)}, "v", nil, nil, &tasks, false, nil, nil); err != nil || !ok {
 		t.Fatal(err)
 	}
 	if n, err := st.GetNodeByName(ctx, "cloud-1"); err != nil || n.TasksTruncated {

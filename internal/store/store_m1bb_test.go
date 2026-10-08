@@ -38,7 +38,7 @@ func seedNode(t *testing.T, ctx context.Context, st *Store, name string) int64 {
 		NodeID: n.ID, TS: time.Now().Unix(),
 		CPUPct: fptr(12.5), MemUsed: iptr(1 << 30), MemTotal: iptr(4 << 30),
 		DiskUsed: iptr(10 << 30), DiskTotal: iptr(100 << 30),
-	}, "test-agent", nil, nil, nil, false)
+	}, "test-agent", nil, nil, nil, false, nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("heartbeat: ok=%v err=%v", ok, err)
 	}
@@ -177,7 +177,7 @@ func TestOpenReadOnlyBlocksWrites(t *testing.T) {
 	if _, err := ro.RegisterNode(ctx, "x", "", "", "", "h", "rh", 0); err == nil || !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("RegisterNode err = %v, want read-only error", err)
 	}
-	if _, err := ro.HeartbeatFull(ctx, &MetricsRow{NodeID: 1}, "v", nil, nil, nil, false); err == nil {
+	if _, err := ro.HeartbeatFull(ctx, &MetricsRow{NodeID: 1}, "v", nil, nil, nil, false, nil, nil); err == nil {
 		t.Fatal("HeartbeatFull must fail on read-only handle")
 	}
 	if err := ro.ReplaceTailnetNodes(ctx, nil); err == nil {

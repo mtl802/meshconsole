@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/mtl802/meshconsole/internal/cmdkind"
 )
 
 // FlexTime 兼容带引号/不带引号的 RFC3339 时间戳（yaml.v3 仅把裸时间戳解析为
@@ -125,12 +127,29 @@ type Console struct {
 	// 任何写入之前统一执行（internal/pki NormalizeSANs）。部署值示例
 	// ["1.13.158.180"]。
 	TLSExtraSANs []string `yaml:"tls_extra_sans"`
-	LogLevel     string   `yaml:"log_level"`
+	// L2AllowedNodes 为任务下发白名单（SPEC-M1d §1）：节点名列表（mac-mini/
+	// windows true，cloud-nanjing 禁止）。nil/空 = 全部节点禁止下发（安全缺省）。
+	// 启动与节点注册时同步进 nodes.l2_allowed，提交与领取双重复核以此列为准。
+	L2AllowedNodes []string `yaml:"l2_allowed_nodes"`
+	// L2ExtraCommands 为已审核 kind 的参数化实例扩展（SPEC-M1d §3）：允许的
+	// (kind, args) 组合白名单——不引入新可执行路径（kind 决定二进制），unit 槽
+	// 不受受管服务集合限制（这正是扩展点），但字符集/值域校验照常。加载期
+	// 按 cmdkind 规则校验，非法条目拒绝启动。
+	L2ExtraCommands []L2ExtraCommand `yaml:"l2_extra_commands"`
+	LogLevel        string           `yaml:"log_level"`
 
 	// panelHosts / agentCIDRs 为加载期规范化产物（不入 YAML）。hostAllowed
 	// 与 registry 来源过滤直接消费。
 	panelHosts []string
 	agentCIDRs []*net.IPNet
+}
+
+// L2ExtraCommand 为 l2_extra_commands 的一个条目：已审核 kind 的参数化实例
+// （SPEC-M1d §3）。Kind 必须在白名单注册表内（不引入新可执行路径）；ArgsJSON
+// 按 kind 参数槽规则校验（unit 槽免受管集合——扩展点即在此，字符集/值域不豁免）。
+type L2ExtraCommand struct {
+	Kind     string `yaml:"kind"`
+	ArgsJSON string `yaml:"args"`
 }
 
 // HeadscaleConfig 为 headscale REST 拉取配置（SPEC-M1b-b §3）。
@@ -219,6 +238,18 @@ func (a AgentScanCfg) KnownList() []string {
 	return *a.Known
 }
 
+// L2ExtraMatches 报告 (kind, 规范化 argsJSON) 是否命中 l2_extra_commands 声明的
+// 参数化实例（SPEC-M1d §3 扩展白名单——只能是已审核 kind 的参数化实例）。
+// 加载期已就地规范化，与提交侧 ValidateArgs 产物可直接精确比对。
+func (c *Console) L2ExtraMatches(kind, argsJSON string) bool {
+	for _, e := range c.L2ExtraCommands {
+		if e.Kind == kind && e.ArgsJSON == argsJSON {
+			return true
+		}
+	}
+	return false
+}
+
 // Agent 为 meshagent（节点代理）配置。
 type Agent struct {
 	// ConsoleURL 留空时使用本地 state 文件里注册时记录的地址。
@@ -241,6 +272,10 @@ type Agent struct {
 	// docker 访问必须以只读 helper 或 socket-proxy 提供（DESIGN §7-5，M1b-b 部署
 	// 落地），本项用于指向受限包装脚本。
 	DockerBin string `yaml:"docker_bin"`
+	// L2Enabled 为本节点的任务执行总开关（SPEC-M1d §1 双重复核的 agent 侧）：
+	// 默认 false——即使 console 误下发，本机 agent 也拒绝执行。mac-mini/windows
+	// 的部署配置置 true，云节点保持 false。
+	L2Enabled bool `yaml:"l2_enabled"`
 	// Services 为受管服务声明（每 15s 查询状态随心跳上报）。
 	Services []ServiceDecl `yaml:"services"`
 	// AgentScan 为 AI agent 发现配置；nil（未配置）等价零值（默认清单、无自定义）。
@@ -340,7 +375,65 @@ func parseConsole(path string) (*Console, bool, error) {
 	if err := cfg.validateHeadscale(); err != nil {
 		return nil, false, err
 	}
+	// SPEC-M1d §1/§3：下发白名单节点名规范化（去空白、去重、无空白标签），
+	// l2_extra_commands 按 cmdkind 参数槽规则校验——非法条目启动即拒绝。
+	names, err := normalizeL2Nodes(cfg.L2AllowedNodes)
+	if err != nil {
+		return nil, false, err
+	}
+	cfg.L2AllowedNodes = names
+	if err := validateL2Extras(cfg.L2ExtraCommands); err != nil {
+		return nil, false, err
+	}
 	return cfg, true, nil
+}
+
+// normalizeL2Nodes 规范化 l2_allowed_nodes：去空白、拒绝空白/超长标签（与节点名
+// 同口径 ≤64 字节）、保序去重。
+func normalizeL2Nodes(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for i, n := range raw {
+		s := strings.TrimSpace(n)
+		if s == "" || len(s) > 64 {
+			return nil, fmt.Errorf("console.l2_allowed_nodes[%d]: 须为非空且 ≤64 字节的节点名", i)
+		}
+		for _, r := range s {
+			if r <= ' ' || r == 0x7f {
+				return nil, fmt.Errorf("console.l2_allowed_nodes[%d]: %q 含空白/控制字符", i, n)
+			}
+		}
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// validateL2Extras 校验 l2_extra_commands：kind 必须已注册（不引入新可执行路径），
+// args 按 kind 槽规则校验（受管集合传非 nil 空集——unit 槽免集合限制是扩展点，
+// 但字符集/值域/键集合校验不豁免）。
+func validateL2Extras(extras []L2ExtraCommand) error {
+	if len(extras) > 64 {
+		return fmt.Errorf("console.l2_extra_commands: 条目数不得超过 64")
+	}
+	for i := range extras {
+		e := &extras[i]
+		if cmdkind.Lookup(e.Kind) == nil {
+			return fmt.Errorf("console.l2_extra_commands[%d]: 未知 kind %q（扩展只能参数化已审核 kind，不引入新可执行路径）", i, e.Kind)
+		}
+		// 校验并就地规范化（键序稳定）：运行期与提交侧规范化产物做精确匹配。
+		canonical, err := cmdkind.ValidateArgs(e.Kind, e.ArgsJSON, func(string) bool { return true })
+		if err != nil {
+			return fmt.Errorf("console.l2_extra_commands[%d] (%s): %v", i, e.Kind, err)
+		}
+		e.ArgsJSON = canonical
+	}
+	return nil
 }
 
 // defaultPanelHosts 为 Host 白名单缺省名单（回环形态，与历史硬编码一致）。

@@ -330,3 +330,78 @@ func TestExtraPositionalArgsRejected(t *testing.T) {
 		t.Fatalf("valid create -expires ignored: expires_at = NULL")
 	}
 }
+
+// TestStripConfigFlagEqualsForm -config= 等号写法只剥离 config 参数本身、保留
+// 其后全部参数（R37 候选核销 / R39-#5）：修复前等号形态把该参数之后的 argv
+// 全部静默丢弃，-expires/-scope 被吞、多余位置参数逃过 NArg 复核，仍照签
+// 长期 token。剥离纯函数 + token create 全链两形态钉住。
+func TestStripConfigFlagEqualsForm(t *testing.T) {
+	// 剥离纯函数：等号形态仅去该项本身；分离值形态行为不变；无 -config 原样。
+	if got := stripConfigFlag([]string{"create", "lunge", "-config=/tmp/c.yaml", "-expires", "X"}); !equalArgs(got, []string{"create", "lunge", "-expires", "X"}) {
+		t.Fatalf("= form strip = %v", got)
+	}
+	if got := stripConfigFlag([]string{"create", "-config", "/tmp/c.yaml", "lunge"}); !equalArgs(got, []string{"create", "lunge"}) {
+		t.Fatalf("space form strip = %v", got)
+	}
+	if got := stripConfigFlag([]string{"create", "lunge"}); !equalArgs(got, []string{"create", "lunge"}) {
+		t.Fatalf("no config strip = %v", got)
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "console.yaml")
+	dbPath := filepath.Join(dir, "data", "meshconsole.db")
+	if err := os.WriteFile(cfgPath, []byte("db_path: \""+dbPath+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pwReader := func(prompt string) (string, error) { return "a-secure-pass-1", nil }
+	if code := cmdUser([]string{"add", "lunge", "-config", cfgPath}, cfgPath, pwReader); code != 0 {
+		t.Fatalf("user add exit = %d", code)
+	}
+	// 形态①：`-config=x` 之后再出现多余位置参数 + -expires —— 后缀不再被吞，
+	// NArg 复核在剥离结果上生效，退出 2 且零签发。
+	if code := cmdToken([]string{"create", "lunge", "-config=" + cfgPath, "extra", "-expires", "2027-06-30T23:59:59Z"}, cfgPath); code != 2 {
+		t.Fatalf("= form with extra arg: exit = %d, want 2", code)
+	}
+	// -scope operator 后置不再被静默忽略：多余位置参数 + 后置 -scope 同拒。
+	if code := cmdToken([]string{"create", "lunge", "-config=" + cfgPath, "extra", "-scope", "operator"}, cfgPath); code != 2 {
+		t.Fatalf("= form with trailing -scope: exit = %d, want 2", code)
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.ListAPITokens(t.Context())
+	st.Close()
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rejected forms issued %d tokens, %v; want 0", len(rows), err)
+	}
+	// 形态②：`-config=x -expires <未来>` 正常签发（-expires 在等号写法之后、
+	// 必须存活到 flag 解析）。
+	if code := cmdToken([]string{"create", "lunge", "-config=" + cfgPath, "-expires", "2027-06-30T23:59:59Z"}, cfgPath); code != 0 {
+		t.Fatalf("= form valid create exit = %d", code)
+	}
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = st.ListAPITokens(t.Context())
+	st.Close()
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("= form valid tokens = %d, %v; want 1", len(rows), err)
+	}
+	if !rows[0].ExpiresAt.Valid {
+		t.Fatalf("= form valid create lost -expires: expires_at = NULL")
+	}
+}
+
+func equalArgs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

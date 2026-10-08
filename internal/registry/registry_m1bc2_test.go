@@ -76,7 +76,7 @@ func TestSourceFilterMiddleware(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	h := New(st, testLogger2(), nil, nil) // nil → 缺省网段
+	h := New(st, testLogger2(), nil, nil, nil) // nil → 缺省网段
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 
@@ -116,7 +116,7 @@ func TestSourceCIDROverrides(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	// 显式空 = 仅回环。
-	h := New(st, testLogger2(), nil, cidrs("127.0.0.0/8", "::1/128"))
+	h := New(st, testLogger2(), nil, cidrs("127.0.0.0/8", "::1/128"), nil)
 	if sourceAllowed("100.64.0.3:8", h.srcCIDRs) {
 		t.Fatal("explicit-empty must reject tailnet source")
 	}
@@ -124,7 +124,7 @@ func TestSourceCIDROverrides(t *testing.T) {
 		t.Fatal("explicit-empty must accept loopback")
 	}
 	// 自定义网段：仅 100.64/10。
-	h2 := New(st, testLogger2(), nil, cidrs("100.64.0.0/10"))
+	h2 := New(st, testLogger2(), nil, cidrs("100.64.0.0/10"), nil)
 	if !sourceAllowed("100.64.0.9:8", h2.srcCIDRs) {
 		t.Fatal("custom cidr must accept 100.64/10")
 	}

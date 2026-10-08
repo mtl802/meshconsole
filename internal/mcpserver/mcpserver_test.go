@@ -11,6 +11,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/mcpserver"
 	"github.com/mtl802/meshconsole/internal/store"
 )
@@ -43,12 +44,12 @@ func newSessionTasksTrunc(t *testing.T, tasksTruncated bool) *mcp.ClientSession 
 		&[]store.AgentTaskRow{{
 			PID: 4242, AgentName: "zcode", Cmd: "zcode m1b-c dev", ElapsedS: 120,
 			CPUPct: fltp(12.5), StartedAt: sqlNullInt(time.Now().Unix() - 120),
-		}}, tasksTruncated)
+		}}, tasksTruncated, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	server := mcpserver.New(st, "test", nil)
+	server := mcpserver.New(st, &config.Console{}, "test", nil)
 	ct, stt := mcp.NewInMemoryTransports()
 	ss, err := server.Connect(ctx, stt, nil)
 	if err != nil {
@@ -88,9 +89,9 @@ func structured(t *testing.T, res *mcp.CallToolResult, out any) {
 	}
 }
 
-// TestHandshakeToolsList initialize（Connect 隐含）+ tools/list：六个只读工具
+// TestHandshakeToolsList initialize（Connect 隐含）+ tools/list：只读工具
 // 齐备，描述非空（SPEC §7：MCP 三方法握手之「握手 + 列表」；M1b-c §2.2 新增
-// list_agent_tasks）。
+// list_agent_tasks；M1d §3.5 新增 list_active_sessions）。
 func TestHandshakeToolsList(t *testing.T) {
 	cs := newSession(t)
 	res, err := cs.ListTools(context.Background(), nil)
@@ -100,6 +101,9 @@ func TestHandshakeToolsList(t *testing.T) {
 	want := map[string]bool{
 		"list_nodes": false, "get_node": false, "list_services": false,
 		"list_agents": false, "list_agent_tasks": false, "get_mesh_status": false,
+		"list_active_sessions": false,
+		// M1d 命令三工具（submit_command 的 scope 拒绝另行覆盖）。
+		"get_command": false, "list_commands": false, "submit_command": false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; ok {
@@ -115,7 +119,7 @@ func TestHandshakeToolsList(t *testing.T) {
 		}
 	}
 	if len(res.Tools) != len(want) {
-		t.Fatalf("tools = %d, want exactly %d (只读五工具，不许多不少)", len(res.Tools), len(want))
+		t.Fatalf("tools = %d, want exactly %d (只读 + 命令查询，M1d §3.5 后共 10)", len(res.Tools), len(want))
 	}
 }
 

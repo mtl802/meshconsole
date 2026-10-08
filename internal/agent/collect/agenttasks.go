@@ -1,6 +1,10 @@
-// Agent 任务采集（SPEC-M1b-c §2.1）：扫描本机进程，匹配已知 AI agent CLI 的
-// 运行实例，并对各 agent 的会话目录做 stat（只 stat 不读不解析内容——会话文件
-// 格式耦合禁止），随心跳上报为 agent_tasks 数组与 agents.last_activity。
+// Agent 任务采集（SPEC-M1b-c §2.1、SPEC-M1d §3.5）：扫描本机进程，匹配已知
+// AI agent CLI 的运行实例，并对各 agent 的会话目录做统计；随心跳上报为
+// agent_tasks 数组与 agents.last_activity。
+//
+// daemon 过滤（SPEC-M1d §3.5）：elapsed > 1h 的进程标记 background=true——
+// 常驻 daemon（codex app-server 之类）不是「任务」，面板任务区不显示（数据
+// 保留入库，MCP 仍可见）；真正的活跃会话由 sessions.go 的会话文件视图呈现。
 //
 // 匹配口径：按进程命令行首 token 的路径基名匹配（`/usr/local/bin/zcode …` 命中
 // zcode）。只看首 token 是刻意收紧——子串/全文匹配会把「vim ~/.codex/sessions/x」
@@ -77,6 +81,9 @@ type AgentTask struct {
 	MemPct    *float64 `json:"mem_pct,omitempty"`
 	// StartedAt 为 unix 秒（由 etime 反推）；0 = 未知（Windows 兜底无 etime）。
 	StartedAt int64 `json:"started_at,omitempty"`
+	// Background 标记常驻 daemon（SPEC-M1d §3.5：elapsed > 1h）——面板任务区
+	// 不显示，数据照常入库（MCP 可见）。elapsed 未知（Windows 兜底）不标记。
+	Background bool `json:"background"`
 }
 
 // DirActivity 为一个 agent 会话目录的 stat 辅证：目录树内最近 mtime（unix 秒）
@@ -181,27 +188,64 @@ func newAgentTaskScanner(
 // 无目标，调用方应整体缺席 agent_tasks 字段而非每拍上报空数组）。
 func (s *AgentTaskScanner) Enabled() bool { return len(s.names) > 0 }
 
-// Scan 执行一轮采集：返回匹配到的任务清单、各 agent 会话目录活跃度，以及
-// truncated 标记（本拍任务数触顶 MaxAgentTasks、清单不完整，R27-#4）。
-// 进程扫描失败返回 error（调用方缺席字段 + collect_errors，不清空 console 侧
-// 任务——扫描失败 ≠ 没有任务），此时活动度仍然返回（子项独立，目录 stat 有效
-// 就如实上报）；会话目录子项失败不报错、该 agent 在返回 map 中缺席。
-// ctx 取消（超预算/停机）按 error 返回。
-func (s *AgentTaskScanner) Scan(ctx context.Context) ([]AgentTask, map[string]DirActivity, bool, error) {
+// backgroundAfterS 为 daemon 过滤阈值（SPEC-M1d §3.5：elapsed > 1h）。
+const backgroundAfterS int64 = 3600
+
+// taskElapsedIsBackground 报告该 elapsed 是否为常驻 daemon（>1h）。elapsed
+// 未知（0）不标记——不知道不是 daemon，宁显不隐。
+func taskElapsedIsBackground(elapsedS int64) bool {
+	return elapsedS > backgroundAfterS
+}
+
+// TaskScanResult 为一轮任务/会话采集产物（各子项失败语义独立，字段缺席=
+// 未知，绝不拿半程结果冒充完整清单）。
+type TaskScanResult struct {
+	// Tasks 为匹配到的任务清单；nil = 进程扫描失败（Err 携带原因）——
+	// 调用方缺席 agent_tasks 字段 + collect_errors，不清空 console 侧任务。
+	Tasks []AgentTask
+	// Activity 为各 agent 会话目录活跃度（子项独立，目录缺失该 agent 缺席）。
+	Activity map[string]DirActivity
+	// Sessions 为活跃会话清单（SPEC-M1d §3.5）；nil = 会话扫描未知（SessErr
+	// 携带原因，调用方缺席 agent_sessions 字段）；非 nil（含空数组）= 本拍
+	// 完整清单，空数组 = 无活跃会话（console 侧清空）。
+	Sessions []AgentSession
+	// TasksTruncated = 任务数触顶 MaxAgentTasks（R27-#4，清单不完整可见）。
+	TasksTruncated bool
+	// SessionsTruncated = 活跃会话数/目录条目触顶（清单是子集，调用方如实
+	// 并进 collect_errors）。
+	SessionsTruncated bool
+	// Err 为进程扫描失败原因（ctx 取消/超预算/ps 不可用）。
+	Err error
+	// SessErr 为会话扫描失败原因（超预算/ctx 取消）。
+	SessErr error
+}
+
+// Scan 执行一轮采集：进程扫描、会话目录活跃度统计、活跃会话扫描（SPEC-M1d
+// §3.5）三个子项共享整轮预算 ctx（R27-#2/R11-G 口径：8s 预算对全部读盘路径
+// 生效），失败语义彼此独立（见 TaskScanResult 字段注释）。
+func (s *AgentTaskScanner) Scan(ctx context.Context) *TaskScanResult {
 	bctx := ctx
 	if s.budget > 0 {
 		var cancel context.CancelFunc
 		bctx, cancel = context.WithTimeout(ctx, s.budget)
 		defer cancel()
 	}
+	out := &TaskScanResult{}
 	tasks, truncated, err := s.scanProcesses(bctx)
-	// 目录 stat 与进程扫描相互独立：任一方向失败不拖累另一方向。目录遍历同样
-	// 挂整轮预算 ctx（R27-#2）——8s 预算对该路径真正生效。
-	activity := s.scanActivity(bctx)
-	if err != nil {
-		return nil, activity, false, err
+	out.Tasks, out.TasksTruncated, out.Err = tasks, truncated, err
+	// 目录 stat 与进程扫描相互独立：任一方向失败不拖累另一方向。
+	out.Activity = s.scanActivity(bctx)
+	sessions, sessTrunc, sessOK := s.ScanSessions(bctx)
+	if !sessOK {
+		// 会话扫描超预算/被取消：整轮未知，缺席 + 如实说明（不外泄半程清单）。
+		out.Sessions, out.SessErr = nil, bctx.Err()
+		if out.SessErr == nil {
+			out.SessErr = errors.New("session scan budget exhausted; agent_sessions unavailable")
+		}
+	} else {
+		out.Sessions, out.SessionsTruncated = sessions, sessTrunc
 	}
-	return tasks, activity, truncated, nil
+	return out
 }
 
 // scanProcesses 按平台扫描进程清单并匹配 agent 名。返回的 truncated 标记本拍
@@ -288,6 +332,9 @@ func (s *AgentTaskScanner) scanProcesses(ctx context.Context) ([]AgentTask, bool
 			AgentName: name,
 			Cmd:       trunc(cmdline, MaxTaskCmdLen),
 			ElapsedS:  parseEtime(fields[1]),
+			// daemon 过滤（SPEC-M1d §3.5）：常驻进程 elapsed > 1h 标记
+			// background——进程活着 ≠ 在干活，任务区不显示，数据保留。
+			Background: taskElapsedIsBackground(parseEtime(fields[1])),
 		}
 		if cpu, ok := parsePct(fields[2]); ok {
 			task.CPUPct = &cpu

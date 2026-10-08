@@ -17,6 +17,29 @@ type State struct {
 	Role         string `json:"role"`
 	NodeToken    string `json:"node_token"`
 	RegisteredAt int64  `json:"registered_at"`
+
+	// StateFile 为 state 文件路径（run 时由 cmdRun 注入；`json:"-"` 不入库
+	// ——内含本机路径非凭据，但无需随 state 持久化）。命令对账目录取其同目录。
+	StateFile string `json:"-"`
+	stateDir  string
+}
+
+// SetStateFile 注入 state 文件路径并固定目录（展开后的绝对路径，防止运行期
+// 工作目录变化导致对账目录漂移）。
+func (s *State) SetStateFile(path string) {
+	s.StateFile = path
+	if dir, err := filepath.Abs(filepath.Dir(path)); err == nil {
+		s.stateDir = dir
+	}
+}
+
+// StateFileDir 返回 state 文件所在目录（命令对账目录 commands/ 的落点——
+// SPEC-M1d §2「结果目录 .pipeline 或 state 同目录」取后者）。
+func (s *State) StateFileDir() string {
+	if s.stateDir != "" {
+		return s.stateDir
+	}
+	return filepath.Dir(s.StateFile)
 }
 
 // ErrNotRegistered 表示本地尚无注册 state。

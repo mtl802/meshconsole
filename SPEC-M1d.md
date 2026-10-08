@@ -40,6 +40,15 @@ Gate（伦哥定案）：仅 Mac mini + Windows 可下发；白名单只读命�
 - l2_extra_commands config 可扩展，但只能是"已审核 kind 的参数化实例"，不能引入新可执行路径。
 - agent 端执行：timeout（默认 30s 上限 300s）+ 进程组 kill；stdout/stderr 合并采集 64KB 硬上限；agent 本地并发执行 ≤2。
 
+## 3.5 会话活跃视图（伦哥 20:35 需求：能看到当前 agent 会话在干嘛）
+
+- 痛点：进程级采集把常驻 daemon（codex app-server，elapsed 数天）误当任务，真正的活跃会话反而不可见。
+- agent 侧新增：扫描已知 agent 会话目录（zcode: ~/.zcode/cli/rollout/，codex: ~/.codex/sessions/，含自定义 agent 同类目录），mtime < 30min 的会话文件为活跃会话；每个活跃会话读首行用户消息（主题，截断 120 字）+ 末行消息文本（当前动作，截断 120 字）——轻解析（逐行 json try/except 只抽 text 字段，格式变更时显示空不报错）。
+- 心跳新可选字段 `agent_sessions`（三态语义同 services）：console 同批 migration 新表 `agent_sessions`（node_id/agent_name/session_file/started_at/last_activity/topic/recent_action/updated_at，按节点全量替换）。
+- daemon 过滤：agent_tasks 采集时 elapsed > 1h 的进程标记 `background=true`，面板任务区不显示（数据保留）。
+- 面板：任务区改「agent 会话活跃」——每卡显示 终端/agent/会话主题/当前动作/持续时长；无活跃会话显示「全部安静」。
+- MCP：新只读工具 `list_active_sessions(node?)`（含 topic/recent_action）。
+
 ## 4. scope 与授权
 
 - readonly：既有只读工具；operator：+ submit_command/get_command/list_commands（description 中文）。

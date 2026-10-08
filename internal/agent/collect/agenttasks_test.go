@@ -52,22 +52,22 @@ const psOutput = `  PID   ELAPSED %CPU %MEM COMMAND
 func TestScanProcessesParse(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	s := scannerFor(taskFakeRunner{out: cmdResult{stdout: psOutput}}, "darwin", now, nil)
-	tasks, activity, _, err := s.Scan(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	res := s.Scan(context.Background())
+	if res.Err != nil {
+		t.Fatal(res.Err)
 	}
-	if activity == nil {
+	if res.Activity == nil {
 		t.Fatal("activity map must never be nil")
 	}
 	byAgent := map[string]AgentTask{}
-	for _, tk := range tasks {
+	for _, tk := range res.Tasks {
 		if _, dup := byAgent[tk.AgentName]; dup {
-			t.Fatalf("duplicate agent in one scan: %+v", tasks)
+			t.Fatalf("duplicate agent in one scan: %+v", res.Tasks)
 		}
 		byAgent[tk.AgentName] = tk
 	}
-	if len(tasks) != 4 {
-		t.Fatalf("tasks = %+v, want 4 (zcode/codex/claude/gemini；vim 与 zsh 不匹配)", tasks)
+	if len(res.Tasks) != 4 {
+		t.Fatalf("tasks = %+v, want 4 (zcode/codex/claude/gemini；vim 与 zsh 不匹配)", res.Tasks)
 	}
 	zc := byAgent["zcode"]
 	if zc.PID != 101 || zc.ElapsedS != 3723 {
@@ -104,16 +104,16 @@ func TestScanCmdTruncatedRuneSafe(t *testing.T) {
 	long := "/usr/local/bin/zcode run " + strings.Repeat("界", 300)
 	out := "  PID   ELAPSED %CPU %MEM COMMAND\n    9    01:00   1 1 " + long
 	s := scannerFor(taskFakeRunner{out: cmdResult{stdout: out}}, "linux", time.Unix(1_800_000_000, 0), nil)
-	tasks, _, _, err := s.Scan(context.Background())
-	if err != nil || len(tasks) != 1 {
-		t.Fatalf("tasks=%v err=%v", tasks, err)
+	res := s.Scan(context.Background())
+	if res.Err != nil || len(res.Tasks) != 1 {
+		t.Fatalf("tasks=%v err=%v", res.Tasks, res.Err)
 	}
-	if len(tasks[0].Cmd) > MaxTaskCmdLen {
-		t.Fatalf("cmd len = %d, want ≤%d", len(tasks[0].Cmd), MaxTaskCmdLen)
+	if len(res.Tasks[0].Cmd) > MaxTaskCmdLen {
+		t.Fatalf("cmd len = %d, want ≤%d", len(res.Tasks[0].Cmd), MaxTaskCmdLen)
 	}
 	// rune 边界：解码必须成功且无残缺字节。
-	if strings.ContainsRune(tasks[0].Cmd[len(tasks[0].Cmd)-3:], 0xFFFD) {
-		t.Fatalf("cmd cut mid-rune: %q", tasks[0].Cmd[len(tasks[0].Cmd)-10:])
+	if strings.ContainsRune(res.Tasks[0].Cmd[len(res.Tasks[0].Cmd)-3:], 0xFFFD) {
+		t.Fatalf("cmd cut mid-rune: %q", res.Tasks[0].Cmd[len(res.Tasks[0].Cmd)-10:])
 	}
 }
 
@@ -121,11 +121,11 @@ func TestScanCmdTruncatedRuneSafe(t *testing.T) {
 // 绝不能把「扫描失败」当「没有任务」清空 console 侧）；活动度仍独立返回。
 func TestScanProcessFailure(t *testing.T) {
 	s := scannerFor(taskFakeRunner{err: errors.New("ps: permission denied")}, "linux", time.Now(), nil)
-	_, activity, _, err := s.Scan(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "permission denied") {
-		t.Fatalf("err = %v, want ps failure", err)
+	res := s.Scan(context.Background())
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "permission denied") {
+		t.Fatalf("err = %v, want ps failure", res.Err)
 	}
-	if activity == nil {
+	if res.Activity == nil {
 		t.Fatal("activity must be returned even when process scan fails")
 	}
 }
@@ -135,9 +135,9 @@ func TestScanProcessFailure(t *testing.T) {
 // 之后任务已丢失，硬扫会拿不完整清单错误清行，缺席字段才是诚实语义。
 func TestScanOutputTruncatedIsError(t *testing.T) {
 	s := scannerFor(taskFakeRunner{out: cmdResult{stdout: "33793 01:00 1 1 zcode 300", truncated: true}}, "linux", time.Now(), nil)
-	_, _, _, err := s.Scan(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "incomplete") {
-		t.Fatalf("err = %v, want truncation error", err)
+	res := s.Scan(context.Background())
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "incomplete") {
+		t.Fatalf("err = %v, want truncation error", res.Err)
 	}
 }
 
@@ -148,18 +148,18 @@ func TestScanWindowsTasklist(t *testing.T) {
 "explorer.exe","987","Console","1","120,000 K"
 "codex.exe","500","Console","1","9,876 K"`
 	s := scannerFor(taskFakeRunner{out: cmdResult{stdout: out}}, "windows", time.Now(), nil)
-	tasks, _, _, err := s.Scan(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	res := s.Scan(context.Background())
+	if res.Err != nil {
+		t.Fatal(res.Err)
 	}
-	if len(tasks) != 2 {
-		t.Fatalf("tasks = %+v, want 2", tasks)
+	if len(res.Tasks) != 2 {
+		t.Fatalf("tasks = %+v, want 2", res.Tasks)
 	}
-	if tasks[0].PID != 4242 || tasks[0].AgentName != "zcode" || tasks[0].Cmd != "zcode.exe" {
-		t.Fatalf("task0 = %+v", tasks[0])
+	if res.Tasks[0].PID != 4242 || res.Tasks[0].AgentName != "zcode" || res.Tasks[0].Cmd != "zcode.exe" {
+		t.Fatalf("task0 = %+v", res.Tasks[0])
 	}
-	if tasks[0].CPUPct != nil || tasks[0].MemPct != nil || tasks[0].ElapsedS != 0 || tasks[0].StartedAt != 0 {
-		t.Fatalf("windows task must carry no fabricated dimensions: %+v", tasks[0])
+	if res.Tasks[0].CPUPct != nil || res.Tasks[0].MemPct != nil || res.Tasks[0].ElapsedS != 0 || res.Tasks[0].StartedAt != 0 {
+		t.Fatalf("windows task must carry no fabricated dimensions: %+v", res.Tasks[0])
 	}
 }
 
@@ -191,13 +191,13 @@ func TestScanActivity(t *testing.T) {
 	s := scannerFor(taskFakeRunner{out: cmdResult{stdout: ""}}, "linux", time.Now(), map[string]string{
 		"zcode": zcDir, "codex": filepath.Join(root, "missing"),
 	})
-	_, act, _, err := s.Scan(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	res := s.Scan(context.Background())
+	if res.Err != nil {
+		t.Fatal(res.Err)
 	}
-	a, ok := act["zcode"]
+	a, ok := res.Activity["zcode"]
 	if !ok {
-		t.Fatalf("zcode activity missing: %+v", act)
+		t.Fatalf("zcode activity missing: %+v", res.Activity)
 	}
 	if a.Files != 2 {
 		t.Fatalf("files = %d, want 2", a.Files)
@@ -205,8 +205,8 @@ func TestScanActivity(t *testing.T) {
 	if diff := a.LastActivity - fresh.Unix(); diff < -2 || diff > 2 {
 		t.Fatalf("last_activity = %d, want ≈%d", a.LastActivity, fresh.Unix())
 	}
-	if _, ok := act["codex"]; ok {
-		t.Fatalf("missing dir must be absent from map (null 上游语义): %+v", act)
+	if _, ok := res.Activity["codex"]; ok {
+		t.Fatalf("missing dir must be absent from map (null 上游语义): %+v", res.Activity)
 	}
 }
 
@@ -346,12 +346,15 @@ func TestScanActivityBudgetExpires(t *testing.T) {
 		"zcode": dir,
 	})
 	s.budget = time.Nanosecond
-	_, act, _, err := s.Scan(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	res := s.Scan(context.Background())
+	if res.Err != nil {
+		t.Fatal(res.Err)
 	}
-	if _, ok := act["zcode"]; ok {
-		t.Fatalf("expired budget must omit activity (unknown ≠ partial): %+v", act)
+	if _, ok := res.Activity["zcode"]; ok {
+		t.Fatalf("expired budget must omit activity (unknown ≠ partial): %+v", res.Activity)
+	}
+	if res.Sessions != nil || res.SessErr == nil {
+		t.Fatalf("expired budget must omit sessions with reason: %+v err=%v", res.Sessions, res.SessErr)
 	}
 }
 
@@ -408,9 +411,9 @@ func TestScanEmptyNames(t *testing.T) {
 	if s.Enabled() {
 		t.Fatal("no names configured must be disabled")
 	}
-	tasks, _, _, err := s.Scan(context.Background())
-	if err != nil || len(tasks) != 0 {
-		t.Fatalf("tasks=%v err=%v", tasks, err)
+	res := s.Scan(context.Background())
+	if res.Err != nil || len(res.Tasks) != 0 {
+		t.Fatalf("tasks=%v err=%v", res.Tasks, res.Err)
 	}
 }
 
@@ -424,14 +427,14 @@ func TestScanMaxTasks(t *testing.T) {
 		b.WriteString(" " + itoa(i) + " 01:00 1 1 /bin/zcode\n")
 	}
 	s := scannerFor(taskFakeRunner{out: cmdResult{stdout: b.String()}}, "linux", time.Now(), nil)
-	tasks, _, truncated, err := s.Scan(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	res := s.Scan(context.Background())
+	if res.Err != nil {
+		t.Fatal(res.Err)
 	}
-	if len(tasks) != MaxAgentTasks {
-		t.Fatalf("tasks = %d, want cap %d", len(tasks), MaxAgentTasks)
+	if len(res.Tasks) != MaxAgentTasks {
+		t.Fatalf("tasks = %d, want cap %d", len(res.Tasks), MaxAgentTasks)
 	}
-	if !truncated {
+	if !res.TasksTruncated {
 		t.Fatal(">64 matches must set truncated (list incomplete visible)")
 	}
 
@@ -442,11 +445,11 @@ func TestScanMaxTasks(t *testing.T) {
 		b2.WriteString(" " + itoa(i) + " 01:00 1 1 /bin/zcode\n")
 	}
 	s2 := scannerFor(taskFakeRunner{out: cmdResult{stdout: b2.String()}}, "linux", time.Now(), nil)
-	tasks2, _, truncated2, err := s2.Scan(context.Background())
-	if err != nil || len(tasks2) != MaxAgentTasks {
-		t.Fatalf("tasks=%d err=%v", len(tasks2), err)
+	res2 := s2.Scan(context.Background())
+	if res2.Err != nil || len(res2.Tasks) != MaxAgentTasks {
+		t.Fatalf("tasks=%d err=%v", len(res2.Tasks), res2.Err)
 	}
-	if truncated2 {
+	if res2.TasksTruncated {
 		t.Fatal("exact cap without overflow must not be truncated")
 	}
 }

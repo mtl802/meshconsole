@@ -29,6 +29,13 @@ var ErrUserNotFound = errors.New("user not found")
 // 间隙中先完成）——签发整体拒绝，旧凭据不得换来活会话。
 var ErrSessionIssuanceDenied = errors.New("user state changed since credential check; session issuance denied")
 
+// API token scope 枚举（SPEC-M1d §1/§4）：readonly=既有只读工具；operator=
+// 额外开放 submit_command/get_command/list_commands。旧 token 列缺省 readonly。
+const (
+	ScopeReadonly = "readonly"
+	ScopeOperator = "operator"
+)
+
 // UserRow 为 users 表行。
 type UserRow struct {
 	ID           int64
@@ -60,6 +67,7 @@ type APITokenRecord struct {
 	UserID      int64
 	Username    string
 	Description string
+	Scope       string        // readonly|operator（SPEC-M1d §1，migration v8）
 	ExpiresAt   sql.NullInt64 // unix 秒；NULL = 长期有效
 	CreatedAt   int64
 }
@@ -72,6 +80,7 @@ type APITokenAuth struct {
 	Enabled   bool
 	ExpiresAt sql.NullInt64
 	TokenHash string // 认证命中后应用层 constant-time 复核用
+	Scope     string // readonly|operator（submit_command 等写路径授权依据）
 	CreatedAt int64
 }
 
@@ -312,8 +321,9 @@ func (s *Store) DeleteExpiredSessions(ctx context.Context, now int64) (int64, er
 }
 
 // CreateAPIToken 签发 API token 记录（expiresAt nil = 长期有效），返回主键 id
-// 供 CLI revoke 使用。
-func (s *Store) CreateAPIToken(ctx context.Context, tokenHash string, userID int64, description string, expiresAt *int64) (int64, error) {
+// 供 CLI revoke 使用。scope ∈ {readonly, operator}（SPEC-M1d §4：operator 才能调
+// submit_command；缺省 readonly 由调用方保证——旧 token 列缺省亦为 readonly）。
+func (s *Store) CreateAPIToken(ctx context.Context, tokenHash string, userID int64, description string, expiresAt *int64, scope string) (int64, error) {
 	if err := s.writable(); err != nil {
 		return 0, err
 	}
@@ -323,8 +333,8 @@ func (s *Store) CreateAPIToken(ctx context.Context, tokenHash string, userID int
 		exp = *expiresAt
 	}
 	res, err := s.write.ExecContext(ctx, `
-INSERT INTO api_tokens(token_hash, user_id, description, expires_at, created_at)
-VALUES(?, ?, ?, ?, ?)`, tokenHash, userID, description, exp, now)
+INSERT INTO api_tokens(token_hash, user_id, description, expires_at, created_at, scope)
+VALUES(?, ?, ?, ?, ?, ?)`, tokenHash, userID, description, exp, now, scope)
 	if err != nil {
 		return 0, err
 	}
@@ -334,7 +344,7 @@ VALUES(?, ?, ?, ?, ?)`, tokenHash, userID, description, exp, now)
 // ListAPITokens 列出全部 API token（联查用户名，按创建时间倒序）。
 func (s *Store) ListAPITokens(ctx context.Context) ([]APITokenRecord, error) {
 	rows, err := s.read.QueryContext(ctx, `
-SELECT t.id, t.token_hash, t.user_id, u.username, t.description, t.expires_at, t.created_at
+SELECT t.id, t.token_hash, t.user_id, u.username, t.description, t.scope, t.expires_at, t.created_at
 FROM api_tokens t JOIN users u ON u.id = t.user_id
 ORDER BY t.created_at DESC, t.id DESC`)
 	if err != nil {
@@ -344,7 +354,7 @@ ORDER BY t.created_at DESC, t.id DESC`)
 	var out []APITokenRecord
 	for rows.Next() {
 		var r APITokenRecord
-		if err := rows.Scan(&r.ID, &r.TokenHash, &r.UserID, &r.Username, &r.Description, &r.ExpiresAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.TokenHash, &r.UserID, &r.Username, &r.Description, &r.Scope, &r.ExpiresAt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -372,12 +382,12 @@ func (s *Store) RevokeAPIToken(ctx context.Context, id int64) (bool, error) {
 // 到期校验由调用方完成（本层不取 now，保持纯查表语义）。
 func (s *Store) AuthenticateAPIToken(ctx context.Context, tokenHash string) (*APITokenAuth, error) {
 	row := s.read.QueryRowContext(ctx, `
-SELECT t.id, t.user_id, u.username, u.enabled, t.expires_at, t.token_hash, t.created_at
+SELECT t.id, t.user_id, u.username, u.enabled, t.expires_at, t.token_hash, t.scope, t.created_at
 FROM api_tokens t JOIN users u ON u.id = t.user_id
 WHERE t.token_hash = ?`, tokenHash)
 	var a APITokenAuth
 	var enabled int
-	err := row.Scan(&a.TokenID, &a.UserID, &a.Username, &enabled, &a.ExpiresAt, &a.TokenHash, &a.CreatedAt)
+	err := row.Scan(&a.TokenID, &a.UserID, &a.Username, &enabled, &a.ExpiresAt, &a.TokenHash, &a.Scope, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

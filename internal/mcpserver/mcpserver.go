@@ -16,6 +16,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/meshview"
 	"github.com/mtl802/meshconsole/internal/store"
 )
@@ -48,6 +49,11 @@ type (
 	getMeshStatusOut struct {
 		Status *meshview.MeshStatus `json:"status"`
 	}
+	listActiveSessionsOut struct {
+		// Sessions 为活跃会话清单（SPEC-M1d §3.5：agent 会话目录 mtime<30min
+		// 的会话文件，轻解析主题与当前动作）。
+		Sessions []meshview.AgentSession `json:"sessions"`
+	}
 )
 
 // get_node 等工具的入参。
@@ -65,14 +71,21 @@ type (
 	listAgentTasksIn struct {
 		Node string `json:"node,omitempty" jsonschema:"可选，按节点名过滤"`
 	}
+	listActiveSessionsIn struct {
+		Node string `json:"node,omitempty" jsonschema:"可选，按节点名过滤"`
+	}
 )
 
-// New 构造注册好五个只读工具的 MCP server。
-func New(st *store.Store, version string, opts *mcp.ServerOptions) *mcp.Server {
+// New 构造注册好只读工具与命令工具的 MCP server。cfg 提供 l2_extra_commands
+// 等提交侧配置（命令工具的统一服务端授权在 addCommandTools/HTTP 中间件）。
+// 注意：本函数注册的工具集含 submit_command，其调用受 scope 校验——stdio 场景
+// 无凭据恒 readonly（SPEC-M1d §1），调用即被拒绝。
+func New(st *store.Store, cfg *config.Console, version string, opts *mcp.ServerOptions) *mcp.Server {
 	if opts == nil {
 		opts = &mcp.ServerOptions{}
 	}
-	opts.Instructions = "MeshConsole 只读查询：节点、指标、受管服务、AI agent 与 tailnet 状态。全部工具只读，无任何写操作。"
+	opts.Instructions = "MeshConsole 查询工具：节点、指标、受管服务、AI agent 与 tailnet 状态（只读）；" +
+		"命令查询 get_command/list_commands（只读）；submit_command 下发白名单命令（需 operator scope，stdio 为只读不可用）。"
 	opts.Logger = nil // 日志由调用方的 stderr slog 负责，SDK 侧不再叠加
 	s := mcp.NewServer(&mcp.Implementation{Name: serverImplName, Version: version}, opts)
 	q := meshview.New(st)
@@ -152,6 +165,17 @@ func New(st *store.Store, version string, opts *mcp.ServerOptions) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "list_active_sessions",
+		Description: "列出当前活跃的 agent 会话（SPEC-M1d §3.5：各 agent 会话目录中最近 30 分钟有活动的会话文件），含会话文件路径、开始时刻与最近活动时刻，可按节点名过滤。已知限制：会话主题（topic）与当前动作（recent_action）暂不可用（恒为空串，各 CLI 会话文件为嵌套 JSONL、内容解析留待后续版本按真实样本实现）——判断某终端上的 agent「正在干嘛」目前以会话文件活跃度为依据",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listActiveSessionsIn) (*mcp.CallToolResult, listActiveSessionsOut, error) {
+		sessions, err := q.AgentSessions(ctx, in.Node)
+		if err != nil {
+			return nil, listActiveSessionsOut{}, err
+		}
+		return nil, listActiveSessionsOut{Sessions: sessions}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "get_mesh_status",
 		Description: "全网汇总：节点总数/在线数/离线名单、服务异常名单（非 active 且数据未过宽限）、headscale tailnet 概况、数据新鲜度（库最新指标时间）",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, getMeshStatusOut, error) {
@@ -161,6 +185,9 @@ func New(st *store.Store, version string, opts *mcp.ServerOptions) *mcp.Server {
 		}
 		return nil, getMeshStatusOut{Status: status}, nil
 	})
+
+	// M1d：命令查询与下发三工具（scope 校验在工具内 + HTTP 中间件 403 前置）。
+	addCommandTools(s, st, cfg)
 
 	return s
 }

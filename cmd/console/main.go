@@ -84,7 +84,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `meshconsole (%s · commit %s)
 用法:
   meshconsole [-config <path>]       服务模式：HTTPS 监听（agent API + 面板 + 公网 MCP）
-  meshconsole mcp [-config <path>]   MCP server：stdio 传输，六个只读工具，零网络暴露
+	meshconsole mcp [-config <path>]   MCP server：stdio 传输，只读工具，零网络暴露
+	                                   （submit_command 需 operator scope 经 HTTP MCP）
   meshconsole pki [-config <path>]   生成/校验 CA 与服务端证书（幂等，不覆盖私钥）
   meshconsole user <add|passwd|disable|enable> <用户名> [-config <path>]
                                      账号管理（交互口令；改密/禁用撤销全部会话与 token）
@@ -126,7 +127,7 @@ func configFlag(args []string) string {
 func cmdMCP(args []string) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: meshconsole mcp [-config <path>]\n（六个只读工具: list_nodes / get_node / list_services / list_agents / list_agent_tasks / get_mesh_status；日志走 stderr，stdout 为 JSON-RPC 通道）\n")
+		fmt.Fprintf(os.Stderr, "用法: meshconsole mcp [-config <path>]\n（只读工具: list_nodes / get_node / list_services / list_agents / list_agent_tasks / get_mesh_status / get_command / list_commands；submit_command 需 operator scope 的 HTTP MCP，stdio 恒只读；日志走 stderr，stdout 为 JSON-RPC 通道）\n")
 		fs.PrintDefaults()
 	}
 	cfgPath := fs.String("config", "console.yaml", "配置文件路径（读取 db_path）")
@@ -150,7 +151,7 @@ func cmdMCP(args []string) int {
 	defer stop()
 	log.Info("mcp server starting (stdio)", "version", version, "commit", commit,
 		"db", cfg.DBPath, "read_only", true)
-	if err := mcpserver.New(st, version, nil).Run(ctx, &mcp.StdioTransport{}); err != nil {
+	if err := mcpserver.New(st, cfg, version, nil).Run(ctx, &mcp.StdioTransport{}); err != nil {
 		log.Error("mcp server", "err", err)
 		return 1
 	}
@@ -280,10 +281,20 @@ func main() {
 	defer stop()
 
 	// 离线巡检与指标保留清理（SPEC §2/§4）+ 会话过期清理（M1b-c2：sessions
-	// 表随登录/登出增删，过期行由本循环低频回收）。
+	// 表随登录/登出增删，过期行由本循环低频回收）+ 命令通道巡检（M1d：unknown
+	// sweep / 离线 pending 归档 / commands 90 天保留）。
 	go registry.SweepLoop(ctx, st, log, time.Duration(cfg.OfflineAfterS)*time.Second)
 	go registry.CleanupLoop(ctx, st, log, cfg.MetricsRetentionDays)
 	go auth.SessionCleanupLoop(ctx, st, log, 10*time.Minute)
+	go registry.CommandLoop(ctx, st, log)
+
+	// L2 下发白名单同步（SPEC-M1d §1）：config 声明 → nodes.l2_allowed 列
+	// （提交与领取双重复核依据）。配置为唯一事实源，重启即重同步。
+	if err := st.SyncL2Allowed(ctx, cfg.L2AllowedNodes); err != nil {
+		log.Error("sync l2_allowed", "err", err)
+		os.Exit(1)
+	}
+	log.Info("l2 allowlist synced", "nodes", cfg.L2AllowedNodes)
 
 	// Headscale 集成（M1b-b，只读拉取）：配置无 headscale 段 = 禁用（INFO 一次）。
 	if cfg.Headscale != nil {
@@ -304,15 +315,17 @@ func main() {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		_, _ = w.Write([]byte("ok"))
 	})
-	// Web 面板（M1b-b + M1b-c2）：会话守卫 + 登录/登出 + Host/Origin 校验
-	// （白名单来自 panel_allowed_hosts）+ overview 并发闸 8。
-	panel.New(meshview.New(st), log, authMgr, cfg.AllowedHosts()).RegisterRoutes(mux)
+	// Web 面板（M1b-b + M1b-c2 + M1d §4）：会话守卫 + 登录/登出 + Host/Origin
+	// 校验（白名单来自 panel_allowed_hosts）+ overview 并发闸 8 + 命令提交/查询
+	// （单管理员 = operator，服务端 cmdsvc 统一授权）。
+	panel.New(meshview.New(st), st, cfg, log, authMgr, cfg.AllowedHosts()).RegisterRoutes(mux)
 	// agent API（M1b-a + M1b-c2 §5）：来源 CIDR 收敛（agent_allowed_cidrs）
 	// + 一次性注册 token / 节点 token 认证。
-	registry.New(st, log, cfg.RegistrationTokens, cfg.AgentCIDRs()).RegisterRoutes(mux)
-	// MCP 公网 HTTP（M1b-c2 §2）：Bearer api_token 认证 + 独立并发闸 4 +
-	// JSON 同步响应模式（SDK Stateless）。stdio MCP（子命令）不受影响。
-	mux.Handle("/mcp", mcpserver.NewHTTPHandler(st, version, authMgr))
+	registry.New(st, log, cfg.RegistrationTokens, cfg.AgentCIDRs(), cfg.L2AllowedNodes).RegisterRoutes(mux)
+	// MCP 公网 HTTP（M1b-c2 §2 + M1d §4）：Bearer api_token 认证 + scope 授权
+	// （submit_command 403 前置）+ 独立并发闸 4 + JSON 同步响应模式（SDK
+	// Stateless）。stdio MCP（子命令）不受影响（恒只读）。
+	mux.Handle("/mcp", mcpserver.NewHTTPHandler(st, cfg, version, authMgr))
 
 	// 在途 handler 计数：drainHTTP 第三段靠它确认「没有任何 handler 还在碰 DB」。
 	var inFlight sync.WaitGroup

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/mtl802/meshconsole/internal/auth"
+	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/store"
 )
 
@@ -34,10 +35,10 @@ func newTestHTTP(t *testing.T) (http.Handler, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CreateAPIToken(t.Context(), auth.HashToken(testTokenPlain), u.ID, "", nil); err != nil {
+	if _, err := st.CreateAPIToken(t.Context(), auth.HashToken(testTokenPlain), u.ID, "", nil, "readonly"); err != nil {
 		t.Fatal(err)
 	}
-	return NewHTTPHandler(st, "test", am), st
+	return NewHTTPHandler(st, &config.Console{}, "test", am), st
 }
 
 type nopLog struct{}
@@ -124,8 +125,10 @@ func TestMCPJSONModeAndTools(t *testing.T) {
 		t.Fatalf("tools/list decode: %v\n%s", err, rec.Body.String())
 	}
 	tools := listResp.Result.Tools
-	if len(tools) != 6 {
-		t.Fatalf("tools = %d, want 6", len(tools))
+	// M1d §3.5：7 个只读工具（含 list_active_sessions）+ 命令三工具
+	//（get_command/list_commands/submit_command）。
+	if len(tools) != 10 {
+		t.Fatalf("tools = %d, want 10", len(tools))
 	}
 	for _, tl := range tools {
 		if tl.Description == "" || !strings.ContainsAny(tl.Description, "节点工具状态服务任务网") {

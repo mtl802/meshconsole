@@ -201,7 +201,7 @@ func TestAPITokenAuth(t *testing.T) {
 	if len(plain) != len(APITokenPrefix)+64 {
 		t.Fatalf("token len = %d", len(plain))
 	}
-	if _, err := st.CreateAPIToken(ctx, hashToken(plain), 1, "hana", nil); err != nil {
+	if _, err := st.CreateAPIToken(ctx, hashToken(plain), 1, "hana", nil, "readonly"); err != nil {
 		t.Fatal(err)
 	}
 	rec, err := m.CheckAPIToken(ctx, plain)
@@ -217,7 +217,7 @@ func TestAPITokenAuth(t *testing.T) {
 	exp := time.Now().Add(-time.Hour)
 	expired, _ := NewAPIToken()
 	ev := exp.Unix()
-	_, _ = st.CreateAPIToken(ctx, hashToken(expired), 1, "old", &ev)
+	_, _ = st.CreateAPIToken(ctx, hashToken(expired), 1, "old", &ev, "readonly")
 	if _, err := m.CheckAPIToken(ctx, expired); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expired = %v", err)
 	}

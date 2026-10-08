@@ -507,3 +507,99 @@ curl -s http://127.0.0.1:7700/healthz
 **观察点（非阻塞，转 M1b-b 候选）**：① `--version` flag 两二进制均缺；② agent 启动日志 version 显示 `31eafac-dirty`（M1a 旧 commit 号，ldflags 注入未随 M1b-a 更新）；③ process 型采集对 agent 自身进程判 inactive（疑似 exclude-self 设计，需核对源码确认意图）。
 
 **部署遗留**：console listen 127.0.0.1:7700（公网未放行，Mac 经隧道接入）；公网直连需腾讯云防火墙放行 TCP 7700 并将 listen 改绑（M1b-b Web 面板批次一并定稿）。
+
+---
+
+# M1d 交付（Agent 任务下发通道 · L2 MVP，2026-10-08）
+
+## 一、交付范围（SPEC-M1d v1 逐条对照）
+
+| SPEC 节 | 交付物 | 关键文件 |
+|---|---|---|
+| §1 数据模型 | migration **v8**（SPEC 原文 v6，序号顺延）：commands 表（command_id uuid 主键永不复用 / status 状态机 / degraded / submission_key 唯一索引 / archived_key / result_recorded）、nodes.l2_allowed + nodes.caps、api_tokens.scope（readonly/operator，旧 token 默认 readonly） | `internal/store/store.go`、`internal/store/command.go` |
+| §2 领取与回执协议 | 心跳请求扩展 caps/command_results/command_running/command_unacked；响应扩展 commands（≤3/拍，响应写出前原子置 claimed+claimed_at）/ack_ids/drop_ids；unknown sweep（lease×2 与 running 后 timeout×1.5）、离线 pending 24h 归档、90 天保留清理、配额 ≤5/节点（事务内计数） | `internal/registry/commands.go`、`internal/registry/background.go`、`internal/store/command.go` |
+| §3 命令白名单 | internal/cmdkind 共享包（console/agent 同码双重校验）：7 个 v1 kind、固定绝对路径 argv 模板 + 类型化参数槽（unit 字符集 [a-zA-Z0-9_@.-] + 受管集合判定、n 值域 50-500/10-120、参数限长 128）；l2_extra_commands 参数化实例扩展（不引入新可执行路径，加载期校验+规范化）；agent 执行环境：固定最小 env（PATH 白名单 + SYSTEMD_PAGER=cat）、固定 cwd（state 同目录）、直接 exec 不经 shell、timeout 1-300s + 进程组 SIGKILL、合并采集 64KB 硬上限（标注计预算内）、本地并发 ≤2 | `internal/cmdkind/`、`internal/agent/executor*.go`、`internal/agent/worker.go` |
+| §4 scope 与授权 | MCP submit_command/get_command/list_commands（中文 description）；HTTP MCP scope 授权（readonly 调 submit_command → **HTTP 403 前置**）；stdio MCP 恒 readonly；面板会话 = operator（POST /api/panel/commands，SameSite=Lax + Origin 校验覆盖 CSRF）；token CLI `-scope` 参数；agent 端 l2_enabled 总开关（安全缺省 false）+ 执行前白名单再校验 | `internal/mcpserver/commands.go`、`internal/mcpserver/http.go`、`internal/panel/panel.go`、`cmd/console/usercmd.go` |
+| §5 审计与保留 | AUDIT 结构化日志（submitted/claimed/finished/dropped/archived，含 command_id/node/kind/args/created_by/scope/终态/拒绝原因）；commands 90 天保留（每小时清理，随 metrics retention 模式）；无 UPDATE result 之外的审计字段改写路径 | `internal/registry/commands.go`、`internal/registry/background.go` |
+| 面板 | 「任务下发」面板：kind/节点下拉（l2/在线资格标注，禁选必败组合）、槽位表单、提交反馈、命令对账流（状态中文映射/结果预览/降级标注），全部 textContent 渲染 | `internal/panel/web/{index.html,app.js,glass.css}` |
+
+## 二、自测数据（E2E 实录，本机 macOS 真实 TLS 链路，console+agent 双进程）
+
+| # | 场景 | 结果 |
+|---|------|------|
+| 1 | 注册（l2_allowed_nodes 含 e2e-mac，注册即同步入库）+ 心跳上报 caps `["mac-launchd"]` | ✓ 落库 nodes.caps |
+| 2 | operator token MCP 提交 ps_snapshot → claimed（claimed_at 回显）→ agent 独立 worker 执行 → 回执 → succeeded（exit 0） | ✓ 全程 3s 内；**输出 >64KB 场景**（本机 ps aux 真实 6.5 万+ 字节）：回执 65516B（截断标注计入预算），不丢不拒 |
+| 3 | ACK 闭环：console 回 ack_ids → agent 删本地对账文件（commands/ 目录清空） | ✓ |
+| 4 | 幂等键：同键同参两次提交 → 同 command_id、第二次 idempotent=true | ✓ |
+| 5 | mac 白名单命令 launchctl_list → succeeded；mac_log_show n=999 → 400「参数 n 须在 10-120」 | ✓ |
+| 6 | readonly token 调 submit_command → **HTTP 403**（中文错误体）；未注册节点 → 404「节点不存在」；非白名单 kind → 400「命令类型不在白名单内」；l2 白名单外节点 → 「该节点未开放任务下发（l2 白名单仅限 mac-mini/windows，云节点禁止）」 | ✓ |
+| 7 | 面板：登录（302）→ POST /api/panel/commands 提交成功（created_by/scope=operator 入库）→ 注入 unit（-h）→ 400 → 未登录提交 → 302 → 命令列表/元数据端点（kind 槽位 + 节点资格） | ✓ |
+| 8 | 混沌：kill agent 半路 → console lease 过期重发 → 重启后执行成功对账；console 重启 ×3 → 命令/租约/回执全从 DB 恢复 | ✓（unknown 240s 实窗未等，单测覆盖两触发分支，列真机项） |
+| 9 | agent 本地对账生命周期：intent 落盘（幂等不覆盖）→ result 覆盖 → ACK 删除；重启恢复（result 重发 / intent 补 interrupted） | ✓（TestWorkerRestartRecovery + E2E 复现） |
+
+**测试**：`go test -count=1 ./...` 254 用例全绿（新增 36，清单见 REVIEW.md R38）；`go vet ./...` 零输出；`gofmt -l` 无文件；`make cross` 三平台通过；版本号 BATCH 升为 **m1d**。
+
+## 三、E2E 发现并修复的缺陷（详见 REVIEW.md R38）
+
+1. **64KB 回执预算穿透**（agent 截断后追加标注超 console 硬上限 → 回执被拒 → 命令卡 claimed）——修复为预算感知截断，回归测试钉死。
+2. **注册后 l2 白名单不同步**（先启 console 后注册节点恒拒）——注册成功路径补同步。
+3. ListCommands 扫描器误用（RETURNING 专用 plain 扫描器进了 join 查询）——修正并核查全部调用点。
+4. MCP 输出 schema 与 json.RawMessage 冲突（SDK 推断为 array）——输出结构改 map 形态。
+
+## 四、已知限制与取舍
+
+1. **幂等窗口的时钟基准是 console 单机时钟**（10 分钟窗口 + archived_key 归档）；跨实例部署需外部时钟一致性（M1 单机形态无此问题）。
+2. **unknown 实窗恢复靠迟到回执或人工**：sweep 240s（lease×2）后才转 unknown，真机断网场景的对账演练列入部署验证项。
+3. **审计为结构化日志 + commands 表本身**：未建独立 operations 表（DESIGN §5 的 operations 属 L2 invoke_agent 批次范围）；日志不可改写、表无 result 之外 UPDATE 路径。
+4. **Windows 节点**：caps 预留、无 kind 实装（SPEC §6）；进程组杀树为单进程 Kill（Job Object 属 M3b），已用平台拆分文件隔离编译面。
+5. **面板命令区**：单管理员（会话即 operator）模型，无 per-用户权限粒度；结果预览 256B，全文走 get_command/点击行 title。
+6. **回执 over 心跳的时延**：结果最快下一拍（15s 间隔）可见——pull 模型固有，非 bug；对实时性有要求的场景属非目标（长连接推送）。
+
+## 五、修复轮 2 增量（m1d-fix2，2026-10-09；R40 五条 + R41 衔接，逐条自查见 REVIEW.md R40' 节）
+
+1. **租约代次（R39-#2，部分关闭→epoch 深修移交 fix3）**：worker 运行链三处实现级缺口补齐
+   （run 临界区收口/收尾摘柄代次守卫/Drop 代次安全化）+ 单测；R41-B1 残余角落（Drop 无代次
+   提示无法区分在场文件归属）按伦哥裁决由 fix3 以 lease_epoch 持久化绑定彻底解决。
+2. **64KB 硬上限（R39-#3，关闭）**：finalizeResult 出口硬保证复核；补 codex 点名精确形态
+   单测（65536B 正文+超时标注 → 恰 cap 且标注在场；already=true 不二次追加标注）。
+3. **SPEC §3.5 会话活跃视图（主体闭合）**：会话采集（30min 窗口/轻解析/预算内遍历）、
+   migration v9 agent_sessions（按节点全量替换）、心跳三态协议、daemon 过滤
+   （agent_tasks.background → 面板任务仪表不计常驻）、面板「agent 会话活跃」卡
+   （五要素+全部安静空态，静态资源 v=13）、MCP list_active_sessions（保留 list_agent_tasks）。
+   Codex 嵌套 JSONL 解析不出 → 主题/动作显示空（R41-②裁决为降级收口语义，fix3 落面板空态分支）。
+4. **-config= 等号写法（R39-#5，关闭）**：全链核验 + 两形态单测 + 二进制级双形态复验
+   （等号+后置 -scope/-expires 正常签发；等号+多余位置参数 exit 2 零签发）。
+5. **同参幂等键超窗复用（R39-#6，关闭）**：幂等命中统一过窗口，超窗归档后键可复用，单测钉死。
+6. **面板任务下发表单重建**：index.html 命令表单区在交付期即缺失（app.js 引用悬空、命令区
+   整体失效），按 app.js 引用接口重建（CSS 完好未动）——E2E 截图确认表单可用。
+7. **E2E 冒烟补充（二进制级）**：agent_sessions 心跳→落库→overview 数据路径、
+   MCP list_active_sessions 真数据返回、面板 390px/1400px 双宽度真实渲染截图自检通过
+   （visual-judge 子代理 provider 故障，人工按同标准判定）。
+8. **运维事故留档**：fix-1 孤儿进程与 m1d-fix2 中间树被复审的并发处置，见 REVIEW.md R40' 节
+   ——派发新修复轮前必须先终止旧轮进程。
+
+## 六、修复轮 3 增量（m1d-fix3，2026-10-09；R41 双阻塞终裁：①深修 ②降级，护栏轮）
+
+1. **租约代次令牌贯穿全链（R41-B1 深修，migration v10）**：console `commands.lease_epoch`
+   （首次领取置 1、租约过期重领自增）；回执归属验证以 epoch 回显匹配为唯一权威令牌，
+   旧代次迟到回执 → drop "stale epoch" + console 侧累计计数（AUDIT 日志
+   `stale_receipts_total`），内容不触达新代次状态；`ack_ids`/`drop_ids` 条目携带代次，
+   agent 据此清理；agent 本地对账文件按 `(command_id, lease_epoch)` 一文件——旧代次的
+   drop/ACK/退役只触达该代次及更早的文件，R41-B1 的「旧代次 drop 误删新代次刚写入的
+   结果 → 回执丢失 → 判 unknown 重执行」从结构上不可能复现。升级残留（无代次旧版
+   对账文件）启动即清除（租约过期重发兜底，不丢账）。
+2. **§3.5 会话内容解析降级收口（R41-B2，伦哥定案 ②）**：topic/recent_action 字段保留
+   但恒为空串（不再尝试轻解析——真实样本中 zcode rollout 为 model_io 嵌套结构、Codex
+   为 response_item.payload.content[] 嵌套 JSONL，原扁平解析在真实文件上同样抽不出
+   内容）；面板会话卡 topic 空时显示会话文件名 + mtime（普通空态样式，附
+   「内容暂不可见」弱化文案，非错误态；app.js v=14）；MCP list_active_sessions 工具
+   描述如实标注该限制。**已知限制：Codex 及各 CLI 嵌套 JSONL 的内容解析留 M1e 按
+   真实样本实现**。附带收益：会话采集不再读文件内容（只 stat），FIFO/大文件不再有
+   影响面。
+3. **验证口径**：go vet + gofmt + go test -count=1 ./... 全绿 + make cross 三平台 +
+   node --check；新增单测覆盖：Drop 与新代次执行真实并发交错（50 次 drop 空射 +
+   等待 gen2 回执完好）、新结果先写后旧代次 drop、同代次重发幂等（执行中 ×20 重发
+   不重执行）、ACK 按代次清理（≤确认代次出清、更高代次在途不可触达）、store 层
+   epoch 自增/迟到回执拒因/幂等命中、registry 层 ack/drop 条目带代次 + 计数器。
+   **部署上机项**：真机混沌场景（kill agent 半路 + 租约过期重发）回归 E2E 未在本轮
+   重跑（列真机验证项），单测已复现同型时序。

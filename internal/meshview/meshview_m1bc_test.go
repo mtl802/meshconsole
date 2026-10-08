@@ -35,7 +35,7 @@ func seedTasks(t *testing.T) *store.Store {
 		&[]store.AgentRow{{Name: "zcode", Type: "cli", Status: "active",
 			LastActivity: &act, SessionFiles: &files}},
 		&[]store.AgentTaskRow{{PID: 4242, AgentName: "zcode", Cmd: "zcode serve",
-			ElapsedS: 300, CPUPct: &cpu, StartedAt: sqlStart(started)}}, false)
+			ElapsedS: 300, CPUPct: &cpu, StartedAt: sqlStart(started)}}, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestAgentTasksSnapshotConsistency(t *testing.T) {
 	if _, err := st.HeartbeatFull(ctx, &store.MetricsRow{
 		NodeID: n.ID, TS: time.Now().Unix(), CPUPct: &cpu,
 	}, "agent-1", nil, nil,
-		&[]store.AgentTaskRow{{PID: 7, AgentName: "zcode", ElapsedS: 10, CPUPct: &cpu}}, true); err != nil {
+		&[]store.AgentTaskRow{{PID: 7, AgentName: "zcode", ElapsedS: 10, CPUPct: &cpu}}, true, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -180,7 +180,7 @@ func TestAgentTaskStaleMarking(t *testing.T) {
 	cpu := 12.5
 	tasks := []store.AgentTaskRow{{PID: 101, AgentName: "zcode", Cmd: "zcode serve", CPUPct: &cpu}}
 	if _, err := st.HeartbeatFull(ctx, &store.MetricsRow{NodeID: n1.ID, TS: time.Now().Unix(), CPUPct: &cpu},
-		"agent-1", nil, nil, &tasks, false); err != nil {
+		"agent-1", nil, nil, &tasks, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// mac-mini（offline）一条时间戳新鲜的遗留任务：节点失联即 stale。

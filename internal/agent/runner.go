@@ -46,6 +46,10 @@ type Runner struct {
 	TaskScan *collect.AgentTaskScanner
 	// Client 为上报 HTTP 客户端（https 时已带固定验证）；nil 时用默认客户端。
 	Client *http.Client
+	// Worker 为命令执行 worker（M1d，SPEC-M1d §2）；nil 表示命令通道禁用
+	// （能力自检全空 + 不消费心跳响应中的命令）。独立 goroutine 执行，
+	// 心跳循环只做交付与回执簿记，永不为命令执行等待。
+	Worker *CommandWorker
 
 	// agentReports 缓存最近一轮扫描结果；nil = 尚未完成首轮扫描。
 	agentReports atomic.Pointer[[]agentdisc.Report]
@@ -134,7 +138,7 @@ type heartbeatExtras struct {
 	reports  *atomic.Pointer[[]agentdisc.Report]
 	tasks    *collect.AgentTaskScanner
 
-	// tasksOut/activity/tasksErr/tasksTrunc 为本 beat 的任务采集结果（reportOnce
+	// tasksOut/activity/sessionsOut 为本 beat 的任务/会话采集结果（reportOnce
 	// 预取，因失败说明须并进 collect_errors 后才有完整的 metrics 快照）。
 	tasksOut []collect.AgentTask
 	activity map[string]collect.DirActivity
@@ -142,6 +146,12 @@ type heartbeatExtras struct {
 	// tasksTrunc 为 true 表示本拍任务清单触顶 64 条被截断（R27-#4：随心跳
 	// 显式上报 agent_tasks_truncated，console 落库并在面板标注「清单不完整」）。
 	tasksTrunc bool
+	// sessionsOut/sessErr/sessTrunc 为活跃会话采集结果（SPEC-M1d §3.5）：三态
+	// 语义同 tasks——扫描成功（含空数组）即上报（空 = 全部安静，console 清空）；
+	// 超预算/取消则缺席字段 + collect_errors（不拿半程清单冒充「无会话」）。
+	sessionsOut []collect.AgentSession
+	sessErr     error
+	sessTrunc   bool
 }
 
 func (e *heartbeatExtras) apply(ctx context.Context, snap *collect.Snapshot, body map[string]any) {
@@ -201,6 +211,18 @@ func (e *heartbeatExtras) apply(ctx context.Context, snap *collect.Snapshot, bod
 				body["agent_tasks_truncated"] = true
 			}
 		}
+		// 活跃会话（SPEC-M1d §3.5）：三态语义同 tasks。空数组 = 「全部安静」，
+		// console 侧清空该节点会话；超预算/取消缺席（console 保留旧清单不清空）。
+		if e.sessErr != nil {
+			snap.Errors["agent_sessions"] = e.sessErr.Error()
+		} else if e.sessionsOut != nil {
+			body["agent_sessions"] = e.sessionsOut
+			// 清单触顶截断：如实标注不完整（与 agent_tasks_truncated 同口径，
+			// console 侧 AUDIT 日志可见；SPEC §3.5 未设面板标注位）。
+			if e.sessTrunc {
+				body["agent_sessions_truncated"] = true
+			}
+		}
 	}
 }
 
@@ -226,20 +248,57 @@ func (r *Runner) reportOnce(ctx context.Context, client *http.Client) error {
 	}
 	if r.TaskScan != nil && r.TaskScan.Enabled() {
 		extras.tasks = r.TaskScan
-		// 任务采集在组装前执行（失败说明要进 collect_errors，须先于 body 编码）。
-		tasks, act, trunc, err := r.TaskScan.Scan(ctx)
-		if err == nil && tasks == nil {
+		// 任务/会话采集在组装前执行（失败说明要进 collect_errors，须先于 body 编码）。
+		res := r.TaskScan.Scan(ctx)
+		tasks := res.Tasks
+		if res.Err == nil && tasks == nil {
 			// 零匹配必须转显式空数组：nil 会序列化成 null（协议违规 400），
 			// 且 console 侧三态里「空数组 = 清空」正是这里要表达的语义。
 			tasks = []collect.AgentTask{}
 		}
 		extras.tasksOut = tasks
-		extras.activity = act
-		extras.tasksErr = err
-		extras.tasksTrunc = trunc
+		extras.activity = res.Activity
+		extras.tasksErr = res.Err
+		extras.tasksTrunc = res.TasksTruncated
+		extras.sessionsOut = res.Sessions
+		extras.sessErr = res.SessErr
+		extras.sessTrunc = res.SessionsTruncated
 	}
-	return reportOnce(ctx, client, r.State.ConsoleURL, r.State.NodeToken, r.State.Name, r.Version, r.Collector, extras)
+	// M1d 命令通道簿记（一次快照同时产出 results/running/unacked 三字段）：
+	// 回执未 ACK 持续重发（SPEC-M1d §2），console 的 ack_ids 到达后由 Worker
+	// 删除本地持久化结果。Worker 为 nil（未启用）时不带任何命令字段。
+	var cmdX *heartbeatCmdExtras
+	var results []*CommandRecord
+	if r.Worker != nil {
+		results = r.Worker.ResultsSnapshot()
+		if len(results) > maxResultsPerBeat {
+			results = results[:maxResultsPerBeat] // 余量下拍续发（ACK 驱动，不丢）
+		}
+		cmdX = &heartbeatCmdExtras{
+			caps:    r.Worker.Caps(),
+			results: results,
+			running: r.Worker.RunningIDs(),
+		}
+		for _, res := range results {
+			cmdX.unacked = append(cmdX.unacked, res.CommandID)
+		}
+	}
+	resp, err := reportOnce(ctx, client, r.State.ConsoleURL, r.State.NodeToken, r.State.Name, r.Version, r.Collector, extras, cmdX)
+	if err != nil {
+		return err
+	}
+	if r.Worker != nil {
+		// 领取（交付 worker 独立执行，不阻塞心跳循环）+ 确认/丢弃簿记。
+		r.Worker.Deliver(resp.Commands)
+		r.Worker.Ack(resp.AckIDs)
+		r.Worker.Drop(resp.DropIDs)
+	}
+	return nil
 }
+
+// maxResultsPerBeat 为单拍心跳最多携带的回执数（console 上限 32；本地在途
+// 配额 ≤5 + 中断恢复余量，正常触不到——防御性截断，余量下拍续发）。
+const maxResultsPerBeat = 32
 
 // jitter 返回 [0.5d, d) 的随机抖动时长（上限即 d 本身，封顶后不超 backoffMax）。
 func jitter(d time.Duration) time.Duration {

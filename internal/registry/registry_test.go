@@ -30,7 +30,7 @@ func newTestHandlerWithTokens(t *testing.T, tokens ...config.RegistrationToken) 
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return New(st, slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), tokens, nil), st
+	return New(st, slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), tokens, nil, nil), st
 }
 
 func doReq(t *testing.T, h *Handler, path, bearer string, body any) *httptest.ResponseRecorder {
@@ -81,7 +81,14 @@ func registerBody(name string) map[string]string {
 // mustRegister 走正常流程注册并返回节点 token 与节点 ID。
 func mustRegister(t *testing.T, h *Handler, name string) (string, int64) {
 	t.Helper()
-	rec := doReq(t, h, "/api/agent/register", regToken, registerBody(name))
+	return mustRegisterWithToken(t, h, name, regToken)
+}
+
+// mustRegisterWithToken 以指定注册 token 注册。注册 token 一次性（消耗即失效）
+// ——多节点测试各节点须用独立 token（newTestHandlerWithTokens 注入）。
+func mustRegisterWithToken(t *testing.T, h *Handler, name, token string) (string, int64) {
+	t.Helper()
+	rec := doReq(t, h, "/api/agent/register", token, registerBody(name))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register %s = %d body=%s", name, rec.Code, rec.Body.String())
 	}

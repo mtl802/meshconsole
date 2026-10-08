@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light">
 <meta name="robots" content="noindex">
 <title>MeshConsole — Agent 控制中台</title>
-<link rel="stylesheet" href="/glass.css">
+<link rel="stylesheet" href="/glass.css?v=13">
 </head>
 <body data-app data-theme="light">
 <!-- TODO(theme-switch): M1b-c 默认亮色；暗色变量块完整保留在 glass.css
@@ -53,19 +53,52 @@
   </header>
 
   <section class="grid" aria-label="agent 控制中台">
-    <!-- 核心区：跨终端聚合的运行中 agent 任务（大卡优先，SPEC-M1b-c §2.3） -->
+    <!-- 核心区：agent 会话活跃（SPEC-M1d §3.5——终端/agent/会话文件/最近活动/持续时长；
+         内容解析降级 R41-B2：主题空时卡片显示文件名+mtime） -->
     <div class="col-12 stack reveal" style="--d:.4s">
       <section class="glass-surface panel">
         <header class="panel-head">
-          <h2 class="panel-title">运行中的 agent 任务</h2>
-          <span class="panel-meta" id="tasks-meta">0</span>
+          <h2 class="panel-title">agent 会话活跃</h2>
+          <span class="panel-meta" id="sessions-meta">全部安静</span>
         </header>
-        <div class="task-grid" id="tasks-grid">
+        <div class="task-grid" id="sessions-grid">
           <div class="task-quiet" data-empty>
             <span class="dot dot--dim"></span>
             <span class="quiet-word">全部安静</span>
-            <span class="quiet-sub">mesh 内没有正在运行的 agent 任务</span>
+            <span class="quiet-sub">mesh 内暂无活跃 agent 会话</span>
           </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- 任务下发（SPEC-M1d §4）：白名单命令表单 + 对账清单；服务端为唯一授权面 -->
+    <div class="col-12 stack reveal" style="--d:.45s">
+      <section class="glass-surface panel">
+        <header class="panel-head">
+          <h2 class="panel-title">任务下发</h2>
+          <span class="panel-meta" id="commands-meta">0 条</span>
+        </header>
+        <form class="cmd-form glass-inset" id="cmd-form">
+          <label class="cmd-field">终端
+            <select id="cmd-node"></select>
+          </label>
+          <label class="cmd-field">命令类型
+            <select id="cmd-kind"></select>
+          </label>
+          <label class="cmd-field" id="cmd-unit-row" style="display:none">服务单元
+            <input id="cmd-unit" type="text" placeholder="unit 名">
+          </label>
+          <label class="cmd-field" id="cmd-n-row" style="display:none">行数
+            <input id="cmd-n" type="number">
+          </label>
+          <label class="cmd-field">超时（秒）
+            <input id="cmd-timeout" type="number" min="1" max="300" placeholder="30">
+          </label>
+          <button class="cmd-submit" id="cmd-submit" type="submit">下发命令</button>
+          <span class="cmd-msg" id="cmd-msg"></span>
+        </form>
+        <div class="panel-body" id="cmd-list">
+          <p class="empty" data-empty>还没有命令记录</p>
         </div>
       </section>
     </div>
@@ -81,7 +114,7 @@
           <p class="empty" data-empty>还没有节点上报</p>
         </div>
         <footer class="panel-foot">
-          invokable 恒为 false —— 发现 ≠ 可调用（M1 边界，DESIGN §4.2-B）· 活跃时刻 = 会话目录 mtime，仅 stat 不读内容
+          发现的 agent 仅登记与监测，不可被远程调用 · 「活跃」来自会话目录的最近修改时间
         </footer>
       </section>
     </div>
@@ -121,6 +154,6 @@
   </footer>
 </main>
 
-<script src="/app.js"></script>
+<script src="/app.js?v=14"></script>
 </body>
 </html>

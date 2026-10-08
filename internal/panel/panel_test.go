@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mtl802/meshconsole/internal/auth"
+	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/meshview"
 	"github.com/mtl802/meshconsole/internal/store"
 )
@@ -51,7 +52,7 @@ func newTestPanel(t *testing.T) (*http.ServeMux, *http.Cookie) {
 		CPUPct: &cpu, MemUsed: &memU, MemTotal: &memT,
 	}, "agent-1",
 		&[]store.ServiceRow{{Name: "headscale", Type: "systemd", Status: "active"}},
-		&[]store.AgentRow{{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"}}, nil, false)
+		&[]store.AgentRow{{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"}}, nil, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func newTestPanel(t *testing.T) (*http.ServeMux, *http.Cookie) {
 
 	authMgr := auth.New(st, testLogger())
 	mux := http.NewServeMux()
-	New(meshview.New(st), testLogger(), authMgr, nil).RegisterRoutes(mux)
+	New(meshview.New(st), st, &config.Console{}, testLogger(), authMgr, nil).RegisterRoutes(mux)
 
 	// 走真实登录流程取得会话 Cookie（POST /login → Set-Cookie mc_session）。
 	form := url.Values{"username": {testUser}, "password": {testPass}}

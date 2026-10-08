@@ -20,6 +20,7 @@ package mcpserver
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/mtl802/meshconsole/internal/auth"
+	"github.com/mtl802/meshconsole/internal/config"
 	"github.com/mtl802/meshconsole/internal/store"
 )
 
@@ -46,9 +48,10 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 // NewHTTPHandler 构造挂 /mcp 的公网 handler 链：
 //
-//	安全头 → Bearer 认证（401 中文化）→ 并发闸（429）→ SDK Streamable HTTP
-func NewHTTPHandler(st *store.Store, version string, am *auth.Manager) http.Handler {
-	srv := New(st, version, nil)
+//	安全头 → Bearer 认证（401 中文化，token 上下文注入）→ submit_command 的
+//	scope 403 前置 → 并发闸（429）→ SDK Streamable HTTP
+func NewHTTPHandler(st *store.Store, cfg *config.Console, version string, am *auth.Manager) http.Handler {
+	srv := New(st, cfg, version, nil)
 	inner := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv },
 		&mcp.StreamableHTTPOptions{
 			// Stateless：无会话状态、仅 POST（GET/DELETE 405）——每次请求独立
@@ -67,8 +70,19 @@ func NewHTTPHandler(st *store.Store, version string, am *auth.Manager) http.Hand
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
 		// 认证先行：不消耗并发闸位（认证失败不值得占用配额）。
-		if _, err := am.CheckAPIToken(r.Context(), auth.BearerToken(r)); err != nil {
+		rec, err := am.CheckAPIToken(r.Context(), auth.BearerToken(r))
+		if err != nil {
 			writeJSONError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+		// token 认证结果注入请求上下文：工具 handler 据此做 scope 授权
+		// （SPEC-M1d §4：所有入口统一服务端授权检查）。
+		r = r.WithContext(WithTokenAuth(r.Context(), rec))
+		// scope 403 前置（SPEC-M1d §7 验收：readonly token 调 submit → 403）：
+		// SDK 工具错误走 JSON-RPC 200 帧，此处按 HTTP 语义直接拦——解析
+		// tools/call 目标工具名，readonly 调 submit_command 一律 403。
+		if rec.Scope != store.ScopeOperator && isSubmitCommandCall(r) {
+			writeJSONError(w, http.StatusForbidden, ErrScopeDenied.Error())
 			return
 		}
 		select {
@@ -85,6 +99,35 @@ func NewHTTPHandler(st *store.Store, version string, am *auth.Manager) http.Hand
 			writeJSONError(w, http.StatusTooManyRequests, "MCP 请求并发已达上限，请稍后再试")
 		}
 	})
+}
+
+// submitCallProbe 为 tools/call 目标的探测上限（只需读到 params.name，远小于
+// 1MB 体上限；超限请求交由 SDK 的 MaxRequestBodyBytes 处理）。
+const submitCallProbe = 64 << 10
+
+// isSubmitCommandCall 报告该 POST 是否为 tools/call submit_command（探测失败
+// 一律 false——畸形请求交由 SDK 报错，不在本层放大拒绝面）。
+func isSubmitCommandCall(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, submitCallProbe))
+	// 无论解析成败都还原 body（SDK 需要完整读取）。
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var probe struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	return probe.Method == "tools/call" && probe.Params.Name == "submit_command"
 }
 
 // zhBufferCap 为错误翻译的缓冲上限：JSON 模式响应在缓冲内完整落定后统一判定，

@@ -2,6 +2,7 @@ package mcpserver_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -15,8 +16,12 @@ import (
 )
 
 // newSession 在内存传输上起 MCP server 会话（client.Connect 即完成 initialize
-// 握手）。库预置：在线节点 cloud-1（metrics + 服务 + agent）。
-func newSession(t *testing.T) *mcp.ClientSession {
+// 握手）。库预置：在线节点 cloud-1（metrics + 服务 + agent + 运行任务快照）。
+func newSession(t *testing.T) *mcp.ClientSession { return newSessionTasksTrunc(t, false) }
+
+// newSessionTasksTrunc 同 newSession，但可指定节点任务快照的截断标记落库值
+// （nodes.tasks_truncated，R27-#4 链路）。
+func newSessionTasksTrunc(t *testing.T, tasksTruncated bool) *mcp.ClientSession {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "mcp.db"))
 	if err != nil {
@@ -34,7 +39,11 @@ func newSession(t *testing.T) *mcp.ClientSession {
 		MemUsed: intp(1 << 30), MemTotal: intp(4 << 30),
 	}, "agent-1",
 		&[]store.ServiceRow{{Name: "headscale", Type: "systemd", Target: "headscale.service", Status: "active"}},
-		&[]store.AgentRow{{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"}})
+		&[]store.AgentRow{{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"}},
+		&[]store.AgentTaskRow{{
+			PID: 4242, AgentName: "zcode", Cmd: "zcode m1b-c dev", ElapsedS: 120,
+			CPUPct: fltp(12.5), StartedAt: sqlNullInt(time.Now().Unix() - 120),
+		}}, tasksTruncated)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +66,10 @@ func newSession(t *testing.T) *mcp.ClientSession {
 
 func intp(i int64) *int64 { return &i }
 
+func fltp(f float64) *float64 { return &f }
+
+func sqlNullInt(v int64) sql.NullInt64 { return sql.NullInt64{Int64: v, Valid: true} }
+
 // structured 把结果的结构化内容解码进 out（顶层对象 → 传址字段）。
 func structured(t *testing.T, res *mcp.CallToolResult, out any) {
 	t.Helper()
@@ -75,8 +88,9 @@ func structured(t *testing.T, res *mcp.CallToolResult, out any) {
 	}
 }
 
-// TestHandshakeToolsList initialize（Connect 隐含）+ tools/list：五个只读工具
-// 齐备，描述非空（SPEC §7：MCP 三方法握手之「握手 + 列表」）。
+// TestHandshakeToolsList initialize（Connect 隐含）+ tools/list：六个只读工具
+// 齐备，描述非空（SPEC §7：MCP 三方法握手之「握手 + 列表」；M1b-c §2.2 新增
+// list_agent_tasks）。
 func TestHandshakeToolsList(t *testing.T) {
 	cs := newSession(t)
 	res, err := cs.ListTools(context.Background(), nil)
@@ -85,7 +99,7 @@ func TestHandshakeToolsList(t *testing.T) {
 	}
 	want := map[string]bool{
 		"list_nodes": false, "get_node": false, "list_services": false,
-		"list_agents": false, "get_mesh_status": false,
+		"list_agents": false, "list_agent_tasks": false, "get_mesh_status": false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; ok {
@@ -218,6 +232,97 @@ func TestCallListServicesAgentsFiltered(t *testing.T) {
 	structured(t, res, &agOut)
 	if len(agOut.Agents) != 0 {
 		t.Fatalf("unknown node must give empty list, got %+v", agOut.Agents)
+	}
+}
+
+// TestCallListAgentTasks list_agent_tasks → 预置任务真数据 + 节点过滤 + 未知节点
+// 空清单语义（SPEC-M1b-c §2.2/§5）。
+func TestCallListAgentTasks(t *testing.T) {
+	cs := newSession(t)
+
+	// 无过滤：返回预置任务（zcode pid=4242）。
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_agent_tasks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Tasks          []map[string]any `json:"tasks"`
+		TasksTruncated bool             `json:"tasks_truncated"`
+	}
+	structured(t, res, &out)
+	if len(out.Tasks) != 1 {
+		t.Fatalf("tasks = %+v, want 1", out.Tasks)
+	}
+	if out.TasksTruncated {
+		t.Fatal("untruncated snapshot must report tasks_truncated=false (键恒在)")
+	}
+	task := out.Tasks[0]
+	if task["node"] != "cloud-1" || task["agent_name"] != "zcode" {
+		t.Fatalf("task = %+v", task)
+	}
+	if task["pid"].(float64) != 4242 || task["elapsed_s"].(float64) != 120 {
+		t.Fatalf("task pid/elapsed = %+v", task)
+	}
+	if task["cpu_pct"].(float64) != 12.5 {
+		t.Fatalf("task cpu = %+v", task)
+	}
+	if _, ok := task["started_at"]; !ok {
+		t.Fatalf("started_at must be exposed when known: %+v", task)
+	}
+
+	// 按节点过滤：未知节点 → 空数组（与 list_services/list_agents 同语义）。
+	res, err = cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "list_agent_tasks",
+		Arguments: map[string]any{"node": "no-such-node"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filtered struct {
+		Tasks []map[string]any `json:"tasks"`
+	}
+	structured(t, res, &filtered)
+	if len(filtered.Tasks) != 0 {
+		t.Fatalf("unknown node must give empty list, got %+v", filtered.Tasks)
+	}
+}
+
+// TestCallListAgentTasksTruncated 截断标记透出（R29-#3）：节点清单触顶 64 条
+// 截断落库（nodes.tasks_truncated=true）后，工具返回 tasks_truncated=true——
+// MCP 用户须知清单仅为前 64 条；按节点过滤取该节点自己的标记（无涉及节点
+// 为 false）。
+func TestCallListAgentTasksTruncated(t *testing.T) {
+	cs := newSessionTasksTrunc(t, true)
+
+	// 无过滤：涉及节点（cloud-1）截断 → true。
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_agent_tasks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Tasks          []map[string]any `json:"tasks"`
+		TasksTruncated bool             `json:"tasks_truncated"`
+	}
+	structured(t, res, &out)
+	if len(out.Tasks) != 1 || !out.TasksTruncated {
+		t.Fatalf("tasks=%d truncated=%v, want 1 task + truncated=true", len(out.Tasks), out.TasksTruncated)
+	}
+
+	// 过滤到无涉及节点（未知节点）：并集为空 → false（键仍在）。
+	res, err = cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "list_agent_tasks",
+		Arguments: map[string]any{"node": "no-such-node"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filtered struct {
+		Tasks          []map[string]any `json:"tasks"`
+		TasksTruncated bool             `json:"tasks_truncated"`
+	}
+	structured(t, res, &filtered)
+	if len(filtered.Tasks) != 0 || filtered.TasksTruncated {
+		t.Fatalf("empty node set must give truncated=false, got %+v", filtered)
 	}
 }
 

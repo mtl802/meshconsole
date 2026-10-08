@@ -1,32 +1,36 @@
 /* ============================================================================
-   MeshConsole panel — Liquid Glass material system (SPEC-M1b-b §4.3)
+   MeshConsole panel — Liquid Glass material system (SPEC-M1b-b §4.3 / M1b-c §1)
    ----------------------------------------------------------------------------
    设计系统取自 docs/skills/liquid-glass-frontend（伦哥点名技能）：
    只取其 CSS 材质与设计原则，丢弃 Next.js/Tailwind/motion 构建链 ——
    本文件为纯手写 CSS，无任何外部依赖（面板须内网/离线可用）。
 
-   五要素自证（对应技能 references）：
-   1. frost        —— .glass-surface: blur(34px)+saturate(190%) + specular 顶边
+   M1b-c：亮色为主（SPEC-M1b-c §1）。技能口径「亮色下 frost 要更薄、更饱和」：
+   - token 三元组换亮色（白底可读的深化版；暗色原值完整保留在 [data-theme="dark"]
+     变量块，M1c+ 做切换时翻 data-theme 即可，组件代码零改动）；
+   - frost 面板 mix 更薄（42%→30%）、saturate 更高（190%→210%+），
+     见下方 [data-theme="light"] 材质覆盖块；
+   - atmosphere 换亮色 mesh：blob 由 screen（暗色提亮）改 multiply（亮色叠色），
+     --aura 相应调低（技能 theming.md：暗色 aura 复用到亮色会发闷）。
+
+   五要素自证（对应技能 references，亮色适配要点见 DELIVERY）：
+   1. frost        —— .glass-surface: blur+saturate + specular 顶边
    2. atmosphere   —— body 后景 blob 渐变场 + 弧线 + 颗粒（玻璃必须有可折射物）
    3. token        —— 全站色板派生自三个 RGB 三元组（见 --primary/--accent/--alarm）
    4. 排版         —— 数据一律等宽（系统 mono 栈，离线取舍见 DELIVERY），
                       标题 = 超大 mono + 一处衬线斜体 accent
    5. 动效         —— 单一 easing 签名（--ease）贯穿：载入 stagger 编排、
-                      数字 tween、离线呼吸红点；prefers-reduced-motion 全关
-
-   浅色主题：M1b-b 仅交付深色。token 已按 theming.md 分层（[data-app] 语义层），
-   浅色只需加 [data-theme="light"] 覆盖块（更薄面板 + 更高 saturate，见技能
-   references/liquid-glass.md「反直觉」一节）。TODO(light-theme)。
+                      数字 tween、任务活动计时、离线呼吸红点；prefers-reduced-motion 全关
    ============================================================================ */
 
 /* ---- 三个 RGB 三元组：全站色板唯一来源（re-skin = 改这里） ----
-   控制室方向：状态色即品牌色 —— mint(online/ok)、amber(warn)、red(crit)。
-   与技能样例（primary/primary-soft/accent）的差异：本面板需要红/黄/绿三态
-   信号色，soft tint 改由 color-mix 从主色派生，三元组纪律不变。 */
+   亮色（默认）：状态色即品牌色，但须在白底可读（SPEC-M1b-c §1 对比度要求）——
+   取 Radix 深阶：emerald 700（ok 主色，白底 4.8:1）、amber 700（warn，4.6:1）、
+   red 600（crit/offline，4.5:1）。soft tint 一律 color-mix 从主色派生。 */
 :root {
-  --primary: 52 211 153;   /* mint — 品牌主色 + online/ok 状态 */
-  --accent: 245 158 11;    /* amber — warn / degraded */
-  --alarm: 248 113 113;    /* red — offline / failed / crit */
+  --primary: 4 120 87;     /* emerald 700 — 品牌主色 + online/ok 状态 */
+  --accent: 180 83 9;      /* amber 700 — warn / degraded */
+  --alarm: 220 38 38;      /* red 600 — offline / failed / crit */
   /* 派生色（禁止在组件里写死 hex） */
   --primary-soft: color-mix(in srgb, rgb(var(--primary)), white 45%);
   --primary-dim: rgb(var(--primary) / 0.14);
@@ -34,19 +38,21 @@
   --alarm-rgb: var(--alarm);
 }
 
-/* ---- 语义 token（[data-app] 层，组件只引用语义，不碰原色） ---- */
+/* ---- 语义 token（[data-app] 层，组件只引用语义，不碰原色） ----
+   亮色默认：冷调 porcelain/ink 中性系（技能 typography-color.md「cool neutrals」，
+   呼应控制室方向的冷蓝），非纯灰。 */
 :root, [data-app] {
-  --app-bg: #070B11;
-  --app-panel: #0D141E;
-  --app-elev: #16202D;
-  --app-border: rgba(214, 232, 244, 0.10);
-  --app-border-strong: rgba(214, 232, 244, 0.20);
-  --app-text: #E8EFF5;
-  --app-text-soft: #94A8B9;
-  --app-text-faint: #5E7080;
-  --app-hover: rgba(214, 232, 244, 0.05);
-  --app-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.8);
-  --aura: 0.30;            /* 玻璃背后色晕强度（深色 = 富） */
+  --app-bg: #EDF1F5;
+  --app-panel: #F7FAFC;
+  --app-elev: #FFFFFF;
+  --app-border: rgba(16, 33, 58, 0.12);
+  --app-border-strong: rgba(16, 33, 58, 0.22);
+  --app-text: #101828;
+  --app-text-soft: #475467;
+  --app-text-faint: #667085;
+  --app-hover: rgba(16, 33, 58, 0.045);
+  --app-shadow: 0 24px 60px -38px rgba(16, 33, 58, 0.35);
+  --aura: 0.24;            /* 玻璃背后色晕强度（亮色 = 柔和 pastel；技能 theming.md） */
 
   /* 等宽栈（离线取舍：不引 webfont，本机装有 JetBrains Mono / IBM Plex Mono
      则自动命中，否则落系统 mono —— 取舍说明见 DELIVERY） */
@@ -59,6 +65,25 @@
   --radius-sm: 12px;
 }
 
+/* ---- 暗色变量块（M1b-b 原实现完整保留；TODO(theme-switch)：M1c+ 提供切换，
+     翻 <body data-theme="dark"> 即整体回到暗色，组件代码零改动） ---- */
+[data-theme="dark"] {
+  --primary: 52 211 153;   /* mint */
+  --accent: 245 158 11;    /* amber */
+  --alarm: 248 113 113;    /* red */
+  --app-bg: #070B11;
+  --app-panel: #0D141E;
+  --app-elev: #16202D;
+  --app-border: rgba(214, 232, 244, 0.10);
+  --app-border-strong: rgba(214, 232, 244, 0.20);
+  --app-text: #E8EFF5;
+  --app-text-soft: #94A8B9;
+  --app-text-faint: #5E7080;
+  --app-hover: rgba(214, 232, 244, 0.05);
+  --app-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.8);
+  --aura: 0.30;
+}
+
 * { box-sizing: border-box; }
 html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 body {
@@ -69,10 +94,12 @@ body {
   font-family: var(--font-ui);
   overflow-x: hidden;
 }
-::selection { background: rgb(var(--primary) / 0.85); color: #06251A; }
+::selection { background: rgb(var(--primary) / 0.85); color: #F7FAFC; }
 
 /* ============================================================================
    ATMOSPHERE —— 玻璃之下必须有可折射的颜色（技能 liquid-glass.md「aura」节）
+   亮色 mesh：multiply 让彩色渐变在 porcelain 底上叠出 pastel（screen 在白底
+   不可见）；blob 色值吃 token，暗色块下自动回到原渐变。
    ============================================================================ */
 .atmosphere {
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
@@ -80,7 +107,7 @@ body {
 }
 .blob {
   position: absolute; border-radius: 999px;
-  filter: blur(76px); mix-blend-mode: screen;
+  filter: blur(76px); mix-blend-mode: multiply;
   opacity: var(--aura);
   will-change: transform;
 }
@@ -91,12 +118,12 @@ body {
 }
 .blob--b {
   width: 40vw; height: 40vw; left: -8%; top: 42%;
-  background: radial-gradient(circle, rgb(var(--accent) / 0.34), transparent 70%);
+  background: radial-gradient(circle, rgb(var(--accent) / 0.4), transparent 70%);
   animation: floatB 31s var(--ease) infinite;
 }
 .blob--c {
   width: 30vw; height: 30vw; left: 62%; top: 66%;
-  background: radial-gradient(circle, rgb(var(--alarm) / 0.18), transparent 70%);
+  background: radial-gradient(circle, rgb(var(--alarm) / 0.24), transparent 70%);
   animation: floatC 37s var(--ease) infinite;
 }
 @keyframes floatA {
@@ -122,11 +149,16 @@ body {
 .grid-lines {
   position: absolute; inset: 0;
   background-image:
-    linear-gradient(rgba(214, 232, 244, 0.028) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(214, 232, 244, 0.028) 1px, transparent 1px);
+    linear-gradient(rgba(16, 33, 58, 0.032) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(16, 33, 58, 0.032) 1px, transparent 1px);
   background-size: 72px 72px;
   mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 30%, transparent 78%);
   -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, black 30%, transparent 78%);
+}
+[data-theme="dark"] .grid-lines {
+  background-image:
+    linear-gradient(rgba(214, 232, 244, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(214, 232, 244, 0.028) 1px, transparent 1px);
 }
 /* 颗粒：模拟质感 + 掩盖渐变 banding（技能 typography-color.md「texture」节） */
 .grain {
@@ -137,7 +169,9 @@ body {
 
 /* ============================================================================
    GLASS MATERIAL —— 真 frost：重 blur + saturate + specular 顶边
-   （ utilities 移植自技能 assets/globals.css，去 Tailwind 化）
+   （utilities 移植自技能 assets/globals.css，去 Tailwind 化；基础块保留暗色
+   调教的原始参数，亮色覆盖块按技能「light-mode tuning」收薄面板 mix、拉高
+   saturate —— 白面板藏 frost，薄一点、饱和一点 pastel 氛围才读得出来）
    ============================================================================ */
 .glass-surface {
   background: color-mix(in srgb, var(--app-panel) 42%, transparent);
@@ -158,6 +192,25 @@ body {
     0 20px 55px -20px rgb(0 0 0 / 0.55);
   border-radius: var(--radius);
 }
+/* 亮色 frost：更薄（panel mix 42/46% → 30/34%）+ 更饱和（saturate 190/200% →
+   210/215%），specular 顶边在亮色下更亮（白 lip 0.55/0.65）——技能 liquid-glass.md */
+[data-theme="light"] .glass-surface {
+  background: color-mix(in srgb, var(--app-panel) 30%, transparent);
+  -webkit-backdrop-filter: blur(30px) saturate(210%);
+  backdrop-filter: blur(30px) saturate(210%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.55),
+    inset 0 0 0 1px var(--app-border);
+}
+[data-theme="light"] .glass-surface-soft {
+  background: color-mix(in srgb, var(--app-panel) 34%, transparent);
+  -webkit-backdrop-filter: blur(40px) saturate(215%);
+  backdrop-filter: blur(40px) saturate(215%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.65),
+    inset 0 0 0 1px var(--app-border),
+    0 20px 55px -24px rgb(16 33 58 / 0.28);
+}
 /* 玻璃面板内部的内嵌层（行/块）：绝不叠 backdrop-filter —— 嵌套会打断 GPU
    合成（技能第一大坑）。父层已 frost，内嵌只做半透明提亮 + 顶缘反光。 */
 .glass-inset {
@@ -169,6 +222,16 @@ body {
 .glass-inset-hover:hover {
   background: color-mix(in srgb, var(--app-elev) 72%, transparent);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.16), inset 0 0 0 1px rgb(255 255 255 / 0.05);
+}
+/* 亮色内嵌：白 elev 叠白板不可见——改用 ink 轻染（贴 elev 层语义的亮色等效），
+   顶缘白色反光更强，hover 时染深一档「lift in」（技能：hover 是提亮不是换色）。 */
+[data-theme="light"] .glass-inset {
+  background: color-mix(in srgb, var(--app-text) 3.5%, transparent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.6);
+}
+[data-theme="light"] .glass-inset-hover:hover {
+  background: color-mix(in srgb, var(--app-text) 6.5%, transparent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.7), inset 0 0 0 1px rgb(16 33 58 / 0.07);
 }
 
 /* ============================================================================
@@ -214,7 +277,7 @@ body {
 
 /* ============================================================================
    SHELL / LAYOUT —— 非对称 bento（技能 layout-composition.md）：
-   7/5 与 5/7 交替，节点卡「主大次小」，拒绝等宽三卡模板脸
+   任务大卡区通栏（核心），服务 5 / tailnet 7 交替，拒绝等宽三卡模板脸
    ============================================================================ */
 .shell {
   position: relative; z-index: 2;
@@ -254,12 +317,14 @@ body {
 }
 .gauge-num.is-zero { color: var(--app-text-faint); }
 .gauge-num.has-issue { color: rgb(var(--alarm)); }
+.gauge-num.is-live { color: rgb(var(--primary)); }
 
 .grid {
   display: grid;
   grid-template-columns: repeat(12, 1fr);
   gap: 22px;
 }
+.col-12 { grid-column: span 12; }
 .col-7 { grid-column: span 7; }
 .col-5 { grid-column: span 5; }
 .stack { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
@@ -267,7 +332,7 @@ body {
 @media (max-width: 980px) {
   .masthead { grid-template-columns: 1fr; align-items: start; }
   .readout { justify-self: start; }
-  .col-7, .col-5 { grid-column: span 12; }
+  .col-12, .col-7, .col-5 { grid-column: span 12; }
 }
 
 /* ============================================================================
@@ -304,73 +369,120 @@ body {
   padding: 14px 4px 8px;
 }
 
-/* ---- 节点卡（主卡） ---- */
-.node-card { padding: 24px 24px 20px; position: relative; overflow: hidden; }
-.node-card .aura {
-  position: absolute; right: -48px; top: -48px; width: 190px; height: 190px;
-  border-radius: 999px; filter: blur(46px); pointer-events: none;
-  background: rgb(var(--primary) / 0.16);
+/* ---- 运行中的 agent 任务（核心区，SPEC-M1b-c §2.3 大卡优先） ---- */
+.task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 14px;
 }
-.node-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.task-card {
+  position: relative; overflow: hidden;
+  padding: 16px 18px 14px;
+  display: flex; flex-direction: column; gap: 9px;
+  min-width: 0;
+}
+.task-card .aura {
+  position: absolute; right: -42px; top: -42px; width: 150px; height: 150px;
+  border-radius: 999px; filter: blur(42px); pointer-events: none;
+  background: rgb(var(--primary) / 0.14);
+}
+.task-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.task-node { font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.16em; text-transform: uppercase; color: var(--app-text-faint); }
+.task-agent { font-family: var(--font-mono); font-size: 1.02rem; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-cpu { margin-left: auto; font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 0.8rem; color: var(--app-text-soft); white-space: nowrap; }
+/* 快照过期/清单截断标注（R27-#3/#4）：琥珀 warn 色 chip——与色点/文字双通道纪律一致，*/
+/* 标注是文字信息不依赖颜色单通道，stale 优先于截断，二者皆无则不占位 */
+.task-flag {
+  font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.12em; text-transform: uppercase;
+  color: rgb(var(--accent));
+  border: 1px solid rgb(var(--accent) / 0.45);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.task-cmd {
+  font-family: var(--font-mono); font-size: 0.76rem; letter-spacing: 0.01em;
+  color: var(--app-text-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-elapsed-row { display: flex; align-items: baseline; gap: 12px; margin-top: 2px; }
+.task-elapsed {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 1.7rem; font-weight: 600; letter-spacing: -0.03em; line-height: 1;
+  color: var(--app-text);
+}
+.task-elapsed small { font-size: 0.72rem; font-weight: 400; color: var(--app-text-faint); margin-left: 2px; }
+.task-since { font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.05em; color: var(--app-text-faint); }
+/* 无任务空态：「全部安静」本身是信息（SPEC-M1b-c §2.3），给足存在感 */
+.task-quiet {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 34px 12px 26px;
+  font-family: var(--font-mono);
+}
+.task-quiet .quiet-word { font-size: 1.05rem; letter-spacing: 0.3em; color: var(--app-text-soft); }
+.task-quiet .quiet-sub { font-size: 0.7rem; letter-spacing: 0.1em; color: var(--app-text-faint); }
+
+/* ---- 终端卡（每终端一张，SPEC-M1b-c §2.3：状态/角色/sparkline/agent 清单） ---- */
+.node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+  gap: 14px;
+}
+@media (max-width: 980px) { .node-grid { grid-template-columns: 1fr; } }
+.node-card {
+  position: relative; overflow: hidden;
+  padding: 16px 18px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  min-width: 0;
+}
+.node-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .node-name {
   font-family: var(--font-mono);
-  font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em;
+  font-size: 1.12rem; font-weight: 600; letter-spacing: -0.02em;
 }
 .node-chip {
-  font-family: var(--font-mono); font-size: 0.64rem; letter-spacing: 0.14em;
+  font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--app-text-soft);
   border: 1px solid var(--app-border-strong);
   border-radius: 999px;
-  padding: 3px 10px;
+  padding: 2px 9px;
 }
-.node-kv {
-  display: grid; grid-template-columns: repeat(4, auto); gap: 4px 22px;
-  margin: 16px 0 4px; width: fit-content;
-}
-.node-kv .label { display: block; margin-bottom: 3px; }
-.node-kv .val {
-  font-family: var(--font-mono); font-size: 0.86rem;
-  font-variant-numeric: tabular-nums;
-  color: var(--app-text);
-}
-.spark-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 14px; }
-.spark-block { min-width: 0; }
+.node-hb { margin-left: auto; font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.05em; color: var(--app-text-faint); white-space: nowrap; }
+.spark-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.spark-block { min-width: 0; padding: 9px 11px; }
 .spark-head {
-  display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px;
+  display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px;
 }
-.spark-val { font-family: var(--font-mono); font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
-.spark-val small { font-size: 0.68rem; font-weight: 400; color: var(--app-text-faint); margin-left: 2px; }
-.spark-block svg { display: block; width: 100%; height: 54px; }
-.disk-meter { margin-top: 16px; }
-.disk-bar {
-  height: 5px; border-radius: 999px; overflow: hidden; margin-top: 6px;
-  background: color-mix(in srgb, var(--app-elev) 80%, transparent);
-}
-.disk-bar > i {
+.spark-val { font-family: var(--font-mono); font-size: 0.98rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.spark-val small { font-size: 0.64rem; font-weight: 400; color: var(--app-text-faint); margin-left: 2px; }
+.spark-block svg { display: block; width: 100%; height: 44px; }
+.disk-meter { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
+.disk-meter .label { margin: 0; }
+.disk-val { font-family: var(--font-mono); font-size: 0.7rem; font-variant-numeric: tabular-nums; color: var(--app-text-soft); justify-self: end; }
+.disk-track { height: 4px; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--app-elev) 80%, transparent); }
+[data-theme="light"] .disk-track { background: color-mix(in srgb, var(--app-text) 8%, transparent); }
+.disk-track > i {
   display: block; height: 100%; border-radius: 999px;
   background: linear-gradient(90deg, rgb(var(--primary) / 0.9), rgb(var(--primary) / 0.55));
   transition: width .6s var(--ease);
 }
-.disk-bar.warn > i { background: linear-gradient(90deg, rgb(var(--accent) / 0.95), rgb(var(--accent) / 0.6)); }
+.disk-track.warn > i { background: linear-gradient(90deg, rgb(var(--accent) / 0.95), rgb(var(--accent) / 0.6)); }
+/* 终端卡 agent 清单：名字 + last_activity（会话目录 stat 辅证） */
+.node-agents { display: flex; flex-direction: column; gap: 6px; }
+.node-agents .label { margin-bottom: 2px; }
+.agent-line {
+  display: grid; grid-template-columns: 12px auto 1fr auto; gap: 8px;
+  align-items: center;
+  padding: 7px 11px;
+  font-family: var(--font-mono); font-size: 0.74rem;
+}
+.agent-line .al-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-line .al-sub { font-size: 0.64rem; color: var(--app-text-faint); letter-spacing: 0.03em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-line .al-act { font-size: 0.66rem; font-variant-numeric: tabular-nums; color: var(--app-text-soft); white-space: nowrap; }
 
-/* ---- 节点小卡（次节点）：更小、更密、与主卡不同形（不等宽纪律） ---- */
-.node-mini {
-  display: grid; grid-template-columns: auto 1fr auto; gap: 4px 14px; align-items: center;
-  padding: 12px 16px;
-}
-.node-mini .node-name { font-size: 0.95rem; }
-.node-mini .mini-meta {
-  font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.05em;
-  color: var(--app-text-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.node-mini .mini-cpu {
-  font-family: var(--font-mono); font-size: 0.86rem; font-variant-numeric: tabular-nums;
-  color: var(--app-text); text-align: right;
-}
-.node-mini .mini-cpu small { color: var(--app-text-faint); font-size: 0.62rem; }
-
-/* ---- 清单行（服务 / agent / tailnet）：glass-inset 语义 ---- */
+/* ---- 清单行（服务 / tailnet）：glass-inset 语义 ---- */
 .row {
   display: grid; align-items: center; gap: 12px;
   padding: 10px 14px;
@@ -380,10 +492,9 @@ body {
 .row .row-name { font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .row-sub { font-size: 0.68rem; color: var(--app-text-faint); letter-spacing: 0.04em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-services { grid-template-columns: 14px 1.2fr 1fr auto; }
-.row-agents   { grid-template-columns: 14px 1fr 0.9fr 1fr auto; }
 .row-tailnet  { grid-template-columns: 14px 1.1fr 1fr auto; }
 @media (max-width: 720px) {
-  .row-services, .row-agents, .row-tailnet { grid-template-columns: 14px 1fr auto; }
+  .row-services, .row-tailnet { grid-template-columns: 14px 1fr auto; }
   .row .hide-sm { display: none; }
 }
 .type-chip {
@@ -406,17 +517,22 @@ body {
   background: var(--app-text-faint);
   transition: background-color .4s var(--ease), box-shadow .4s var(--ease);
 }
-.dot--ok   { background: rgb(var(--primary)); box-shadow: 0 0 10px rgb(var(--primary) / 0.55); }
-.dot--warn { background: rgb(var(--accent)); box-shadow: 0 0 10px rgb(var(--accent) / 0.5); }
-.dot--crit { background: rgb(var(--alarm)); box-shadow: 0 0 10px rgb(var(--alarm) / 0.55); }
+.dot--ok   { background: rgb(var(--primary)); box-shadow: 0 0 8px rgb(var(--primary) / 0.4); }
+.dot--warn { background: rgb(var(--accent)); box-shadow: 0 0 8px rgb(var(--accent) / 0.4); }
+.dot--crit { background: rgb(var(--alarm)); box-shadow: 0 0 8px rgb(var(--alarm) / 0.45); }
 .dot--dim  { background: var(--app-text-faint); }
 .dot-text { font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; }
 .status-cell { display: inline-flex; align-items: center; gap: 8px; }
-/* offline / 异常：呼吸红点（可注意的视觉处理） */
+/* offline / 异常：呼吸红点（可注意的视觉处理）；运行中任务：呼吸绿点 */
 .breathing { animation: breathe 2.4s var(--ease) infinite; }
+.breathing--live { animation: breatheLive 2.4s var(--ease) infinite; }
 @keyframes breathe {
-  0%, 100% { box-shadow: 0 0 4px rgb(var(--alarm) / 0.4); opacity: 1; }
-  50%      { box-shadow: 0 0 16px rgb(var(--alarm) / 0.95); opacity: 0.55; }
+  0%, 100% { box-shadow: 0 0 4px rgb(var(--alarm) / 0.35); opacity: 1; }
+  50%      { box-shadow: 0 0 14px rgb(var(--alarm) / 0.9); opacity: 0.55; }
+}
+@keyframes breatheLive {
+  0%, 100% { box-shadow: 0 0 4px rgb(var(--primary) / 0.3); opacity: 1; }
+  50%      { box-shadow: 0 0 12px rgb(var(--primary) / 0.8); opacity: 0.6; }
 }
 .status-warn-text { color: rgb(var(--accent)); }
 .status-crit-text { color: rgb(var(--alarm)); }
@@ -456,7 +572,7 @@ body {
 @keyframes wipe { to { clip-path: inset(0 0 -10% 0); } }
 
 @media (prefers-reduced-motion: reduce) {
-  .blob, .breathing { animation: none !important; }
+  .blob, .breathing, .breathing--live { animation: none !important; }
   .reveal, .reveal--clip { animation-duration: 0.01s !important; animation-delay: 0s !important; }
   * { transition-duration: 0.01s !important; }
 }

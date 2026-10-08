@@ -44,6 +44,8 @@ type Node struct {
 	LastSeen     sql.NullInt64 // unix 秒
 	LastSuccess  sql.NullInt64 // unix 秒
 	CreatedAt    int64         // unix 秒
+	// TasksTruncated 为最近一次显式任务快照的截断标记（R27-#4，migration v5）。
+	TasksTruncated bool
 }
 
 // MetricsRow 为 metrics 表行；空指针字段入库为 NULL（采集失败禁止填 0）。
@@ -261,6 +263,43 @@ CREATE TABLE IF NOT EXISTS tailnet_nodes (
 CREATE INDEX IF NOT EXISTS idx_tailnet_nodes_updated ON tailnet_nodes(updated_at);
 `,
 	},
+	{
+		// M1b-c（SPEC §2.2）：agent 运行任务快照表 + AI agent 会话活跃度列。
+		// agent_tasks 为「当前正在运行」的快照：心跳按节点全量替换（进程消失 =
+		// 任务结束，行随之删除，不留历史）；历史任务档案属 M1c+，本期不做。
+		// ai_agents 增列 last_activity（会话目录树最近 mtime，unix 秒，可空）与
+		// session_files（目录树文件数，可空）——只 stat 不读内容的轻量辅证。
+		Version: 4,
+		SQL: `
+CREATE TABLE IF NOT EXISTS agent_tasks (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	node_id    INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+	pid        INTEGER NOT NULL,
+	agent_name TEXT    NOT NULL,
+	cmd        TEXT    NOT NULL DEFAULT '',
+	elapsed_s  INTEGER NOT NULL DEFAULT 0,
+	cpu_pct    REAL,
+	mem_pct    REAL,
+	started_at INTEGER,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_node_updated ON agent_tasks(node_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_updated ON agent_tasks(updated_at);
+
+	ALTER TABLE ai_agents ADD COLUMN last_activity INTEGER;
+	ALTER TABLE ai_agents ADD COLUMN session_files INTEGER;
+`,
+	},
+	{
+		// m1b-c-fix（R27-#4）：节点级「任务清单截断」标记。单拍匹配任务数超过
+		// 上限 64 时，agent 上报的 agent_tasks 是不完整子集——随最近一次显式
+		// 任务快照写入该标记（快照字段缺席不改动），面板/MCP 据此标注「清单
+		// 不完整」，截断可见不静默。
+		Version: 5,
+		SQL: `
+ALTER TABLE nodes ADD COLUMN tasks_truncated INTEGER NOT NULL DEFAULT 0;
+`,
+	},
 }
 
 func (s *Store) migrate() error {
@@ -376,7 +415,7 @@ VALUES(?, ?, ?, ?, '', 'online', ?, ?, NULL, ?)`,
 func (s *Store) AuthenticateNode(ctx context.Context, tokenHash string) (*Node, error) {
 	row := s.read.QueryRowContext(ctx, `
 SELECT id, name, role, os, arch, tailnet_ip, public_ip, agent_version, status,
-       token_hash, last_seen, last_success, created_at
+       token_hash, last_seen, last_success, created_at, tasks_truncated
 FROM nodes WHERE token_hash = ?`, tokenHash)
 	return scanNode(row)
 }
@@ -386,7 +425,8 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanNode(row rowScanner) (*Node, error) {
 	n := &Node{}
 	err := row.Scan(&n.ID, &n.Name, &n.Role, &n.OS, &n.Arch, &n.TailnetIP, &n.PublicIP,
-		&n.AgentVersion, &n.Status, &n.TokenHash, &n.LastSeen, &n.LastSuccess, &n.CreatedAt)
+		&n.AgentVersion, &n.Status, &n.TokenHash, &n.LastSeen, &n.LastSuccess, &n.CreatedAt,
+		&n.TasksTruncated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -448,11 +488,14 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 // HeartbeatFull 单事务完成一次心跳的全部写入（R11-F）：节点时间戳 + metrics +
-// services 全量替换（services 非 nil 时）+ agents 全量替换（agents 非 nil 时）。
-// 任何一步失败整体回滚——三次独立事务中途失败会留下「metrics 已落、清单未换」
-// 的半轮数据，合并后与单条心跳同原子性。services/agents 传 nil 表示字段缺席
-// （无变化不覆盖）。返回 false 表示节点不存在（token 失效）。
-func (s *Store) HeartbeatFull(ctx context.Context, n *MetricsRow, agentVersion string, services *[]ServiceRow, agents *[]AgentRow) (bool, error) {
+// services 全量替换（services 非 nil 时）+ agents 全量替换（agents 非 nil 时）+
+// agent_tasks 全量替换（tasks 非 nil 时）。任何一步失败整体回滚——三次独立事务
+// 中途失败会留下「metrics 已落、清单未换」的半轮数据，合并后与单条心跳同原子性。
+// services/agents/tasks 传 nil 表示字段缺席（无变化不覆盖）。tasks 非 nil 时
+// tasksTruncated 随快照写入 nodes.tasks_truncated（R27-#4：清单触顶截断可见，
+// 未截断的显式快照把标记复位为 false；tasks 为 nil 时不改动标记）。返回 false
+// 表示节点不存在（token 失效）。
+func (s *Store) HeartbeatFull(ctx context.Context, n *MetricsRow, agentVersion string, services *[]ServiceRow, agents *[]AgentRow, tasks *[]AgentTaskRow, tasksTruncated bool) (bool, error) {
 	if err := s.writable(); err != nil {
 		return false, err
 	}
@@ -473,6 +516,20 @@ func (s *Store) HeartbeatFull(ctx context.Context, n *MetricsRow, agentVersion s
 	}
 	if agents != nil {
 		if err := replaceAgentsTx(ctx, tx, n.NodeID, *agents, now); err != nil {
+			return false, err
+		}
+	}
+	if tasks != nil {
+		if err := replaceAgentTasksTx(ctx, tx, n.NodeID, *tasks, now); err != nil {
+			return false, err
+		}
+		// 截断标记是快照的属性，与快照同事务落库（同生同灭，无半拍错位）。
+		truncInt := 0
+		if tasksTruncated {
+			truncInt = 1
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE nodes SET tasks_truncated = ? WHERE id = ?`, truncInt, n.NodeID); err != nil {
 			return false, err
 		}
 	}
@@ -516,7 +573,7 @@ func (s *Store) CountMetrics(ctx context.Context, nodeID int64) (int, error) {
 func (s *Store) GetNodeByName(ctx context.Context, name string) (*Node, error) {
 	row := s.read.QueryRowContext(ctx, `
 SELECT id, name, role, os, arch, tailnet_ip, public_ip, agent_version, status,
-       token_hash, last_seen, last_success, created_at
+       token_hash, last_seen, last_success, created_at, tasks_truncated
 FROM nodes WHERE name = ?`, name)
 	return scanNode(row)
 }
@@ -596,7 +653,11 @@ type AgentRow struct {
 	Status    string // active/inactive/unavailable/unknown
 	Invokable bool   // M1 恒 false（发现 ≠ 可调用，DESIGN §4.2-B）
 	Detail    string
-	UpdatedAt int64 // unix 秒，由 store 统一取 now
+	// LastActivity/SessionFiles 为会话目录 stat 辅证（SPEC-M1b-c §2.1，
+	// 只 stat 不读内容）；nil = 目录缺失或未产出（NULL）。
+	LastActivity *int64
+	SessionFiles *int64
+	UpdatedAt    int64 // unix 秒，由 store 统一取 now
 }
 
 // ReplaceNodeServices 以本次上报为准全量替换某节点的服务清单（SPEC-M1b-a §4）：
@@ -689,19 +750,67 @@ func replaceAgentsTx(ctx context.Context, tx *sql.Tx, nodeID int64, ags []AgentR
 		// invokable 由服务端强制为 false：发现 ≠ 可调用（DESIGN §4.2-B），
 		// 客户端无任何途径写 true。
 		ags[i].Invokable = false
+		var lastAct, files any
+		if ags[i].LastActivity != nil {
+			lastAct = *ags[i].LastActivity
+		}
+		if ags[i].SessionFiles != nil {
+			files = *ags[i].SessionFiles
+		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO ai_agents(node_id, name, type, version, path, status, invokable, detail, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO ai_agents(node_id, name, type, version, path, status, invokable, detail, last_activity, session_files, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(node_id, name) DO UPDATE SET
 	type = excluded.type, version = excluded.version, path = excluded.path,
 	status = excluded.status, invokable = excluded.invokable,
-	detail = excluded.detail, updated_at = excluded.updated_at`,
+	detail = excluded.detail, last_activity = excluded.last_activity,
+	session_files = excluded.session_files, updated_at = excluded.updated_at`,
 			ags[i].NodeID, ags[i].Name, ags[i].Type, ags[i].Version, ags[i].Path,
-			ags[i].Status, ags[i].Invokable, ags[i].Detail, ags[i].UpdatedAt); err != nil {
+			ags[i].Status, ags[i].Invokable, ags[i].Detail, lastAct, files, ags[i].UpdatedAt); err != nil {
 			return err
 		}
 	}
 	return markStale(ctx, tx, "ai_agents", nodeID, ags, now)
+}
+
+// AgentTaskRow 为 agent_tasks 表行（心跳上报的运行任务快照；按节点全量替换）。
+type AgentTaskRow struct {
+	NodeID    int64
+	PID       int64
+	AgentName string
+	Cmd       string
+	ElapsedS  int64
+	CPUPct    *float64
+	MemPct    *float64
+	// StartedAt 为进程启动时刻（unix 秒，由 etime 反推）；nil = 未知（Windows
+	// tasklist 兜底无此数据）。
+	StartedAt sql.NullInt64
+	UpdatedAt int64 // unix 秒，由 store 统一取 now
+}
+
+// replaceAgentTasksTx 为任务快照的核心写入（先清后插的全量替换，SPEC-M1b-c
+// §2.2：进程消失 = 任务结束，不留历史行），供单表事务与 HeartbeatFull 共用。
+func replaceAgentTasksTx(ctx context.Context, tx *sql.Tx, nodeID int64, tasks []AgentTaskRow, now int64) error {
+	// 先清后插（与 tailnet_nodes 同口径）：快照表只反映「现在」，不存在 stale 簿记态。
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_tasks WHERE node_id = ?`, nodeID); err != nil {
+		return err
+	}
+	for i := range tasks {
+		tasks[i].NodeID = nodeID
+		tasks[i].UpdatedAt = now
+		var startedAt any
+		if tasks[i].StartedAt.Valid {
+			startedAt = tasks[i].StartedAt.Int64
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO agent_tasks(node_id, pid, agent_name, cmd, elapsed_s, cpu_pct, mem_pct, started_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			tasks[i].NodeID, tasks[i].PID, tasks[i].AgentName, tasks[i].Cmd,
+			tasks[i].ElapsedS, tasks[i].CPUPct, tasks[i].MemPct, startedAt, tasks[i].UpdatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // markStale 将本次上报未出现的行 status 置 'stale'（全量替换语义的另一半）。
@@ -783,27 +892,36 @@ type AgentRecord struct {
 	Status    string
 	Invokable bool
 	Detail    string
-	UpdatedAt int64
+	// LastActivity/SessionFiles 为会话目录 stat 辅证（M1b-c）；NULL 保持 nil。
+	LastActivity *int64
+	SessionFiles *int64
+	UpdatedAt    int64
 }
 
-// ListAgents 按节点列出 AI agent 行（按名称排序）。
-func (s *Store) ListAgents(ctx context.Context, nodeID int64) ([]AgentRecord, error) {
-	rows, err := s.read.QueryContext(ctx, `
-SELECT node_id, name, type, version, path, status, invokable, detail, updated_at
-FROM ai_agents WHERE node_id = ? ORDER BY name`, nodeID)
-	if err != nil {
-		return nil, err
-	}
+func scanAgentRows(rows *sql.Rows) ([]AgentRecord, error) {
 	defer rows.Close()
 	var out []AgentRecord
 	for rows.Next() {
 		var r AgentRecord
-		if err := rows.Scan(&r.NodeID, &r.Name, &r.Type, &r.Version, &r.Path, &r.Status, &r.Invokable, &r.Detail, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.NodeID, &r.Name, &r.Type, &r.Version, &r.Path, &r.Status,
+			&r.Invokable, &r.Detail, &r.LastActivity, &r.SessionFiles, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListAgents 按节点列出 AI agent 行（按名称排序）。
+func (s *Store) ListAgents(ctx context.Context, nodeID int64) ([]AgentRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT node_id, name, type, version, path, status, invokable, detail,
+       last_activity, session_files, updated_at
+FROM ai_agents WHERE node_id = ? ORDER BY name`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return scanAgentRows(rows)
 }
 
 // ---- M1b-b：tailnet（Headscale）与只读聚合查询 ----
@@ -922,16 +1040,57 @@ FROM services ORDER BY name, node_id`)
 // ListAllAgents 列出全网 AI agent 行。
 func (s *Store) ListAllAgents(ctx context.Context) ([]AgentRecord, error) {
 	rows, err := s.read.QueryContext(ctx, `
-SELECT node_id, name, type, version, path, status, invokable, detail, updated_at
+SELECT node_id, name, type, version, path, status, invokable, detail,
+       last_activity, session_files, updated_at
 FROM ai_agents ORDER BY name, node_id`)
 	if err != nil {
 		return nil, err
 	}
+	return scanAgentRows(rows)
+}
+
+// AgentTaskRecord 为读出的 agent_tasks 行（当前运行任务快照）。
+type AgentTaskRecord struct {
+	NodeID    int64
+	PID       int64
+	AgentName string
+	Cmd       string
+	ElapsedS  int64
+	CPUPct    sql.NullFloat64
+	MemPct    sql.NullFloat64
+	StartedAt sql.NullInt64
+	UpdatedAt int64
+}
+
+// ListAgentTasks 列出某节点当前任务快照（按 agent 名、pid 排序）。
+func (s *Store) ListAgentTasks(ctx context.Context, nodeID int64) ([]AgentTaskRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT node_id, pid, agent_name, cmd, elapsed_s, cpu_pct, mem_pct, started_at, updated_at
+FROM agent_tasks WHERE node_id = ? ORDER BY agent_name, pid`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return scanAgentTaskRows(rows)
+}
+
+// ListAllAgentTasks 列出全网当前任务快照（按节点、agent 名、pid 排序）。
+func (s *Store) ListAllAgentTasks(ctx context.Context) ([]AgentTaskRecord, error) {
+	rows, err := s.read.QueryContext(ctx, `
+SELECT node_id, pid, agent_name, cmd, elapsed_s, cpu_pct, mem_pct, started_at, updated_at
+FROM agent_tasks ORDER BY node_id, agent_name, pid`)
+	if err != nil {
+		return nil, err
+	}
+	return scanAgentTaskRows(rows)
+}
+
+func scanAgentTaskRows(rows *sql.Rows) ([]AgentTaskRecord, error) {
 	defer rows.Close()
-	var out []AgentRecord
+	var out []AgentTaskRecord
 	for rows.Next() {
-		var r AgentRecord
-		if err := rows.Scan(&r.NodeID, &r.Name, &r.Type, &r.Version, &r.Path, &r.Status, &r.Invokable, &r.Detail, &r.UpdatedAt); err != nil {
+		var r AgentTaskRecord
+		if err := rows.Scan(&r.NodeID, &r.PID, &r.AgentName, &r.Cmd, &r.ElapsedS,
+			&r.CPUPct, &r.MemPct, &r.StartedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -1030,13 +1189,15 @@ type NodeRecord struct {
 	LastSeen     sql.NullInt64
 	LastSuccess  sql.NullInt64
 	CreatedAt    int64
+	// TasksTruncated 为最近一次显式任务快照的截断标记（R27-#4，migration v5）。
+	TasksTruncated bool
 }
 
 // ListNodes 列出全部节点（按名称排序；不含 token_hash）。
 func (s *Store) ListNodes(ctx context.Context) ([]NodeRecord, error) {
 	rows, err := s.read.QueryContext(ctx, `
 SELECT id, name, role, os, arch, tailnet_ip, public_ip, agent_version, status,
-       last_seen, last_success, created_at
+       last_seen, last_success, created_at, tasks_truncated
 FROM nodes ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -1046,7 +1207,8 @@ FROM nodes ORDER BY name`)
 	for rows.Next() {
 		var r NodeRecord
 		if err := rows.Scan(&r.ID, &r.Name, &r.Role, &r.OS, &r.Arch, &r.TailnetIP,
-			&r.PublicIP, &r.AgentVersion, &r.Status, &r.LastSeen, &r.LastSuccess, &r.CreatedAt); err != nil {
+			&r.PublicIP, &r.AgentVersion, &r.Status, &r.LastSeen, &r.LastSuccess, &r.CreatedAt,
+			&r.TasksTruncated); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

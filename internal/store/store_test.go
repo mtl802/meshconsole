@@ -443,7 +443,7 @@ func TestHeartbeatFullAtomic(t *testing.T) {
 	row := &MetricsRow{NodeID: node.ID, TS: time.Now().Unix(), CPUPct: &pct}
 	svcs := []ServiceRow{{Name: "a", Type: "process", Target: "a", Status: "active"}}
 	ags := []AgentRow{{Name: "zcode", Type: "cli", Version: "1.0", Status: "active"}}
-	if ok, err := st.HeartbeatFull(ctx, row, "v1", &svcs, &ags); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, row, "v1", &svcs, &ags, nil, false); err != nil || !ok {
 		t.Fatalf("heartbeat full: ok=%v err=%v", ok, err)
 	}
 	if n, _ := st.CountMetrics(ctx, node.ID); n != 1 {
@@ -457,7 +457,7 @@ func TestHeartbeatFullAtomic(t *testing.T) {
 	}
 
 	// 缺席语义：nil = 字段缺席，既有清单不动、metrics 照写。
-	if ok, err := st.HeartbeatFull(ctx, row, "v1", nil, nil); err != nil || !ok {
+	if ok, err := st.HeartbeatFull(ctx, row, "v1", nil, nil, nil, false); err != nil || !ok {
 		t.Fatalf("heartbeat full (absent): ok=%v err=%v", ok, err)
 	}
 	if s, _ := st.ListServices(ctx, node.ID); len(s) != 1 || s[0].Status != "active" {
@@ -472,7 +472,7 @@ func TestHeartbeatFullAtomic(t *testing.T) {
 	for i := range flood {
 		flood[i] = ServiceRow{Name: fmt.Sprintf("s%05d", i), Type: "process", Status: "active"}
 	}
-	if _, err := st.HeartbeatFull(ctx, row, "v1", &flood, nil); err == nil {
+	if _, err := st.HeartbeatFull(ctx, row, "v1", &flood, nil, nil, false); err == nil {
 		t.Fatal("oversized services batch must fail")
 	}
 	// metrics 与既有服务行必须原样保留（半轮数据不存在）。

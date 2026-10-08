@@ -1,3 +1,67 @@
+# DELIVERY — M1b-c 交付说明（亮色主题 + Agent 任务监测 / agent 中台）
+
+> 交付人：zcode · 2026-10-08
+> 依据：SPEC-M1b-c.md（唯一需求源，逐条执行）+ `docs/skills/liquid-glass-frontend` 技能（伦哥点名，theming/liquid-glass 两篇先行）
+> 基线：M1b-b（commit da1e1ad）。状态：**本机可验证项全部自测通过（含真机伪装进程 E2E）；cloud-agent 上机上报、真 headscale 连测、浏览器人眼验收列部署上机项**（逐条证据见 REVIEW.md「自测报告 · zcode M1b-c」节）。**R27 首审 5 条已修完（m1b-c-fix，REVIEW.md R28 节）；R29 复审 3 条已修完（m1b-c-fix2，REVIEW.md R30 节），未执行 git commit。**
+
+## 〇、修复轮 m1b-c-fix（R27 全 5 条，2026-10-08）
+
+R27 裁决 2 阻塞 + 2 建议 + 1 可选全部修完（逐条文件:行号见 REVIEW.md R28）。行为变化：① 服务端 `agent_tasks.cpu_pct` 值域放宽为「有限且 ≥0」不设上限（多核 ps %CPU 超 100 是 ps 语义，此前 8 核打满会整条心跳 400 丢库）；mem_pct 维持 [0,100]；② 会话目录遍历全程挂 8s 预算 ctx、8192 上限改文件+目录合计、触顶 `Truncated` 如实进 collect_errors（海量空目录不再无限遍历）；③ 离线/快照过期（>90s 未刷新，`taskStaleAfter`）节点的任务打 `stale` 标记——面板任务大卡计时冻结+「snapshot stale」标注、仪表与 meta 不冒充运行中，MCP list_agent_tasks 同源带标记；④ 任务清单触顶 64 触发 `agent_tasks_truncated` 上报，落 nodes.tasks_truncated（**migration v5**），面板任务卡/meta 标注「list truncated」；⑤ headscale.go:41 注释与节流窗口实际行为对齐（纯注释）。验证：vet/gofmt 零输出、171 用例全绿（+9）、make cross 三平台、node --check + DOM 桩冒烟过。
+
+## 〇′、修复轮 m1b-c-fix2（R29 全 3 条，2026-10-08）
+
+R29 裁决 1 阻塞（R27-#2 第 2 次修复）+ 2 建议全部修完（逐条文件:行号见 REVIEW.md R30）。行为变化：① 会话目录遍历**弃 `filepath.WalkDir` 改显式栈式 DFS + 分批 readdir**（`os.Open` + `ReadDir(256)` 分批，批间查 ctx、批内逐条查条目配额）——超大单目录（数十万条目）的读取量不再发生在检查之前，被「8192 配额 + 一批」与 8s 预算双重封顶，触顶/超时如实报不完整（Truncated→collect_errors / 缺席，上报口径不变）；② 面板 overview **拉取持续失败超 90s**（与服务端 `taskStaleAfter` 同窗口径）时旧任务卡按 stale 冻结（复用 updateTaskCard 同一套语义：计时停走、呼吸点停转、「snapshot stale」标注、仪表只计非 stale），窗口内失败不冻结，恢复刷新自动解冻；③ MCP `list_agent_tasks` 返回结构新增 `tasks_truncated` 键（恒输出，涉及节点截断标记并集），工具描述同步——MCP 用户可知清单仅为前 64 条。验证：vet/gofmt 零输出、**174 用例全绿（+3）**、make cross 三平台、node --check + DOM 桩冒烟（冻结/解冻四拍）过。
+
+## 一、交付物清单
+
+| 项 | 说明 |
+|----|------|
+| **agent 任务采集**（`internal/agent/collect/agenttasks.go`，SPEC §2.1） | 每 15s 随心跳：①进程扫描——unix `ps -eo pid,etime,pcpu,pmem,command`，按 agentdisc 已知清单（known 默认五项 + config custom 并集，同名 custom 优先）匹配**命令行首 token 基名**（宁漏不误：`vim ~/.codex/…` 不误报；解释器包装漏报如实）；Windows `tasklist /FO CSV /NH` 兜底（cpu/mem/etime/started_at 报 null 不填 0）。每命中进程抓 pid/agent_name/cmd（截断 200 字节）/elapsed_s/cpu_pct/mem_pct/started_at（etime 反推）。②会话目录 stat——known 内置映射（zcode `~/.zcode/cli/rollout`、codex `~/.codex/sessions`、claude `~/.claude/projects`、gemini `~/.gemini/tmp`；aider 无公认目录不统计），custom 走配置新字段 `agent_scan.custom[].session_dir`（~ 展开，同名声明优先）；**只 stat 不读内容**（WalkDir d.Info()=lstat），取树内文件最近 mtime+文件数（**条目上限 8192 为文件+目录合计，R27-#2 后触顶置 Truncated 如实进 collect_errors，目录遍历全程挂整轮 8s 预算 ctx**），目录缺失置 null。整轮预算 8s；ps/tasklist **失败=缺席字段+collect_errors（失败≠没有任务，绝不空数组清行）**；ps 输出触 1MB 上限同样显式报错（真机回归：64KB 级上限在 558 进程的 macOS 上静默丢高 pid 行，自测抓出修复）。心跳新增顶层可选字段 `agent_tasks`（三态沿用 R11-A：扫描成功即上报数组、空数组=清空该节点、缺席=无变化）+ `agent_tasks_truncated`（单拍匹配 >64 时置 true，R27-#4）+ `agents[].last_activity/session_files`（runner 每拍合并活动度进发现清单，15s 刷新） |
+| **console 侧落库与聚合**（SPEC §2.2） | migration **v4**：`agent_tasks` 表（node_id/pid/agent_name/cmd/elapsed_s/cpu_pct/mem_pct/started_at/updated_at，节点删除级联）+ `ai_agents` 增列 `last_activity`/`session_files`。心跳 `agent_tasks` 经 `optionalArray` 三态校验（显式 null 400）后**按节点先清后插全量替换**（进程消失=任务结束不留历史行；任务历史档案属 M1c+ 不做）；值域校验（pid>0 去重、elapsed≥0、**cpu_pct 有限且≥0 不设上限（多核 ps %CPU 超 100 是 ps 语义，R27-#1）**、mem_pct∈[0,100] 拒 NaN/Inf、started_at 不晚于 now+1d、cmd 服务端再截断净化、≤64 条）；`agent_tasks_truncated` 随显式快照落 nodes.tasks_truncated（**migration v5**）；`HeartbeatFull` 单事务扩为 metrics+services+agents+tasks+截断标志写入（任一失败整体回滚）。`/api/panel/overview` 聚合扩展：`running_tasks`（全网任务快照带节点名与 **stale 过期标记（R27-#3）**）+ agents 带 `last_activity/session_files` + 节点带 `tasks_truncated` |
+| **MCP**（SPEC §2.2） | 新增只读工具 `list_agent_tasks(node?)`（结构化输出 `{tasks:[…], tasks_truncated:bool}`——R29-#3 后截断标记恒输出（涉及节点 `nodes.tasks_truncated` 并集，true=清单仅为前 64 条），未知节点空清单）——**六只读工具**：list_nodes/get_node/list_services/list_agents/**list_agent_tasks**/get_mesh_status。E2E 实测返回真数据（本机 3 个真实 codex 进程 + 伪装 zcode 进程） |
+| **亮色主题面板**（SPEC §1/§2.3，`internal/panel/web/`） | **亮色为默认**（`data-theme="light"`）：token 三元组换亮色（emerald 700/amber 700/red 600，白底对比度 4.8/4.6/4.5:1——等宽字数据、状态点、offline 红全部白底可读）；语义层换冷调 porcelain/ink；frost 按技能「light-mode tuning」**更薄（panel mix 42/46%→30/34%）更饱和（saturate 190/200%→210/215%）**+ 亮 specular；atmosphere 换亮色 mesh（blob `screen`→`multiply`，`--aura` 0.30→0.24）；glass-inset 亮色改 ink 轻染。**暗色完整保留在 `[data-theme="dark"]` 变量块（M1b-b 原值），TODO 标 M1c+ 切换，翻属性整体回暗组件零改动**。中台信息架构：顶栏四仪表（在线终端/运行中任务总数（>0 亮绿；**只计未过期快照，R27-#3**）/服务异常/tailnet 在线）→ **运行中 agent 任务大卡区**（核心，跨终端卡流：终端/agent/cmd 摘要/活动计时本地每秒走动/cpu/呼吸绿点；**快照过期（stale）时计时冻结+「snapshot stale」标注+呼吸停转、截断节点的卡标「list truncated」（R27-#3/#4）**；空态「全部安静」受管可往返）→ 终端区每终端一卡（状态/角色/sparkline/disk/agent 清单带 `act <rel>` last_activity）→ 服务+tailnet 区块保留。Makefile 版本批次号 m1b-b→m1b-c |
+| **顺手修：tailnet ips=null**（SPEC §4） | 根因：headscale 版本演进中节点地址字段改名（新版 `addresses` / 旧版 proto `ip_addresses`→JSON `ipAddresses`），旧解析只认 `addresses` → 旧版部署 ips 空串→视图 null。修复：wireNode 双字段声明取非空者（同现时优 addresses）；`availableRoutes` 为子网路由（非节点 100.x 地址）刻意不采。单测钉住旧字段解析入库全链路 + 双字段同现优先级 |
+| config 扩展 | `agent_scan.custom[].session_dir`（可选，~ 展开，不做存在性校验——目录此刻缺失是合法状态） |
+| 测试 | 净增 30 用例（132→162）：collector 10（解析/etime/截断 rune 安全/扫描失败语义/触顶报错/tasklist/目录 stat/上限/匹配口径/空清单）、registry 4（三态/值域/活跃度透传/cmd 净化）、store 4（全量替换+清空+隔离/NULL 维度+级联/活跃度往返/migration v4）、meshview 2（overview 扩展/节点过滤）、mcpserver 2（六工具清单/list_agent_tasks）、headscale 2（旧字段/优先级）+ 既有用例随协议扩展补齐。**R27 修复轮再净增 9（162→171）**：collect 3（空目录条目上限收敛/目录遍历 ctx/预算耗尽缺席）、registry 3（cpu 750 放行落库/NaN-Inf 拒绝/截断标志链路）、store 2（migration v5/截断标志往返）、meshview 1（stale 标记三态）。**R29 修复轮再净增 3（171→174）**：collect 2（超大单目录小配额×小批量收敛+截断如实/flipCtx 中途超时 ok=false）、mcpserver 1（tasks_truncated 透出） |
+
+## 二、Liquid Glass 亮色适配说明（SPEC §2.3 交付自证五要素）
+
+- **frost**：亮色下白面板藏 frost——按技能 liquid-glass.md「反直觉」节收薄 panel mix（surface 42%→30%、soft 46%→34%）+ 拉高 saturate（190%→210%、200%→215%），pastel aura 才读得出来；specular 顶边换亮 lip（0.55/0.65）；glass-inset 在亮色下改用 ink 3.5% 轻染 + 白顶缘反光（白 elev 叠白板不可见），hover 染深一档「lift in」。
+- **atmosphere**：亮色 mesh——blob 混合模式 `screen`（暗色提亮）在白底不可见，改 `multiply` 叠出 pastel；`--aura` 0.30→0.24（技能 theming.md：暗色 aura 复用到亮色会发闷）；网格线换深色 3.2% 墨线；弧线/边框吃 token 自动适配。
+- **token**：三 RGB 三元组纪律不变，亮色换 Radix 深阶（emerald 700 `4 120 87`/amber 700 `180 83 9`/red 600 `220 38 38`）——状态色即品牌色延续，且白底对比度全部 ≥4.5:1；全站色板照旧从三元组派生，组件无一处写死 hex。暗色三元组+语义层原值保留在 `[data-theme="dark"]` 变量块。
+- **排版**：等宽系统栈不变（离线取舍延续 M1b-b）；标题超大 mono + 衬线斜体 accent（`Agent *ops*`，呼应 agent 中台定位）；数据全部 `tabular-nums`。
+- **动效**：唯一 easing 签名延续；新增「活动计时」每秒走动（数据更新非动画，reduced-motion 下照常走）；运行中任务呼吸绿点（与 offline 呼吸红点同款曲线）；空态「全部安静」给足存在感（SPEC：这本身是信息）。
+
+## 三、部署上机项与已知限制
+
+### 部署上机项（commit 后由 Hana 主会话执行）
+
+1. **cloud-agent 升级 m1b-c 二进制**（`make cross` 产物 linux/amd64）：真机上报 agent_tasks/last_activity，面板与 MCP list_agent_tasks 核对真数据（本机 E2E 已全链路验证：伪装进程匹配→消失清行→MCP 真数据）。
+2. **真 headscale 连测**：确认现网版本节点地址字段形态（`addresses` vs `ipAddresses`），面板 tailnet ips 列显示（本机 mock 双形态已覆盖，真机字段形态待核）。
+3. **浏览器人眼过亮色面板**：frost 薄饱和/pastel atmosphere/任务大卡/活动计时动效的实际观感（本机 Edge headless 受沙箱限制无法截图，同 M1b-b 口径；Node+最小 DOM 桩冒烟以真数据跑通 render 全路径并抓修 2 个运行时缺陷，见 REVIEW「四个真实缺陷」节）。
+
+### 已知限制（本机验证边界内如实说明）
+
+4. known 会话目录内置四家映射；aider 无公认固定目录不统计（last_activity 如实 null）；可用 `known: []` + custom + `session_dir` 整体替换。目录映射不校验存在性（此刻缺失=合法 null）。
+5. 进程匹配只看命令行首 token 基名：解释器包装（`python -m aider`）与改名进程（如本机真实 `zcode-host-local-1`）漏报如实（宁漏不误；本机实测真实 zcode CLI 进程形态即属此类，已记录）。
+6. agent_tasks 只存当前快照（进程消失即清行），历史任务档案/统计为 M1c+（SPEC §3 非目标）。
+7. Windows 任务采集为 tasklist 兜底（cpu/mem/etime/started_at 报 null），精细化属 M1c+（SPEC §3）。
+8. 升级路径：v3 库原地跑 v4 migration（`ALTER TABLE ai_agents ADD COLUMN` 两列，旧行 NULL 语义正确）→ v5（nodes 增 `tasks_truncated` 列，NOT NULL DEFAULT 0，R27-#4）；MCP 只读句柄不执行 migration，console 服务模式需先启动一次。
+
+## 四、验证汇总（2026-10-08）
+
+`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` **162 用例全绿**（12 包全 ok，M1b-b 收口 132 → 净增 30）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` 面板 JS 过；Node+最小 DOM 桩冒烟（真 overview 数据全路径 render：任务大卡/终端卡/agent 清单/空态往返/计时 tick）通过并抓修 2 个面板运行时缺陷。本机 E2E（/tmp/m1bc-e2e，心跳 5s）：console+agent 全链路——伪装进程（`exec -a zcode /bin/sleep 300`）匹配上报（pid/elapsed/started_at etime 反推全对）→ 进程退出 1-2 拍内快照清行；3 个真实 codex 进程全被正确匹配；agents last_activity/session_files 上报；`/api/panel/overview` 含 `running_tasks`；MCP 六工具 + `list_agent_tasks` 真数据；`data-theme="light"` 默认输出。对用户可见的行为变化：① agent 心跳新增 `agent_tasks`/`agents[].last_activity` 字段（旧 console 收到新 agent 心跳会因未知字段忽略而兼容，新 console 收旧 agent 心跳字段缺席=无变化，双向兼容）；② migration v4 自动执行（console 服务模式首次启动）；③ MCP 工具数 5→6；④ 面板默认亮色 + 中台三区块（顶栏 tailnet 仪表口径从 tracked 改为 online）；⑤ `--version` 批次号变 `m1b-c+git_<hash>`；⑥ tailnet ips 在旧版 headscale 下不再为 null。
+
+### 修复轮 m1b-c-fix 验证（2026-10-08，R27 后）
+
+`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` **171 用例全绿**（162 + 修复轮净增 9，12 包全 ok）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` + DOM 桩冒烟扩展 stale/truncated 形态（任务卡标注/冻结计时/仪表只计非 stale/meta `N running · N stale · list truncated`/恢复/空态往返）全过。增量行为变化：① cpu_pct>100 的心跳不再整条 400 丢库；② migration v5 随 console 服务模式首启自动执行；③ 旧 console + 新 agent 组合下 `agent_tasks_truncated` 未知字段被忽略（双向兼容不变）；④ 心跳 `collect_errors` 可能新增 `agent_activity` 键（会话目录触顶截断说明，值 ≤256B 净化入库）。
+
+### 修复轮 m1b-c-fix2 验证（2026-10-08，R29 后）
+
+`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` **174 用例全绿**（171 + 修复轮净增 3，12 包全 ok）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` + DOM 桩冒烟（可控时钟四拍：成功渲染计时走动 → 窗口内失败不冻结 → 超 90s 失败冻结（标注/停转/仪表 0/meta/计时停走）→ 恢复自动解冻）通过。增量行为变化：① 单个超大会话目录（数十万条目）读取量被「8192 配额 + 一批（256）」与 8s 预算双重封顶，不再无界读盘；触顶/超时如实报不完整（collect_errors/缺席口径不变）；② console 不可达超 90s 后面板任务卡冻结、仪表归零，恢复自动回活；③ MCP `list_agent_tasks` 返回新增恒在键 `tasks_truncated`（旧客户端按未知字段忽略，兼容）。
+
+---
+
 # DELIVERY — M1b-b 交付说明（MCP Server + Headscale 集成 + Web 只读面板）
 
 > 交付人：zcode · 2026-10-08

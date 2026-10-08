@@ -68,6 +68,11 @@ disk_mount: "/"
 #       type: cli
 #       command: /opt/tools/my-agent
 #       version_flag: "--version"
+#       session_dir: ~/.my-agent/sessions
+#       # session_dir 可选（M1b-c）：会话目录，只 stat 不读内容，
+#       # 取树内文件最近 mtime + 文件数作 last_activity 随 agents 上报；
+#       # 支持 ~ 展开，目录此刻缺失是合法状态（last_activity 如实 null）。
+#       # known 清单（zcode/codex/claude/gemini）已内置目录映射，无需声明。
 #   services:
 #     - name: hana-agent
 #       port: 5800

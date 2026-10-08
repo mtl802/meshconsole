@@ -180,6 +180,9 @@ func cmdRun(args []string) int {
 		Services: collect.NewServiceChecker(cfg.Services, cfg.DockerBin),
 		// AI agent 发现（默认已知清单 + 自定义声明，低频 5 分钟）。
 		Discover: agentdisc.New(scanCfg.KnownList(), scanCfg.Custom, scanCfg.Services),
+		// agent 任务采集（SPEC-M1b-c §2.1）：进程扫描 + 会话目录 stat，每 15s
+		// 随心跳上报；无任何 agent 名（known 清空且无 custom）时自动缺席字段。
+		TaskScan: collect.NewAgentTaskScanner(scanCfg.KnownList(), scanCfg.Custom),
 		Client:   client,
 	}
 	if err := runner.Run(ctx); err != nil {

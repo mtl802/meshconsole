@@ -1,9 +1,9 @@
 BINS := bin/meshconsole bin/meshagent
-# R19-#5：版本语义化为批次号（M1B_B）+ git 短哈希后缀，经 ldflags 注入两二进制；
-# `meshconsole --version` / `meshagent --version` 输出版本形如 m1b-b+git_<short_hash>。
-M1B_B := m1b-b
+# R19-#5：版本语义化为批次号（m1b-c）+ git 短哈希后缀，经 ldflags 注入两二进制；
+# `meshconsole --version` / `meshagent --version` 输出版本形如 m1b-c+git_<short_hash>。
+BATCH := m1b-c
 COMMIT ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null || echo none)
-VERSION ?= $(M1B_B)+git_$(COMMIT)
+VERSION ?= $(BATCH)+git_$(COMMIT)
 # 观察点②：版本与 commit 双双注入两二进制（-X main.version / -X main.commit），
 # 与启动日志可核验。
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)

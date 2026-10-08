@@ -19,6 +19,13 @@ import (
 // 的陈旧数据，不再当现行异常（避免把断连节点的旧状态当服务故障）。
 const serviceIssueGrace = 300 * time.Second
 
+// taskStaleAfter 任务快照的新鲜窗口（R27-#3）：agent_tasks 每个心跳拍全量替换，
+// 在线且扫描健康的节点上快照时刻应紧跟心跳。超过该窗口未刷新（节点失联，或其
+// 进程扫描持续失败——失败时 agent_tasks 字段缺席、旧快照原样保留）即视为过期：
+// 视图层打 Stale 标记，面板停止计时并标注「快照过期」，不冒充运行中。取值
+// offline_after（60s）的 1.5 倍，容忍零星数拍抖动。
+const taskStaleAfter = 90 * time.Second
+
 // metricsWindow get_node 指标摘要回看窗口（SPEC-M1b-b §2：最近 24h）。
 const metricsWindow = 24 * time.Hour
 
@@ -49,6 +56,9 @@ type Node struct {
 	LastSeen     *int64 `json:"last_seen,omitempty"`
 	LastSuccess  *int64 `json:"last_success,omitempty"`
 	CreatedAt    int64  `json:"created_at"`
+	// TasksTruncated 为该节点最近一次显式任务快照的截断标记（R27-#4）：true =
+	// 其 agent_tasks 清单是不完整子集（单拍触顶 64 条），消费方标注「清单不完整」。
+	TasksTruncated bool `json:"tasks_truncated,omitempty"`
 }
 
 // Service 为受管服务行视图。
@@ -63,16 +73,37 @@ type Service struct {
 }
 
 // Agent 为 AI agent 行视图；Invokable 恒 false（发现 ≠ 可调用，DESIGN §4.2-B）。
+// LastActivity/SessionFiles 为会话目录 stat 辅证（M1b-c）；null = 目录缺失或
+// 未产出（前端与 MCP 消费方按「未知」呈现，不填 0）。
 type Agent struct {
-	Node      string `json:"node"`
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Version   string `json:"version,omitempty"`
-	Path      string `json:"path,omitempty"`
-	Status    string `json:"status"`
-	Invokable bool   `json:"invokable"`
-	Detail    string `json:"detail,omitempty"`
-	UpdatedAt int64  `json:"updated_at"`
+	Node         string `json:"node"`
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	Version      string `json:"version,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Status       string `json:"status"`
+	Invokable    bool   `json:"invokable"`
+	Detail       string `json:"detail,omitempty"`
+	LastActivity *int64 `json:"last_activity,omitempty"`
+	SessionFiles *int64 `json:"session_files,omitempty"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+// AgentTask 为一条运行中的 agent 任务视图（SPEC-M1b-c §2.2，agent_tasks 快照）。
+// CPUPct/MemPct/StartedAt 缺省 = 不可用（Windows tasklist 兜底无此维度）。
+// Stale = 快照已过期（R27-#3：所属节点失联，或快照超 taskStaleAfter 未刷新），
+// 消费方应停止计时并标注，不得当「正在运行」。
+type AgentTask struct {
+	Node      string   `json:"node"`
+	PID       int64    `json:"pid"`
+	AgentName string   `json:"agent_name"`
+	Cmd       string   `json:"cmd,omitempty"`
+	ElapsedS  int64    `json:"elapsed_s"`
+	CPUPct    *float64 `json:"cpu_pct,omitempty"`
+	MemPct    *float64 `json:"mem_pct,omitempty"`
+	StartedAt *int64   `json:"started_at,omitempty"`
+	UpdatedAt int64    `json:"updated_at"`
+	Stale     bool     `json:"stale"`
 }
 
 // TailnetNode 为 tailnet_nodes 行视图（Headscale 只读镜像）。
@@ -162,10 +193,11 @@ type MeshStatus struct {
 	Freshness *int64 `json:"freshness,omitempty"`
 }
 
-// Overview 为面板聚合输出（SPEC-M1b-b §4.1：nodes/services/agents/tailnet/
-// metrics 摘要一次取齐）。ServiceIssues 为现行异常服务名单——与
-// get_mesh_status 同一口径（status != active、非 stale、未过 300s 宽限），
-// 由 service 层算好输出（R19-#4：前端只消费名单，不做业务计算）。
+// Overview 为面板聚合输出（SPEC-M1b-b §4.1 + SPEC-M1b-c §2.2：nodes/services/
+// agents/running_tasks/tailnet/metrics 摘要一次取齐）。ServiceIssues 为现行
+// 异常服务名单——与 get_mesh_status 同一口径（status != active、非 stale、
+// 未过 300s 宽限），由 service 层算好输出（R19-#4：前端只消费名单，不做业务
+// 计算）。RunningTasks 为全网当前 agent 任务快照（跨终端聚合，前端只渲染）。
 type Overview struct {
 	GeneratedAt   int64           `json:"generated_at"`
 	Freshness     *int64          `json:"freshness,omitempty"`
@@ -173,6 +205,7 @@ type Overview struct {
 	Services      []Service       `json:"services"`
 	ServiceIssues []ServiceIssue  `json:"service_issues"`
 	Agents        []Agent         `json:"agents"`
+	RunningTasks  []AgentTask     `json:"running_tasks"`
 	Tailnet       *TailnetSummary `json:"tailnet,omitempty"`
 }
 
@@ -183,7 +216,7 @@ func nodeView(n *store.NodeRecord) Node {
 		ID:   n.ID,
 		Name: n.Name, Role: n.Role, OS: n.OS, Arch: n.Arch, Status: n.Status,
 		AgentVersion: n.AgentVersion, TailnetIP: n.TailnetIP, PublicIP: n.PublicIP,
-		CreatedAt: n.CreatedAt,
+		CreatedAt: n.CreatedAt, TasksTruncated: n.TasksTruncated,
 	}
 	if n.LastSeen.Valid {
 		v := n.LastSeen.Int64
@@ -204,7 +237,27 @@ func serviceView(nodeName string, r store.ServiceRecord) Service {
 func agentView(nodeName string, r store.AgentRecord) Agent {
 	return Agent{Node: nodeName, Name: r.Name, Type: r.Type, Version: r.Version,
 		Path: r.Path, Status: r.Status, Invokable: r.Invokable, Detail: r.Detail,
+		LastActivity: r.LastActivity, SessionFiles: r.SessionFiles,
 		UpdatedAt: r.UpdatedAt}
+}
+
+// taskView 把 agent_tasks 行转为视图（附带节点名，跨终端卡流直接可渲染）。
+func taskView(nodeName string, r store.AgentTaskRecord) AgentTask {
+	t := AgentTask{Node: nodeName, PID: r.PID, AgentName: r.AgentName, Cmd: r.Cmd,
+		ElapsedS: r.ElapsedS, UpdatedAt: r.UpdatedAt}
+	if r.CPUPct.Valid {
+		v := r.CPUPct.Float64
+		t.CPUPct = &v
+	}
+	if r.MemPct.Valid {
+		v := r.MemPct.Float64
+		t.MemPct = &v
+	}
+	if r.StartedAt.Valid {
+		v := r.StartedAt.Int64
+		t.StartedAt = &v
+	}
+	return t
 }
 
 func tailnetView(r store.TailnetNodeRecord) TailnetNode {
@@ -325,6 +378,7 @@ func (q *Query) NodeDetail(ctx context.Context, name string) (*NodeDetail, error
 		ID: n.ID, Name: n.Name, Role: n.Role, OS: n.OS, Arch: n.Arch,
 		TailnetIP: n.TailnetIP, PublicIP: n.PublicIP, AgentVersion: n.AgentVersion,
 		Status: n.Status, LastSeen: n.LastSeen, LastSuccess: n.LastSuccess, CreatedAt: n.CreatedAt,
+		TasksTruncated: n.TasksTruncated,
 	}
 	detail := &NodeDetail{Node: nodeView(rec)}
 
@@ -398,6 +452,41 @@ func (q *Query) Agents(ctx context.Context, nodeName string) ([]Agent, error) {
 			continue
 		}
 		out = append(out, agentView(name, r))
+	}
+	return out, nil
+}
+
+// AgentTasks 列出当前运行中的 agent 任务快照；nodeName 为空返回全网
+// （SPEC-M1b-c §2.2，MCP list_agent_tasks 与面板 overview 同源）。所属节点
+// 失联或快照超 taskStaleAfter 未刷新的任务打 Stale 标记（R27-#3：离线/扫描
+// 失败节点的旧任务不冒充运行中）。
+func (q *Query) AgentTasks(ctx context.Context, nodeName string) ([]AgentTask, error) {
+	rows, err := q.st.ListAllAgentTasks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names, err := q.st.NodeNameIDMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	nodes, err := q.st.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	statusByID := make(map[int64]string, len(nodes))
+	for i := range nodes {
+		statusByID[nodes[i].ID] = nodes[i].Status
+	}
+	staleCutoff := time.Now().Add(-taskStaleAfter).Unix()
+	out := make([]AgentTask, 0, len(rows))
+	for _, r := range rows {
+		name, ok := names[r.NodeID]
+		if !ok || (nodeName != "" && name != nodeName) {
+			continue
+		}
+		t := taskView(name, r)
+		t.Stale = statusByID[r.NodeID] != "online" || r.UpdatedAt < staleCutoff
+		out = append(out, t)
 	}
 	return out, nil
 }
@@ -525,6 +614,10 @@ func (q *Query) Overview(ctx context.Context) (*Overview, error) {
 	}
 	sortIssues(out.ServiceIssues)
 	if out.Agents, err = q.Agents(ctx, ""); err != nil {
+		return nil, err
+	}
+	// M1b-c：全网运行任务快照一次取齐（复用 AgentTasks，不新写 SQL）。
+	if out.RunningTasks, err = q.AgentTasks(ctx, ""); err != nil {
 		return nil, err
 	}
 	if out.Tailnet, err = q.tailnet(ctx); err != nil {

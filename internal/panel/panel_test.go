@@ -42,7 +42,7 @@ func newTestPanel(t *testing.T) *http.ServeMux {
 		CPUPct: &cpu, MemUsed: &memU, MemTotal: &memT,
 	}, "agent-1",
 		&[]store.ServiceRow{{Name: "headscale", Type: "systemd", Status: "active"}},
-		&[]store.AgentRow{{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"}})
+		&[]store.AgentRow{{Name: "zcode", Type: "cli", Version: "3.14.4", Status: "active"}}, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

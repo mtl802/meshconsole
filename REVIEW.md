@@ -395,3 +395,116 @@
 **裁决结论：通过 → 放行 commit（COMMIT_OK）。** m1b-b 至此完成 R19→R21→R23 两轮修复收敛（fix/fix2 各一轮，未触 3 轮护栏），由 worker 执行 commit 后回 idle。真 Headscale 连测与浏览器人眼验收仍为部署上机项，commit 后由 Hana 主会话执行。
 
 **M1b-c 候选清单（累计）**：① headscale.go:41 注释文案与节流窗口实现同步（本轮新增）；② pki.go 证书生成前校验 tailnet_ip 合法性（R17-#1）；③ config.go systemd/docker target 256 字节启动校验（R17-#2）；④ agent/runner.go:135 注释三态语义同步（R17-#3）。
+
+---
+
+# 自测报告 · zcode M1b-c（2026-10-08）
+
+**结论：SPEC-M1b-c 五节逐条落地，本机可验证项全部自测通过；真机 cloud-agent 上报与浏览器人眼验收列部署上机项。** 验证基线：`go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **162 用例全绿**（12 包全 ok；M1b-b 收口 132 → 净增 30）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过、`node --check internal/panel/web/app.js` 过。未执行 git commit。
+
+## SPEC §5 验收清单逐条
+
+| # | 验收项 | 结果 | 证据 |
+|---|--------|------|------|
+| 1 | vet/gofmt/test 全绿 + cross 三平台 + 点名单测 | ✅ | SPEC 点名五类全覆盖：**进程匹配解析**（`collect/agenttasks_test.go` `TestScanProcessesParse`：首 token 基名匹配、无辜进程不误报（vim 打开会话文件/grep 参数含 agent 名）、表头残行跳过、cpu/mem 解析非法报 null）、**etime 反推**（`TestParseEtime` 九形态含 `mm:ss`/`hh:mm:ss`/`dd-hh:mm:ss`/非法输入返回 0 不编造；`TestScanProcessesParse` 断言 started_at=now−etime）、**三态语义**（`registry_m1bc_test.go` `TestHeartbeatAgentTasksThreeStates`：显式数组落库→缺席无变化→空数组清空→显式 null 400 且整条不落 metrics）、**migration v4**（`store_m1bc_test.go` `TestMigrationV4Schema`：schema 版本 ≥4 + ai_agents 新列 PRAGMA 断言）、**list_agent_tasks**（`mcpserver_test.go` `TestCallListAgentTasks`：真数据 + 节点过滤 + 未知节点空清单；`TestHandshakeToolsList` 六工具不许多不少） |
+| 2 | 真机：伪装进程匹配与消失清行 | ✅（本机 E2E）/ cloud-agent 上报待上机 | 本机 console+agent 全链路（/tmp/m1bc-e2e，心跳 5s）：`exec -a zcode /bin/sleep 300` 伪装进程 → 下一拍 overview `running_tasks` 出现 `zcode pid=33793 elapsed/started_at（etime 反推）`；进程自然退出 → 1-2 拍内 zcode 从快照消失（清行）。附带真实验证：本机在跑的 3 个真实 codex 进程（含 ChatGPT.app 内嵌 codex-cli）全部被正确匹配上报。**cloud-agent（云机）上报 agent_tasks 列部署上机项** |
+| 3 | 面板亮色 + 中台三区块人眼验收 | ✅（结构/数据自测）/ 人眼待上机 | 亮色为默认（`data-theme="light"`，curl 实证）；顶栏四仪表（online/running tasks/svc issues/tailnet up）+ 运行任务大卡区（`running_tasks` 聚合、空态「全部安静」）+ 终端卡区（每终端状态/角色/sparkline/disk/agent 清单带 last_activity）+ 服务/tailnet 两区块保留；overview 聚合 JSON 实证含 `running_tasks` 与 agents `last_activity/session_files`。**浏览器人眼（亮色玻璃质感/动效观感）列部署上机项**（本机 Edge headless 受沙箱限制无法截图，与 M1b-b 同口径；Node+最小 DOM 桩冒烟以真 overview 数据跑通 render 全路径——任务大卡/终端卡/agent 清单/空态往返/活动计时 tick 全断言，抓出并修复 2 个运行时缺陷，见「四个真实缺陷」节 3/4） |
+| 4 | MCP list_agent_tasks 返回真数据 | ✅ | 本机 E2E：stdio 逐帧 `initialize` → `tools/list` 六工具 → `tools/call list_agent_tasks` 返回 4 条真任务（3×codex 真实进程 + 1×zcode 伪装进程，含 pid/elapsed） |
+| 5 | REVIEW/DELIVERY 更新；禁止 commit | ✅ | 即本节 + DELIVERY.md 顶部 M1b-c 交付说明；全程未 commit |
+
+## SPEC 各节落地说明
+
+- **§1 亮色主题**：token 三元组换亮色（emerald 700 `4 120 87` / amber 700 `180 83 9` / red 600 `220 38 38`，白底对比度 4.8/4.6/4.5:1，等宽字数据/状态点/offline 红全部白底可读）；语义层换冷调 porcelain/ink 中性系（非纯灰）；frost 按技能「light-mode tuning」收薄（panel mix 42/46%→30/34%）+ 拉高 saturate（190/200%→210/215%）+ 亮 specular（白 lip 0.55/0.65）；atmosphere 换亮色 mesh（blob `screen`→`multiply`，`--aura` 0.30→0.24——技能 theming.md：暗色 aura 复用亮色会发闷）；glass-inset 亮色改 ink 轻染 + 白顶缘（白 elev 叠白板不可见）。**暗色实现完整保留在 `[data-theme="dark"]` 变量块（三元组+语义层+材质覆盖+网格线），TODO 注释标 M1c+ 切换**，翻 body 属性即可整体回暗、组件零改动。
+- **§2.1 agent 侧采集**（`internal/agent/collect/agenttasks.go` 新文件）：进程扫描 unix `ps -eo pid,etime,pcpu,pmem,command`（首 token 基名匹配，宁漏不误——解释器包装漏报如实）/ Windows `tasklist /FO CSV /NH` 兜底（cpu/mem/etime/started_at 缺席报 null 不填 0）；会话目录 stat（known 内置映射 zcode `~/.zcode/cli/rollout`、codex `~/.codex/sessions`、claude `~/.claude/projects`、gemini `~/.gemini/tmp`；aider 无公认目录不统计；custom 走配置新字段 `agent_scan.custom[].session_dir`，同名声明优先）——**只 stat 不读内容**（WalkDir 的 d.Info() 即 lstat），取树内文件最近 mtime + 文件数（文件数上限 8192 防失控），目录缺失该 agent 缺席（null）。随心跳上报：`agent_tasks` 顶层数组（三态沿用：进程扫描**成功**即上报含空数组清空；**扫描失败缺席字段 + collect_errors 说明——失败≠没有任务，绝不发空数组清行**）+ `agents[].last_activity/session_files`（runner 每拍把活动度合并进缓存的发现清单，15s 刷新不等 5 分钟扫描）。整轮预算 8s 超时中断；单 beat 任务数上限 64。
+- **§2.2 console 侧**：migration **v4**（`agent_tasks` 表 node_id/pid/agent_name/cmd/elapsed_s/cpu_pct/mem_pct/started_at/updated_at + `ai_agents` 增列 last_activity/session_files；节点删除级联清任务行）；心跳 `agent_tasks` 三态（`optionalArray` 泛型沿用 R11-A：显式 null 400、缺席不覆盖、数组全量替换）**按节点先清后插全量替换**（进程消失=任务结束不留历史行，无 stale 簿记态）；`HeartbeatFull` 单事务扩到 metrics+services+agents+tasks 四组写入；校验（`validateAgentTasks`）：agent_name 非空 ≤128、pid>0 且同 beat 去重、elapsed_s≥0、cpu/mem ∈[0,100]（NaN/Inf 拒绝）、started_at 非负且不晚于 now+1d（时钟漂移容忍）、cmd 服务端再截断 200 字节+去控制字符、条目 ≤64；`/api/panel/overview` 聚合扩展 `running_tasks`（全网任务快照带节点名）+ agents 带活跃度；MCP 新增只读 `list_agent_tasks(node?)`（六工具）。
+- **§2.3 面板中台信息架构**：顶栏 readout 四大数字（在线终端/运行中任务总数（>0 亮品牌绿「活着」）/服务异常/tailnet 在线——tailnet 仪表从 tracked 改为 **online** 口径）；**运行中 agent 任务大卡区**（col-12 通栏、auto-fill ≥330px 大卡：终端名/agent 名/cmd 摘要（ellipsis+title 全文）/活动计时（**本地每秒走动**，15s 轮询刷新锚点消漂移）/cpu、呼吸绿点；无任务显示「全部安静」空态且空态元素受管可往返）；终端区每终端一张卡（状态点/角色 chip/心跳/cpu+mem sparkline/disk meter/该终端 agent 清单行带 `act <rel>` last_activity 与文件数 title）；服务与 tailnet 两区块保留（亮色化，tailnet 行的 ips 列修复后可见，见 §4）。
+- **§4 顺手修 tailnet ips=null**：根因=headscale 版本演进中节点地址字段改名——新版 `addresses`、旧版 proto `ip_addresses`（JSON `ipAddresses`），旧解析只认 `addresses` → 旧版部署 ips 空串 → 视图 null。修复：wireNode 双字段声明、取非空者（同现时优 addresses 不拼接）；`availableRoutes` 是子网路由（非 100.x 节点地址）**刻意不采**。单测：旧字段响应解析入库（`TestFetchNodesLegacyIPAddresses` 全链路到 tailnet_nodes.ips）+ 双字段同现优先级（`TestFetchNodesAddressesPreferred`）。真 headscale 上机连测仍列部署上机项。
+
+## 真机 E2E / DOM 冒烟抓出并修复的四个真实缺陷（自测价值记录）
+
+1. **known 清单会话目录 `~` 未展开**：内置映射值直接 `os.Stat("~/.…")` 失败 → last_activity 恒 null。修复：`newAgentTaskScanner` 对内置映射统一过 `config.ExpandHome`（与 custom 的 session_dir 同口径）。本机 E2E 实证修复后 zcode last_activity/files=3 上报。
+2. **ps 全量输出被 64KB 级上限截断、高 pid 进程行静默丢失**：任务采集复用了服务查询的 `maxExecOutput=64KB`，真机（macOS 558 进程）`ps -eo …command` 实测 ≈150KB → 截断点后的进程（本例伪装 zcode pid=33793）被静默丢弃且表现为「任务消失」的错误快照。修复：任务采集独立 `TaskScanMaxOutput=1MB` 封顶（R10-#5 有界语义不变），且**触顶显式报错**（缺席字段+collect_errors）而非拿不完整清单硬扫——回归单测 `TestScanOutputTruncatedIsError` 钉住。
+3. **终端卡 build 漏挂状态字段**（Node + 最小 DOM 桩冒烟抓出，M1b-b 同款手段）：`buildNodeCard` 未把 dot/name/role/hb 挂到 card，`updateNodeCard` 首帧即 `undefined.className` TypeError——纯 `node --check` 抓不到的运行时缺陷。修复并纳入冒烟断言。
+4. **「全部安静」空态会同显两份**（DOM 桩冒烟抓出）：syncList 克隆 `[data-empty]` 占位后原型节点未从容器移除，任务清零时原型+克隆两份同显。修复：克隆受管、原型立即移除；冒烟钉住「有数据→空态回位→任务恢复」三段往返。
+
+## 已知限制与上机项（不含糊）
+
+- **部署上机项**：① cloud-agent（云机）升级 m1b-c 二进制上报 agent_tasks/last_activity 真机核对；② 真headscale 连测验证 ips 字段（旧版 ipAddresses 形态是否为现网实际形态待核——本机 mock 双形态已覆盖）；③ 浏览器人眼过亮色面板（frost 薄饱和/atmosphere pastel/任务大卡/活动计时动效）。
+- 本机验证边界内限制：① known 会话目录映射内置四家（aider 无公认固定目录不统计，last_activity 如实 null；可用 `known: []`+custom+session_dir 整体替换）；② 进程匹配只看命令行首 token 基名——解释器包装（`python -m aider`）与改名进程（如本机真实 `zcode-host-local-1`）漏报如实（宁漏不误，注释与 DELIVERY 均声明）；③ 任务历史档案不做（SPEC §3 非目标，agent_tasks 表仅存当前快照）；④ 面板任务大卡的活动计时在 15s 轮询间隙本地走动，锚点随每拍校准（时钟偏移容忍）；⑤ Edge headless 在本沙箱无法截图（与 M1b-b 同因），面板视觉自测以 DOM/数据链路实证+人眼上机验收兜底。
+- 顺手修正：Makefile 版本批次号 `m1b-b` → `m1b-c`（R19-#5 口径：版本=批次号），`--version` 输出 `m1b-c+git_<hash>`。
+
+## R27 · codex 首审 m1b-c + 裁决（2026-10-08 15:20，值班员执行）
+
+**结论：修改后通过（裁决）。** codex 首审 m1b-c（review-m1b-c.out，63,055 tokens）判**不通过**：2 阻塞 + 2 建议；R23/R21 核销 4 关闭 + 1 可选残留。SPEC 主链路（亮色、中台布局、migration v4、三态、MCP 六工具）确认符合。值班员逐条抽验源码后裁决如下（轮次号跳至 R27：脚本注释已占用 R24/R26 作巡检教训编号，避免撞号）。
+
+### 裁决（Hana 值班员，按伦哥授权自主裁决流程性问题）
+
+| # | 意见 | 级别 | 裁决 | 修复口径 |
+|---|------|------|------|----------|
+| 1 | 进程 CPU 值域不一致：`registry.go:619`/`agenttasks.go:273`，多核 ps %CPU 可 >100%，采集端原值上报、服务端 ∈[0,100] 校验拒绝 → 整条心跳与指标丢库 | 阻塞 | 采纳 | 服务端 `validateAgentTasks` cpu_pct 放宽为「有限、≥0」（只拒 NaN/Inf/负数，不设伪上限）；采集端保持 ps 原值（%CPU 多核超 100 是 ps 语义非脏数据）。补多核 >100 通过的单测 |
+| 2 | 目录遍历未传 context：`agenttasks.go:193、315`，8192 上限只数文件、海量空目录仍无限遍历，8s 预算对该路径失效 | 阻塞 | 采纳 | WalkDir 全路径吃 ctx（8s 预算真正生效）；8192 上限改为文件+目录合计计数，触顶按截断处理（与既有 truncated 语义同口径：如实报不完整） |
+| 3 | 离线/扫描失败节点旧任务仍显示运行、持续计时：`meshview.go:457`/`app.js:315` | 建议 | 采纳 | 该节点快照过期标记（面板任务卡/计时随节点失联态停走+标注），避免误报 |
+| 4 | >64 任务静默截断全量覆盖：`agenttasks.go:283` | 建议 | 采纳 | 触顶时上报截断状态（清单不完整可见），面板相应标注 |
+| 5 | R23 可选残留：`headscale.go:41` 注释仍误称恢复重置节流窗口 | 可选 | 顺手修 | 一行注释文案对齐实际行为 |
+| — | SPEC:49,50 云机上报 + 人眼验收未完成 | 上机项 | 维持列部署上机项 | 与 M1b-b 同口径：本机沙盒边界所致，REVIEW/DELIVERY 已列明，不阻塞本轮 |
+
+**修复轮范围**：本表 5 条全修 → 派 m1b-c-fix。验证口径不变：go vet / gofmt / go test -count=1 全绿 + make cross 三平台 + 两阻塞各补单测，M1b-c 已验收项不回退。禁止 git commit。
+
+## R28 · zcode 修复轮 m1b-c-fix（2026-10-08 完成）
+
+**R27 裁决 5 条全部按口径修完**（2 阻塞 + 2 建议 + 1 可选顺手修）。修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **171 用例全绿**（修复前基线 162 + 本轮新增 9：collect 3、registry 3、store 2、meshview 1；12 包全 ok）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过、`node --check` 面板 JS 过 + Node DOM 桩冒烟（stale 冻结/截断标注/meta 口径/空态往返全断言）通过。未执行 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞：进程 CPU 值域统一。`internal/registry/registry.go:629-633` `validateAgentTasks` 拆分双字段口径——新增 `finiteNonNeg`（`:596-598`，只拒 NaN/Inf/负数），**cpu_pct 仅须有限且 ≥0 不设上限**（多核 ps %CPU 超 100 是 ps 语义，8 核打满 = 750，设伪上限会把重载心跳连任务快照带指标整条丢库）；**mem_pct 为常驻物理内存占比维持 [0,100] 封顶**（同函数 `:632`）。采集端不动：`agenttasks.go` 保持 ps 原值上报，`AgentTask` 结构注释钉住口径（`:66-70`）。测试：`registry_m1bc_test.go` `TestHeartbeatAgentTasksCPUAbove100`（cpu_pct=750 心跳 200 且落库 750.0、同拍 mem 42 正常）+ `TestValidateAgentTasksNonFinite`（±Inf/NaN/负数 × cpu/mem 八形态直测拒绝、cpu=750/mem=100 边界放行）+ 既有值域用例改造（原「cpu 100.5 → 400」按新口径改负数/负 mem/mem>100 三拒绝态） |
+| 2 | 阻塞：目录遍历可控。`internal/agent/collect/agenttasks.go`：① `Scan`（`:184-198`）把整轮 8s 预算的 bctx 传入 `scanActivity(ctx)`（`:309`）→ `statDirTree(ctx, root)`（`:328`）——WalkDir 回调每条目先查 `ctx.Err()`，超时即终止整树返回 ok=false（预算内没数完 = 未知，缺席如实上报，不拿半程结果冒充；`:336-338`）；② 8192 上限改**文件+目录合计计数**（`entries` 计数器含根目录，`MaxSessionEntries` 取代 `MaxSessionFiles`，`:38-41`）——海量空目录不再绕过上限无限遍历；③ 触顶当前条目照常计入后 `SkipAll` 停止并置 `DirActivity.Truncated`（`:84-90` 新字段），runner（`runner.go:170-184`）把截断 agent 名单如实并进 `collect_errors["agent_activity"]`（与 ps 输出触顶同口径：截断的 Files 是下界不静默；目录缺失/预算耗尽本就缺席不在此列）。测试：`TestScanSessionDirCapCountsDirs`（8292 空目录收敛、Files==0 证明上限被目录命中、Truncated=true）、`TestStatDirTreeRespectsCtx`（预取消 ctx → ok=false）、`TestScanActivityBudgetExpires`（1ns 注入预算 → 活动度缺席=未知）、`TestScanSessionFileCap` 更新（根目录占 1 条目位、Files=cap-1、Truncated=true） |
+| 3 | 建议：离线/扫描失败节点旧任务误报。服务端口径唯一化：`internal/meshview/meshview.go` 新增 `taskStaleAfter=90s`（offline_after 60s 的 1.5 倍，`:22-27`）；`AgentTask` 视图新增 `Stale bool json:"stale"`（`:94-95`）；`AgentTasks`（`:458-484`）载入节点状态表，**`Stale = 节点 status != "online" || updated_at < now-taskStaleAfter`**——前者覆盖节点失联，后者覆盖「节点在线但进程扫描持续失败」（失败时 agent_tasks 字段缺席、旧快照原样保留的库内形态）；overview 与 MCP list_agent_tasks 同源受益（面板任务大卡与 get_mesh_status 消费同一标记）。面板：`app.js` `updateTaskCard`（`:312-352`）stale 时**计时冻结在快照值、移出每秒走动集合 liveRows、呼吸点停转 warn、卡上「snapshot stale」标注**（`.task-flag` chip，glass.css 新增，琥珀 accent 色+文字双通道）；`renderReadout`（`:236-237`）运行任务仪表只计非 stale；`tasks-meta` 文本带 `N stale`。测试：`meshview_m1bc_test.go` `TestAgentTaskStaleMarking`（离线节点新鲜快照 → stale；在线新鲜 → 不 stale；在线但快照拨旧超窗 → stale；JSON 契约含 `"stale"` 键）；DOM 冒烟断言冻结/不进 liveRows/标注/恢复路径 |
+| 4 | 建议：任务清单截断可见。全链路：① 采集端 `scanProcesses` 返回 `(tasks, truncated, err)`（`agenttasks.go:211`）——触顶**不 break**，剩余行继续解析只计数（输出已 1MB 封顶代价可忽略）换准确判定：匹配数 >64 才置 truncated，恰 64 不误报；`Scan` 四返回值（`:190`）。② runner（`runner.go:200-202`）心跳体加顶层可选字段 `agent_tasks_truncated: true`（未截断不带该字段=缺席）。③ console：`heartbeatReq.AgentTasksTruncated *bool`（`registry.go:356-360`，缺席=false；仅随显式数组生效，数组缺席时忽略）；store **migration v5** `nodes.tasks_truncated` 列（`store.go:293-301`，NOT NULL DEFAULT 0）；`HeartbeatFull` 签名扩 `tasksTruncated bool`（`:498`）——tasks 非 nil 时与快照**同事务**写 `nodes.tasks_truncated`（`:525-533`，未截断显式快照复位 false，快照缺席不改动，无半拍错位）。④ 视图与面板：`NodeRecord`/`Node`/meshview `Node.TasksTruncated`（`tasks_truncated,omitempty`）透传；`app.js` `render` 按节点名取 `tasks_truncated`（`:521-523`），命中节点的任务卡标「list truncated」chip + meta 追加 `· list truncated`（stale 优先占位）。测试：store `TestHeartbeatTasksTruncatedFlag`（true 落库/缺席不动/未截断复位三段）+ `TestMigrationV5Schema`（版本 ≥5 + PRAGMA 列存在）；registry `TestHeartbeatAgentTasksTruncatedFlag`（HTTP 三拍：截断置位 → 数组缺席不动 → 未截断快照复位）；collect `TestScanMaxTasks` 扩断言（>64 truncated=true、恰 64 false） |
+| 5 | 可选：`internal/headscale/headscale.go:39-44` `successResetStreak` 注释修正——恢复连续成功 3 次仅归零**失败计数**；WARN 节流窗口独立维护、不随恢复重置（R21-#2/R22-#2 后的实际行为），任意时刻相邻两条 WARN 间隔仍 ≥ warnThrottle。纯注释改动 |
+
+**验证记录（m1b-c-fix）**：`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` 全绿（**171 用例**：cmd/console 3、agent 14、collect 33、agentdisc 9、config 18、headscale 12、mcpserver 6、meshview 6、panel 5、pki 11、registry 24、store 24；其中含 6 个子测试）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` 与 Node+DOM 桩冒烟（真 overview 数据含 stale/truncated 形态：任务卡标注/冻结计时/仪表口径/meta 文本/空态往返全过）通过。对用户可见的行为变化：① 多核打满进程（cpu_pct>100）的心跳不再被整条拒绝丢库；② 离线/快照过期节点的任务在面板停止计时并标注 snapshot stale，仪表与 meta 不再冒充运行中；③ 任务清单触顶 64 时节点带截断标记、面板标注 list truncated；④ 会话目录海量空目录场景遍历收敛且截断进 collect_errors；⑤ migration v5 自动执行（console 服务模式首次启动，nodes 增 tasks_truncated 列）。M1b-c 已验收项（SPEC §5 清单、R27 前核销项）无回退——既有 162 用例全部保持通过，SPEC 点名用例（三态/migration v4/六工具/解析 etime）原样绿。
+
+## R29 · codex 复审 m1b-c-fix + 裁决（2026-10-08 16:20，值班员执行）
+
+**结论：修改后通过（裁决）。** codex 复审 m1b-c-fix（review-m1b-c-fix.out，47,683 tokens）判**不通过**：R27 五条关闭四条（#1 CPU 值域、#3 stale 冻结、#4 截断标记、#5 注释均核销），阻塞 #2 遍历预算残余 + 新增 2 建议；验证独立复核全绿（171 用例、vet/gofmt/三平台交叉编译），全程未修改仓库文件。SPEC 主链路符合，真机上报/人眼验收沿用 R27 非阻塞裁决。值班员逐条抽验后裁决如下。
+
+### 裁决（Hana）
+
+| # | 意见 | 级别 | 裁决 | 口径 |
+|---|------|------|------|------|
+| 1 | agenttasks.go:338 `filepath.WalkDir` 内部先一次性整读并排序单目录再逐项回调，超大单目录（数十万文件）读取量不受 8192 条目配额与 8s ctx 约束 | 阻塞 | 采纳 | 弃 WalkDir 改显式分批遍历（Open+ReadDir(n) 分批，批间检查 ctx.Err() 与条目累计配额），触顶/超时立即收敛并如实上报截断（不静默）。实现自由度：分批大小不强制，「单目录读取量受 ctx 与配额双重支配」成立即可。**返工计数：R27-#2 同条意见第 2 次修复，本轮复审仍不过即触发「同条修两次不过」上限请示伦哥** |
+| 2 | app.js:613 overview 拉取持续失败时旧卡留在 liveRows 继续计时、显示运行数 | 建议 | 采纳 | 与 R27-#3 stale 冻结同机制：数据超新鲜度期限即冻结（移出 liveRows、停转、标注），恢复自动解冻 |
+| 3 | mcpserver.go:146 list_agent_tasks 仅返回任务清单，未透出节点截断标记，MCP 用户不知结果仅为前 64 条 | 建议 | 采纳 | MCP 返回结构补 tasks_truncated（nodes.tasks_truncated 已落库，视图透出即可） |
+
+**返工计数**：#1 第 2 次修复（m1b-c-fix 首修未关闭，仍未触发上限——该条件指修两次仍不过）；#2/#3 首次出现。修复轮计数：m1b-c-fix 第 1 轮、m1b-c-fix2 第 2 轮，未触 3 轮收敛护栏（第 3 轮无论意见多少强制收口转候选）。
+
+**修复轮范围**：本表 3 条全修 → 派 m1b-c-fix2。验证口径不变：go vet / gofmt / go test -count=1 全绿 + make cross 三平台 + node --check；M1b-c 已验收项不回退。禁止 git commit。
+
+## R30 · zcode 修复轮 m1b-c-fix2（2026-10-08 完成）
+
+**R29 裁决 3 条全部按口径修完**（1 阻塞第 2 次修复 + 2 建议）。修复后 `go vet ./...` 零输出、`gofmt -l` 无文件、`go test -count=1 ./...` **174 用例全绿**（修复前基线 171 + 本轮新增 3：collect 2、mcpserver 1；12 包全 ok）、`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过、`node --check` 面板 JS 过 + Node DOM 桩冒烟（拉取失败冻结/解冻全路径断言）通过。未执行 git commit。
+
+| # | 修复说明（文件:行号 · 怎么修） |
+|---|---|
+| 1 | 阻塞（R27-#2 第 2 次修复）：目录遍历预算对超大单目录真正生效。`internal/agent/collect/agenttasks.go` **弃 `filepath.WalkDir`**——其内部对单个目录 `os.ReadDir` 一次性整读并排序后才逐项回调，数十万条目的单目录在回调检查（配额/ctx）发生之前就已无界读盘。改为**显式栈式 DFS + 分批 readdir**：`walkDirTree`（`:346-429`，`statDirTree`（`:331-334`）以生产常量 `MaxSessionEntries`/新常量 `dirReadBatch=256`（`:322-327`）委托）——每个目录 `os.Open` 后按批 `ReadDir(256)`，**批间查 `ctx.Err()`、批内逐条查条目累计配额**（配额先于下一批读取生效，单目录读取量被封顶在「配额 + 一批」≈8448 条之内，不再随目录体积增长）；触顶立即停止并置 `Truncated`（计数口径不变：根目录占 1 位、文件+目录合计、Files 是下界）；ctx 中途超时返回 `ok=false` 走既有「未知=缺席」语义（`DirActivity{}` 零值不外泄半程统计）；单目录打开失败跳过该子树、读错误放弃该目录余量（均与旧 WalkDir 的 SkipDir 口径一致）；不跟随符号链接（ReadDir 条目 `IsDir()` 对 symlink 为 false，天然无环）。上报语义不变：截断仍由 runner 并进 `collect_errors["agent_activity"]`，预算耗尽仍缺席。测试：`agenttasks_test.go` 新增 `TestWalkDirHugeSingleDirQuotaDominates`（984 文件单目录 × 配额 600 × 批 64——强制跨多批，Files 恰停 cap-1、Truncated 如实：配额在批中/批间都能截停）+ `TestWalkDirCtxExpiresMidWalk`（`flipCtx` 第 k 次 `Err()` 确定性翻转——真实 timer 与遍历竞速必闪失——中途超时 → ok=false 且不外泄半程统计）；既有 R28 用例（8292 文件/8292 空目录/入口 ctx/1ns 预算）原样全绿，生产常量下多批路径由 `TestScanSessionFileCap`（8292 文件 ÷ 256 = 33 批）继续覆盖 |
+| 2 | 建议：overview 拉取持续失败旧卡冻结。`internal/panel/web/app.js`：模块级记录 `lastGoodOv`/`lastGoodAt`（`:610-612`），新鲜度期限 `FETCH_STALE_MS = 90s`（与服务端 `taskStaleAfter` 同窗口径，R27-#3，约 6 拍轮询）。`tick` catch 分支（`:635`）：超线即调 `renderStaleSnapshot()`（`:618-624`）——把上一次成功 overview 以「全部任务 `stale: true`」形态重渲，**完全复用 render/updateTaskCard 既有冻结语义**（计时移出 liveRows 停走、呼吸点停转转 warn、「snapshot stale」标注、运行仪表与 meta 只计非 stale），不另起炉灶；渲染后再叠 crit「fetch failed · retrying」新鲜度行。窗口内失败（刚断 1-2 拍）保持原样不冻结；恢复刷新后正常 render 自动解冻。DOM 桩冒烟（可控时钟 + fetch 脚本）四拍断言全过：成功渲染计时走动 → 窗口内失败不冻结 → 超 90s 失败冻结（标注/停转/仪表 0/meta「0 running · 1 stale」/计时停走）→ 恢复自动解冻 |
+| 3 | 建议：MCP 透出截断标记。`internal/mcpserver/mcpserver.go`：`listAgentTasksOut` 增 `TasksTruncated bool json:"tasks_truncated"`（`:40-47`，恒输出，false=完整清单，消费方免缺席特判）；handler（`:137-170`）在任务清单之外取节点视图按过滤口径求并集——未过滤=全网任一节点截断即 true，按节点过滤=该节点自己的标记，无涉及节点=false（数据源即 R27-#4 落库的 `nodes.tasks_truncated`，零新 SQL）；工具 Description 同步注明标记含义。测试：`mcpserver_test.go` `newSession` 参数化落库标记（`newSessionTasksTrunc`），`TestCallListAgentTasksTruncated`（截断节点 → true；未知节点过滤 → false 且键在）+ 既有用例补 `tasks_truncated:false` 契约断言 |
+
+**验证记录（m1b-c-fix2）**：`go vet ./...` 零输出；`gofmt -l` 无文件；`go test -count=1 ./...` 全绿（**174 用例**：cmd/console 3、agent 14、collect 35、agentdisc 9、config 18、headscale 12、mcpserver 7、meshview 6、panel 5、pki 11、registry 24、store 24）；`make cross` linux/amd64 + darwin/arm64 + windows/amd64 通过；`node --check` 与 Node DOM 桩冒烟（冻结/解冻四拍）通过。对用户可见的行为变化：① 数十万条目的单个会话目录不再引发无界读盘——遍历读取量被条目配额与 8s 预算双重封顶，触顶/超时如实报不完整（collect_errors/缺席），清单与活跃度上报口径不变；② 面板在 console 不可达超 90s 后，任务卡停走并标注 snapshot stale、运行仪表归零，恢复后自动回活；③ MCP `list_agent_tasks` 返回结构新增 `tasks_truncated` 键（恒在，截断节点并集），工具描述同步。M1b-c 已验收项（SPEC §5 清单、R27 前核销项）无回退——既有 171 用例全部保持通过，SPEC 点名用例（三态/migration v4+v5/六工具/解析 etime）原样绿。
+
+## R31 · codex 复审 m1b-c-fix2 + 裁决：3 轮收敛收口（2026-10-08 17:05，值班员执行）
+
+**结论：3 轮收敛收口，实质通过（带候选残留）。** codex 复审 m1b-c-fix2（review-m1b-c-fix2.out，65,910 tokens）判**修改后通过**：R29 #1 阻塞（超大单目录无界读盘）**核销关闭**——分批读取、批间 ctx 检查、条目配额全部确认生效；无新增阻塞；残余 2 条建议。验证独立复核全绿（174 用例、vet/gofmt、JS 语法、三平台双程序编译），全程未修改仓库文件。SPEC 主链路符合；云机上报/人眼验收沿用 R27 非阻塞口径。
+
+**护栏触发**：m1b-c 修复轮已累计 2 轮（m1b-c-fix、m1b-c-fix2），本次复审为第 3 轮决策点。按值班制度收敛护栏：**不派 fix3，残余意见全部转候选，收口锁定**。
+
+### 残余意见裁决（全部转候选，不阻塞收口）
+
+| # | 意见 | 级别 | 裁决 | 候选口径 |
+|---|------|------|------|----------|
+| 1 | `app.js:627/635` 冻结仅由 catch 触发：fetch 挂起（既不成功也不失败）时超 90s 仍继续计时，且轮询请求叠加（codex 复现 120s 未冻结） | 建议 | 转候选 | 独立于 catch 的新鲜度检查（每次 tick 校验 lastGoodAt）+ fetch 超时（AbortController）+ 轮询防重入。属 R29 #2 的挂起路径残余，非新问题 |
+| 2 | `mcpserver.go:144/154` list_agent_tasks 任务清单与截断标记分两次读取，并发心跳下可出现旧任务快照配新截断标记 | 建议 | 转候选 | 任务与标记同一读事务取得。属数据一致性打磨，窗口极窄、无功能破坏 |
+
+**收口理由**：① codex 判「修改后通过」，R29 全部阻塞清零，残余仅 2 条边界场景建议（fetch 挂起、并发读窗口），不影响主功能正确性；② 3 轮收敛护栏制度要求到此为止，避免建议级意见无限循环消耗修复预算；③ 174 用例全绿 + 三平台编译通过 + 主链路符合 SPEC，质量已达提交线。残余意见转入 M1b-c2/M1d 候选清单，随后续批次处理。
+
+**COMMIT_OK 授权**：本裁决 touch COMMIT_OK，worker 执行本地 git commit（无 push）。理由：多设备开发约定「未提交的本地代码等于丢失」，收口即锁定成果；commit 为本地操作、git 可回退，若伦哥对收口有异议可 git reset 回退。R27-R31 全程无 push，远端推送仍等伦哥指令。

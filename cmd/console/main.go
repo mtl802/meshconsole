@@ -80,7 +80,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `meshconsole (%s · commit %s)
 用法:
   meshconsole [-config <path>]       服务模式：HTTPS 监听（agent API + 只读面板）
-  meshconsole mcp [-config <path>]   MCP server：stdio 传输，五个只读工具，零网络暴露
+  meshconsole mcp [-config <path>]   MCP server：stdio 传输，六个只读工具，零网络暴露
   meshconsole pki [-config <path>]   生成/校验 CA 与服务端证书（幂等，不覆盖私钥）
   meshconsole --version              打印语义版本与 commit
 `, version, commit)
@@ -100,7 +100,7 @@ func cmdVersion() int {
 func cmdMCP(args []string) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: meshconsole mcp [-config <path>]\n（五个只读工具: list_nodes / get_node / list_services / list_agents / get_mesh_status；日志走 stderr，stdout 为 JSON-RPC 通道）\n")
+		fmt.Fprintf(os.Stderr, "用法: meshconsole mcp [-config <path>]\n（六个只读工具: list_nodes / get_node / list_services / list_agents / list_agent_tasks / get_mesh_status；日志走 stderr，stdout 为 JSON-RPC 通道）\n")
 		fs.PrintDefaults()
 	}
 	cfgPath := fs.String("config", "console.yaml", "配置文件路径（读取 db_path）")

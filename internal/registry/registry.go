@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,9 +41,11 @@ const (
 	maxCollectErrKv  = 256     // collect_errors 单条 key/value 长度上限
 	maxServices      = 64      // 心跳 services 数组条目上限（M1 规模富余）
 	maxAgents        = 64      // 心跳 agents 数组条目上限
+	maxAgentTasks    = 64      // 心跳 agent_tasks 数组条目上限（SPEC-M1b-c §2.2）
 	maxSvcDetail     = 512     // 服务/agent detail 长度上限
 	maxAgentVersion  = 128     // agent 版本串长度上限
 	maxAgentPath     = 512     // agent 路径长度上限
+	maxTaskCmd       = 200     // 任务 cmd 截断长度（SPEC-M1b-c §2.1：200 字符）
 )
 
 // Handler 为 agent API 的 HTTP 处理器集合。
@@ -342,12 +345,19 @@ type heartbeatReq struct {
 	Metrics      metricsIn `json:"metrics"`
 	// CollectErrors 字段名 -> 采集失败原因；非空时 last_success 不刷新。
 	CollectErrors map[string]string `json:"collect_errors"`
-	// Services / Agents 为 M1b-a 扩展（可选数组字段）。R11-A：以 json.RawMessage
+	// Services / Agents / AgentTasks 为可选数组字段。R11-A：以 json.RawMessage
 	// 承载，解码后区分三态——字段缺席 → 无变化不覆盖；显式 `[]` → 全量替换
-	// （既有行转 stale）；**显式 `null` → 协议违规 400**（null 不是合法上报，
-	// 不得与缺席混同）。以本次上报为准 UPSERT（SPEC-M1b-a §4）。
-	Services json.RawMessage `json:"services"`
-	Agents   json.RawMessage `json:"agents"`
+	// （既有行转 stale / 任务快照清空）；**显式 `null` → 协议违规 400**（null
+	// 不是合法上报，不得与缺席混同）。以本次上报为准（SPEC-M1b-a §4、
+	// SPEC-M1b-c §2.1）。
+	Services   json.RawMessage `json:"services"`
+	Agents     json.RawMessage `json:"agents"`
+	AgentTasks json.RawMessage `json:"agent_tasks"`
+	// AgentTasksTruncated 标记本次 agent_tasks 清单触顶 64 条被截断（R27-#4）：
+	// true = 清单是不完整子集，console 落库 nodes.tasks_truncated 供面板标注
+	// 「清单不完整」。仅与显式 agent_tasks 数组一同生效（随快照落库）；字段
+	// 缺席 = false；数组缺席时该字段忽略（无快照即无标记变更）。
+	AgentTasksTruncated *bool `json:"agent_tasks_truncated"`
 }
 
 // errNullField 为可选数组字段收到显式 null 的协议违规。
@@ -387,7 +397,22 @@ type agentIn struct {
 	Path    string `json:"path"`
 	Status  string `json:"status"`
 	Detail  string `json:"detail"`
+	// 会话目录活跃度辅证（M1b-c，只 stat 不读内容）；nil = 未知（入库 NULL）。
+	LastActivity *int64 `json:"last_activity"`
+	SessionFiles *int64 `json:"session_files"`
 	// Invokable 不在协议内：服务端强制 false（发现 ≠ 可调用，DESIGN §4.2-B）。
+}
+
+// agentTaskIn 为心跳上报的单条运行任务快照（SPEC-M1b-c §2.1）。
+type agentTaskIn struct {
+	PID       int64    `json:"pid"`
+	AgentName string   `json:"agent_name"`
+	Cmd       string   `json:"cmd"`
+	ElapsedS  int64    `json:"elapsed_s"`
+	CPUPct    *float64 `json:"cpu_pct"`
+	MemPct    *float64 `json:"mem_pct"`
+	// StartedAt 为 unix 秒（etime 反推）；nil = 未知（Windows 兜底，入库 NULL）。
+	StartedAt *int64 `json:"started_at"`
 }
 
 // metricsIn 与 agent 上报结构对应；指针承载 null 语义——采集失败的字段为 nil，禁止填 0。
@@ -545,6 +570,14 @@ func validateAgents(in []agentIn) ([]store.AgentRow, error) {
 		if strings.ContainsAny(path, "\x00") {
 			return nil, fmt.Errorf("agents[%d]: bad path", i)
 		}
+		// 会话活跃度辅证（M1b-c）：非负整型，缺失/越界语义见下——负值属协议
+		// 违规整条拒绝；超出现在+1 天的时间戳同样拒绝（客户端时钟漂移容忍 1 天）。
+		if a.LastActivity != nil && (*a.LastActivity < 0 || *a.LastActivity > time.Now().Unix()+86400) {
+			return nil, fmt.Errorf("agents[%d]: bad last_activity", i)
+		}
+		if a.SessionFiles != nil && (*a.SessionFiles < 0 || *a.SessionFiles > 1<<40) {
+			return nil, fmt.Errorf("agents[%d]: bad session_files", i)
+		}
 		out = append(out, store.AgentRow{
 			Name:    name,
 			Type:    typ,
@@ -552,8 +585,68 @@ func validateAgents(in []agentIn) ([]store.AgentRow, error) {
 			Path:    path,
 			Status:  status,
 			// Invokable 由 store 层强制 false，这里不透传任何客户端输入。
-			Detail: sanitizeErrStr(a.Detail, maxSvcDetail),
+			Detail:       sanitizeErrStr(a.Detail, maxSvcDetail),
+			LastActivity: a.LastActivity,
+			SessionFiles: a.SessionFiles,
 		})
+	}
+	return out, nil
+}
+
+// finiteNonNeg 报告 v 是否为有限非负浮点（NaN/Inf/负数一律 false）。
+func finiteNonNeg(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
+}
+
+// validateAgentTasks 校验心跳 agent_tasks 数组（值域 + 上限 + 同 pid 去重），
+// 返回入库行（SPEC-M1b-c §2.2）。cpu/mem 为 nil = 不可用（Windows 兜底）。
+// cpu_pct 只须有限且 ≥0（R27-#1）：多核 ps %CPU 超 100 是 ps 语义（8 核打满
+// = 800）而非脏数据，设上限会把重载心跳整条拒之门外、指标与任务快照一并丢库；
+// mem_pct 为常驻物理内存占比，仍须 ∈ [0,100]。started_at 非负、不得晚于当前
+// 时刻+1 天（时钟漂移容忍）。
+func validateAgentTasks(in []agentTaskIn) ([]store.AgentTaskRow, error) {
+	if len(in) > maxAgentTasks {
+		return nil, fmt.Errorf("too many agent_tasks (%d > %d)", len(in), maxAgentTasks)
+	}
+	seen := map[int64]bool{}
+	out := make([]store.AgentTaskRow, 0, len(in))
+	for i, t := range in {
+		name := sanitizeErrStr(t.AgentName, 128)
+		if name == "" {
+			return nil, fmt.Errorf("agent_tasks[%d]: empty agent_name", i)
+		}
+		if t.PID <= 0 {
+			return nil, fmt.Errorf("agent_tasks[%d]: bad pid", i)
+		}
+		if seen[t.PID] {
+			return nil, fmt.Errorf("agent_tasks[%d]: duplicate pid %d", i, t.PID)
+		}
+		seen[t.PID] = true
+		if t.ElapsedS < 0 {
+			return nil, fmt.Errorf("agent_tasks[%d]: negative elapsed_s", i)
+		}
+		// 有限（拒 NaN/Inf）且非负，两字段同规；mem_pct 额外受 100 封顶。
+		if t.CPUPct != nil && !finiteNonNeg(*t.CPUPct) {
+			return nil, fmt.Errorf("agent_tasks[%d]: cpu_pct out of range", i)
+		}
+		if t.MemPct != nil && (!finiteNonNeg(*t.MemPct) || *t.MemPct > 100) {
+			return nil, fmt.Errorf("agent_tasks[%d]: mem_pct out of range", i)
+		}
+		if t.StartedAt != nil && (*t.StartedAt < 0 || *t.StartedAt > time.Now().Unix()+86400) {
+			return nil, fmt.Errorf("agent_tasks[%d]: bad started_at", i)
+		}
+		row := store.AgentTaskRow{
+			PID:       t.PID,
+			AgentName: name,
+			Cmd:       sanitizeErrStr(t.Cmd, maxTaskCmd),
+			ElapsedS:  t.ElapsedS,
+			CPUPct:    t.CPUPct,
+			MemPct:    t.MemPct,
+		}
+		if t.StartedAt != nil {
+			row.StartedAt = sql.NullInt64{Int64: *t.StartedAt, Valid: true}
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -589,6 +682,13 @@ func svcRowsOrNil(present bool, rows []store.ServiceRow) *[]store.ServiceRow {
 }
 
 func agentRowsOrNil(present bool, rows []store.AgentRow) *[]store.AgentRow {
+	if !present {
+		return nil
+	}
+	return &rows
+}
+
+func taskRowsOrNil(present bool, rows []store.AgentTaskRow) *[]store.AgentTaskRow {
 	if !present {
 		return nil
 	}
@@ -686,11 +786,32 @@ func (h *Handler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 		agentRows = rows
 	}
+	// M1b-c：agent_tasks 三态（同 services/agents R11-A 口径）——缺席不覆盖；
+	// 显式 null 400；显式数组（含 []）按节点全量替换（进程消失即清行）。
+	tkPresent, tkIn, err := optionalArray[agentTaskIn](req.AgentTasks)
+	if err != nil {
+		h.log.Warn("heartbeat agent_tasks field malformed", "node", node.Name, "reason", err.Error())
+		httpError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	var taskRows []store.AgentTaskRow
+	if tkPresent {
+		rows, verr := validateAgentTasks(tkIn)
+		if verr != nil {
+			h.log.Warn("heartbeat agent_tasks invalid", "node", node.Name, "reason", verr.Error())
+			httpError(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		taskRows = rows
+	}
 
-	// 单事务完成本次心跳全部写入（R11-F）：metrics 与 services/agents 全量替换
-	// 同一事务，任一失败整体回滚，不落半轮数据。
+	// 单事务完成本次心跳全部写入（R11-F）：metrics 与 services/agents/agent_tasks
+	// 全量替换同一事务，任一失败整体回滚，不落半轮数据。截断标记（R27-#4）仅
+	// 随显式任务快照生效：HeartbeatFull 在 tasks 非 nil 时才写 nodes.tasks_truncated。
+	tasksTruncated := req.AgentTasksTruncated != nil && *req.AgentTasksTruncated
 	stOK, err := h.st.HeartbeatFull(r.Context(), row, sanitizeErrStr(req.AgentVersion, 64),
-		svcRowsOrNil(svcPresent, svcRows), agentRowsOrNil(agPresent, agentRows))
+		svcRowsOrNil(svcPresent, svcRows), agentRowsOrNil(agPresent, agentRows),
+		taskRowsOrNil(tkPresent, taskRows), tasksTruncated)
 	if err != nil {
 		h.log.Error("store heartbeat", "node", node.Name, "err", err)
 		httpError(w, http.StatusInternalServerError, "internal")

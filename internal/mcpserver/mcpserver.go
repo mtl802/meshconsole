@@ -1,4 +1,5 @@
-// Package mcpserver 把 mesh 只读状态暴露为 MCP 工具（SPEC-M1b-b §2）。
+// Package mcpserver 把 mesh 只读状态暴露为 MCP 工具（SPEC-M1b-b §2、
+// SPEC-M1b-c §2.2 新增 list_agent_tasks）。
 //
 // 传输：stdio（JSON-RPC 2.0，MCP 规范语义由官方 go-sdk 保证），不监听任何端口
 // ——网络暴露为零（M3 再议 HTTP+SSE）。只读：数据出口全部经 internal/meshview
@@ -37,6 +38,13 @@ type (
 	listAgentsOut struct {
 		Agents []meshview.Agent `json:"agents"`
 	}
+	listAgentTasksOut struct {
+		Tasks []meshview.AgentTask `json:"tasks"`
+		// TasksTruncated 为涉及节点的截断标记并集（R29-#3）：任一节点的任务
+		// 清单触顶单拍 64 条上限即 true——tasks 只是前 64 条的不完整快照。
+		// 恒输出（false = 完整清单），消费方无需缺席特判。
+		TasksTruncated bool `json:"tasks_truncated"`
+	}
 	getMeshStatusOut struct {
 		Status *meshview.MeshStatus `json:"status"`
 	}
@@ -52,6 +60,9 @@ type (
 		Node string `json:"node,omitempty" jsonschema:"可选，按节点名过滤"`
 	}
 	listAgentsIn struct {
+		Node string `json:"node,omitempty" jsonschema:"可选，按节点名过滤"`
+	}
+	listAgentTasksIn struct {
 		Node string `json:"node,omitempty" jsonschema:"可选，按节点名过滤"`
 	}
 )
@@ -123,6 +134,38 @@ func New(st *store.Store, version string, opts *mcp.ServerOptions) *mcp.Server {
 			ags = []meshview.Agent{}
 		}
 		return nil, listAgentsOut{Agents: ags}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "list_agent_tasks",
+		Description: "列出当前运行中的 agent 任务快照（节点/agent 名/命令/已运行时长/cpu/mem/启动时刻；进程消失即从快照移除，无历史），可按节点名过滤。" +
+			"tasks_truncated=true 表示涉及节点的清单触顶 64 条截断、返回仅为前 64 条",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listAgentTasksIn) (*mcp.CallToolResult, listAgentTasksOut, error) {
+		tasks, err := q.AgentTasks(ctx, in.Node)
+		if err != nil {
+			return nil, listAgentTasksOut{}, err
+		}
+		if tasks == nil {
+			tasks = []meshview.AgentTask{}
+		}
+		// 截断标记透出（R29-#3）：nodes.tasks_truncated 已落库（R27-#4），
+		// 视图按过滤口径取并集——未过滤=全网任一节点截断即 true，按节点过滤
+		// =该节点自己的标记；无涉及节点（未知节点过滤）为 false。
+		nodes, err := q.Nodes(ctx)
+		if err != nil {
+			return nil, listAgentTasksOut{}, err
+		}
+		out := listAgentTasksOut{Tasks: tasks}
+		for _, n := range nodes {
+			if in.Node != "" && n.Name != in.Node {
+				continue
+			}
+			if n.TasksTruncated {
+				out.TasksTruncated = true
+				break
+			}
+		}
+		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

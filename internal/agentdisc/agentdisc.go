@@ -49,6 +49,11 @@ type Report struct {
 	Path    string `json:"path,omitempty"`
 	Status  string `json:"status"` // active | inactive | unavailable
 	Detail  string `json:"detail,omitempty"`
+	// M1b-c：会话目录活跃度辅证（SPEC-M1b-c §2.1，只 stat 不读内容）。Scan
+	// 本身不填——由 runner 的任务采集器按心跳频率合并后随 agents 上报；
+	// nil = 未知（JSON 缺席，console 侧存 null）。
+	LastActivity *int64 `json:"last_activity,omitempty"`
+	SessionFiles *int64 `json:"session_files,omitempty"`
 }
 
 // Scanner 执行一轮发现扫描。字段在 New 时固定（配置不热加载）。

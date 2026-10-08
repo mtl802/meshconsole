@@ -38,7 +38,9 @@ const warnThrottle = time.Hour
 
 // successResetStreak 失败计数归零所需的连续成功次数（R19-#9）：flapping 场景
 // （失败→单次成功→失败…）下若单次成功即归零，每次新失败都会满足「首次失败
-// 立即 WARN」再次突破节流；恢复必须连续成功确认后才重置计数与节流窗口。
+// 立即 WARN」再次突破节流；恢复必须连续成功确认后才归零失败计数。WARN 节流
+// 窗口独立维护、不随恢复重置（R21-#2/R22-#2）——任意时刻相邻两条 WARN 间隔
+// 仍 ≥ warnThrottle。
 const successResetStreak = 3
 
 // Client 为 headscale REST 只读客户端。
@@ -77,11 +79,16 @@ type wireResp struct {
 }
 
 type wireNode struct {
-	ID        json.RawMessage `json:"id"` // 数字或字符串（版本差异），见 parseNodeID
-	Name      string          `json:"name"`
-	Addresses []string        `json:"addresses"`
-	Online    *bool           `json:"online"` // 旧版无此字段 → nil，按 offline 存但不误判为拉取失败
-	LastSeen  *time.Time      `json:"lastSeen"`
+	ID   json.RawMessage `json:"id"` // 数字或字符串（版本差异），见 parseNodeID
+	Name string          `json:"name"`
+	// 节点 tailscale 地址字段名随 headscale 版本演进改名（SPEC-M1b-c §4 顺手修
+	// 的 ips=null 根因）：新版为 `addresses`，旧版 proto 字段为 `ip_addresses`
+	// （JSON `ipAddresses`）。两处都声明、取非空者——都是节点地址列表；
+	// `availableRoutes` 等路由字段是子网路由（非 100.x 节点地址），刻意不采。
+	Addresses   []string   `json:"addresses"`
+	IpAddresses []string   `json:"ipAddresses"`
+	Online      *bool      `json:"online"` // 旧版无此字段 → nil，按 offline 存但不误判为拉取失败
+	LastSeen    *time.Time `json:"lastSeen"`
 }
 
 // parseNodeID 兼容 headscale 各版本的 id 形态（数字 / 整数字符串）。
@@ -164,10 +171,15 @@ func (c *Client) FetchNodes(ctx context.Context) ([]Node, error) {
 		if wn.Name == "" {
 			return nil, fmt.Errorf("node[%d]: empty machine name", i)
 		}
+		// 地址取两代字段名中非空者（都为空 = 该版本确实未给地址，如实存空串）。
+		ips := wn.Addresses
+		if len(ips) == 0 {
+			ips = wn.IpAddresses
+		}
 		out = append(out, Node{
 			ID:       id,
 			Name:     wn.Name,
-			IPs:      wn.Addresses,
+			IPs:      ips,
 			Online:   wn.Online != nil && *wn.Online,
 			LastSeen: wn.LastSeen,
 		})

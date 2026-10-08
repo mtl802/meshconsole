@@ -3,16 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
 <meta name="robots" content="noindex">
-<title>MeshConsole — Network Control</title>
+<title>MeshConsole — Agent Control Plane</title>
 <link rel="stylesheet" href="/glass.css">
 </head>
-<body data-app data-theme="dark">
-<!-- TODO(light-theme): M1b-b 仅深色；token 已按 [data-theme] 分层，浅色覆盖块
-     参照技能 liquid-glass.md「更薄面板 + 更高 saturate」补齐即可 -->
+<body data-app data-theme="light">
+<!-- TODO(theme-switch): M1b-c 默认亮色；暗色变量块完整保留在 glass.css
+     [data-theme="dark"]（token 三元组 + 语义层 + 材质覆盖），M1c+ 做切换时
+     翻本属性即可，组件代码零改动 -->
 
-<!-- atmosphere：玻璃之下必须有可折射的颜色 -->
+<!-- atmosphere：玻璃之下必须有可折射的颜色（亮色 mesh，multiply 叠 pastel） -->
 <div class="atmosphere" aria-hidden="true">
   <div class="blob blob--a"></div>
   <div class="blob blob--b"></div>
@@ -25,8 +26,8 @@
 <main class="shell">
   <header class="masthead">
     <div class="reveal--clip" style="--d:.06s">
-      <p class="kicker">meshconsole // read-only console</p>
-      <h1 class="display">Network <em>control</em></h1>
+      <p class="kicker">meshconsole // agent control plane</p>
+      <h1 class="display">Agent <em>ops</em></h1>
     </div>
     <div class="readout glass-surface-soft reveal" style="--d:.22s" id="readout" aria-label="mesh summary">
       <div class="gauge">
@@ -34,8 +35,8 @@
         <span class="label">online</span>
       </div>
       <div class="gauge">
-        <span class="gauge-num" id="g-offline">–</span>
-        <span class="label">offline</span>
+        <span class="gauge-num" id="g-tasks">–</span>
+        <span class="label">running tasks</span>
       </div>
       <div class="gauge">
         <span class="gauge-num" id="g-issues">–</span>
@@ -43,25 +44,42 @@
       </div>
       <div class="gauge">
         <span class="gauge-num" id="g-tailnet">–</span>
-        <span class="label">tailnet</span>
+        <span class="label">tailnet up</span>
       </div>
     </div>
   </header>
 
-  <section class="grid" aria-label="mesh detail">
-    <!-- 主节点大卡 + 次节点小卡 + tailnet —— 不等宽 bento -->
-    <div class="col-7 stack reveal" style="--d:.4s" id="lead-slot"></div>
-
-    <div class="col-5 stack reveal" style="--d:.5s">
-      <div class="stack" id="minis-slot" style="--d:.5s"></div>
+  <section class="grid" aria-label="agent control plane">
+    <!-- 核心区：跨终端聚合的运行中 agent 任务（大卡优先，SPEC-M1b-c §2.3） -->
+    <div class="col-12 stack reveal" style="--d:.4s">
       <section class="glass-surface panel">
         <header class="panel-head">
-          <h2 class="panel-title">Tailnet</h2>
-          <span class="panel-meta" id="tailnet-meta">headscale</span>
+          <h2 class="panel-title">Running agent tasks</h2>
+          <span class="panel-meta" id="tasks-meta">0</span>
         </header>
-        <div class="panel-body" id="tailnet-list">
-          <p class="empty">headscale integration disabled or not synced yet</p>
+        <div class="task-grid" id="tasks-grid">
+          <div class="task-quiet" data-empty>
+            <span class="dot dot--dim"></span>
+            <span class="quiet-word">全部安静</span>
+            <span class="quiet-sub">no agent tasks running across the mesh</span>
+          </div>
         </div>
+      </section>
+    </div>
+
+    <!-- 终端区：每终端一张卡（状态/角色/sparkline/agent 清单 + last_activity） -->
+    <div class="col-12 stack reveal" style="--d:.5s">
+      <section class="glass-surface panel">
+        <header class="panel-head">
+          <h2 class="panel-title">Terminals</h2>
+          <span class="panel-meta" id="nodes-meta">0</span>
+        </header>
+        <div class="node-grid" id="nodes-grid">
+          <p class="empty" data-empty>no nodes reported yet</p>
+        </div>
+        <footer class="panel-foot">
+          invokable is always false — discovery ≠ invocation (M1 boundary, DESIGN §4.2-B) · last_activity = session dir mtime, stat only
+        </footer>
       </section>
     </div>
 
@@ -72,7 +90,7 @@
           <span class="panel-meta" id="services-meta">0</span>
         </header>
         <div class="panel-body" id="services-list">
-          <p class="empty">no services reported</p>
+          <p class="empty" data-empty>no services reported</p>
         </div>
       </section>
     </div>
@@ -80,15 +98,12 @@
     <div class="col-7 stack reveal" style="--d:.7s">
       <section class="glass-surface panel">
         <header class="panel-head">
-          <h2 class="panel-title">AI agents</h2>
-          <span class="panel-meta" id="agents-meta">0</span>
+          <h2 class="panel-title">Tailnet</h2>
+          <span class="panel-meta" id="tailnet-meta">headscale</span>
         </header>
-        <div class="panel-body" id="agents-list">
-          <p class="empty">no agents discovered</p>
+        <div class="panel-body" id="tailnet-list">
+          <p class="empty" data-empty>headscale integration disabled or not synced yet</p>
         </div>
-        <footer class="panel-foot">
-          invokable is always false — discovery ≠ invocation (M1 boundary, DESIGN §4.2-B)
-        </footer>
       </section>
     </div>
   </section>

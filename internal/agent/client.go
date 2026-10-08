@@ -248,7 +248,7 @@ func reportOnce(ctx context.Context, client *http.Client, consoleURL, nodeToken,
 		"collect_errors": snap.Errors,
 	}
 	if extra != nil {
-		extra.apply(ctx, body)
+		extra.apply(ctx, snap, body)
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

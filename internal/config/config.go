@@ -157,6 +157,10 @@ type CustomAgent struct {
 	Command string `yaml:"command"`
 	// VersionFlag 为版本探测参数，缺省 "--version"。
 	VersionFlag string `yaml:"version_flag"`
+	// SessionDir 为该 agent 的会话目录（SPEC-M1b-c §2.1 last_activity 辅证）：
+	// 只 stat 不读内容，取最近 mtime 与文件数。支持 ~ 展开；空值 = 不统计
+	// （last_activity 上报缺席）。known 清单的目录映射内置在 collect 包。
+	SessionDir string `yaml:"session_dir"`
 }
 
 // CustomAgentService 为显式声明的服务型 AI agent：仅本地端口探测存活性登记，
@@ -539,6 +543,9 @@ func validateAgentScan(scan *AgentScanCfg) error {
 		scan.Custom[i].Command = cmd
 		scan.Custom[i].VersionFlag = vf
 		scan.Custom[i].Type = typ
+		// 会话目录（M1b-c last_activity 辅证）：~ 展开即可，不做存在性校验——
+		// 目录此刻缺失是合法状态（last_activity 如实报 null）。
+		scan.Custom[i].SessionDir = ExpandHome(strings.TrimSpace(c.SessionDir))
 	}
 	for i, s := range scan.Services {
 		if !validLabelCfg(s.Name, 128) {
